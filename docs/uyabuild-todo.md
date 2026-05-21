@@ -106,24 +106,33 @@
 
 ### 7.2 TODO
 
-| ID | 优先级 | 任务 | 依赖 | 验收标准 |
-|---|---|---|---|---|
-| `P2-1` | `P0` | 实现 `blake3` 摘要与路径规范化工具 | `P1-6` | 文件与目录摘要稳定可复现 |
-| `P2-2` | `P0` | 实现 Snapshotter 与目录 Merkle tree | `P2-1` | 目录输入可生成单一 root digest |
-| `P2-3` | `P0` | 设计 CAS 对象布局 | `P2-1` | 文件、目录、日志对象可写入 CAS |
-| `P2-4` | `P0` | 设计 NoSQLite 集合与索引模型：`build_runs/actions/artifacts/events/cache_entries` | `P2-3` | 可创建元数据集合并完成基本查询 |
-| `P2-5` | `P0` | 实现 Typed IR 到 Target Graph 的转换 | `P1-6` | 图中可解析目标依赖关系 |
-| `P2-6` | `P0` | 实现 Planner：Target Graph -> Action DAG | `P2-5` | 单目标可规划出动作列表 |
-| `P2-7` | `P0` | 实现 action key 计算 | `P2-2`, `P2-6` | 修改输入/命令/环境后键会变化 |
-| `P2-8` | `P1` | 实现 early cutoff 所需的输出摘要比较 | `P2-7` | 输出未变化时可标记 no-change |
-| `P2-9` | `P1` | 实现基础本地缓存索引 | `P2-4`, `P2-7` | 相同动作可命中本地缓存 |
-| `P2-10` | `P1` | 实现 `uya plan --json` 动作图输出 | `P2-6` | 动作图可用于调试和 golden test |
+当前状态（2026-05-21）：
+
+- `bin/uyabuild` 已进入 Phase 2 主路径：`uyabuild plan --json` 会输出 typed IR + action graph；`uyabuild build` 会执行目标闭包、输入快照、action key 计算、CAS/meta 持久化，并在已有输出时返回 `seeded-output` / `local-hit`。
+- bootstrap seed 已完成的主项：`P2-2`、`P2-4`、`P2-5`、`P2-6`、`P2-7`、`P2-8`、`P2-9`、`P2-10`。
+- 已收口的新能力：`meta/` 现在会生成 NoSQLite 风格的集合与索引文档；`success-no-change` 已可基于上一版成功输出触发，并让仅依赖未变化输出的下游动作继续保持 `local-hit`。
+- 尚未替换的 bootstrap 兼容项：`P2-1` 当前仍使用 `blake2s` 兼容后端，待工具链具备稳定 `blake3` 接口后切换；`P2-3` 已覆盖 `file/tree/action manifest`，专用日志 CAS 对象仍待 Phase 3 执行器接入。
+
+| ID | 优先级 | 状态 | 任务 | 依赖 | 验收标准 |
+|---|---|---|---|---|---|
+| `P2-1` | `P0` | `进行中` | 实现 `blake3` 摘要与路径规范化工具 | `P1-6` | 文件与目录摘要稳定可复现 |
+| `P2-2` | `P0` | `已完成` | 实现 Snapshotter 与目录 Merkle tree | `P2-1` | 目录输入可生成单一 root digest |
+| `P2-3` | `P0` | `进行中` | 设计 CAS 对象布局 | `P2-1` | 文件、目录、日志对象可写入 CAS |
+| `P2-4` | `P0` | `已完成` | 设计 NoSQLite 集合与索引模型：`build_runs/actions/artifacts/events/cache_entries` | `P2-3` | 可创建元数据集合并完成基本查询 |
+| `P2-5` | `P0` | `已完成` | 实现 Typed IR 到 Target Graph 的转换 | `P1-6` | 图中可解析目标依赖关系 |
+| `P2-6` | `P0` | `已完成` | 实现 Planner：Target Graph -> Action DAG | `P2-5` | 单目标可规划出动作列表 |
+| `P2-7` | `P0` | `已完成` | 实现 action key 计算 | `P2-2`, `P2-6` | 修改输入/命令/环境后键会变化 |
+| `P2-8` | `P1` | `已完成` | 实现 early cutoff 所需的输出摘要比较 | `P2-7` | 输出未变化时可标记 no-change |
+| `P2-9` | `P1` | `已完成` | 实现基础本地缓存索引 | `P2-4`, `P2-7` | 相同动作可命中本地缓存 |
+| `P2-10` | `P1` | `已完成` | 实现 `uya plan --json` 动作图输出 | `P2-6` | 动作图可用于调试和 golden test |
 
 ### 7.3 退出条件
 
 - 内容快照、动作键、动作图都已可用。
 - NoSQLite 元数据集合与索引结构稳定到足以支持执行和查询。
 - 本地缓存索引已具备最小闭环。
+
+当前判断：Phase 2 的 planner/meta/early-cutoff/bootstrap cache 闭环已经形成；剩余缺口收敛为 `blake3` 后端切换，以及专用日志 CAS 对象随 Phase 3 执行器接入。
 
 ## 8. Phase 3：执行器、沙箱、依赖追踪、严格模式
 

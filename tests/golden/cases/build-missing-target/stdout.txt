@@ -1,1 +1,11 @@
-
+workspace: uyabuild
+phase: 2
+matched_targets: 1
+planned_actions: 1
+cache_hits: 0
+seeded_outputs: 1
+success_no_change: 0
+pending_execution: 0
+root_digest: f4612f03bd24c90b3055b46c6b32768ff8933b4dfa1bbb7cd81e0f0b709b5ff3
+matched:
+  //bootstrap:uyabuild

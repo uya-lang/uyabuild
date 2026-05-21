@@ -23,6 +23,8 @@ use libc.closedir;
 use libc.opendir;
 use libc.readdir;
 use std.io.fread;
+use std.io.fwrite;
+use std.crypto.blake2s.blake2s_digest;
 use std.mem.arena.Arena;
 use std.mem.arena.arena_alloc;
 use std.mem.arena.arena_init;
@@ -31,7 +33,7 @@ use std.mem.memset;
 use std.runtime.get_argc;
 use std.runtime.get_argv;
 
-const VERSION: &byte = "0.2.0-phase1" as &byte;
+const VERSION: &byte = "0.3.0-phase2" as &byte;
 
 const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 2;
@@ -47,9 +49,16 @@ const S_IFDIR: u32 = 16384u32;
 const S_IFREG: u32 = 32768u32;
 
 const MAX_ARGS: i32 = 256;
-const PHASE_NUMBER: i32 = 1;
+const PHASE_NUMBER: i32 = 2;
 const PHASE1_ARENA_SIZE: i32 = 16 * 1024 * 1024;
 const MAX_STRING_BUILD: usize = 8192usize;
+const DIGEST_BYTES: usize = 32usize;
+const DIGEST_HEX_BYTES: usize = 64usize;
+const MAX_DIGEST_MANIFEST: usize = 65536usize;
+const SNAPSHOT_FILE: i32 = 1;
+const SNAPSHOT_DIR: i32 = 2;
+const VISIT_STATE_VISITING: i32 = 1;
+const VISIT_STATE_DONE: i32 = 2;
 
 const DT_UNKNOWN: i32 = 0;
 const DT_DIR: i32 = 4;
@@ -69,7 +78,16 @@ struct Workspace {
 struct StateLayout {
     root: [byte: PATH_MAX],
     cas: [byte: PATH_MAX],
+    cas_blobs: [byte: PATH_MAX],
+    cas_trees: [byte: PATH_MAX],
+    cas_manifests: [byte: PATH_MAX],
     meta: [byte: PATH_MAX],
+    meta_build_runs: [byte: PATH_MAX],
+    meta_actions: [byte: PATH_MAX],
+    meta_artifacts: [byte: PATH_MAX],
+    meta_events: [byte: PATH_MAX],
+    meta_cache_entries: [byte: PATH_MAX],
+    meta_indexes: [byte: PATH_MAX],
     runs: [byte: PATH_MAX],
     tmp: [byte: PATH_MAX],
     locks: [byte: PATH_MAX],
@@ -106,6 +124,29 @@ struct Diagnostic {
 struct StringNode {
     text: &byte,
     next: &StringNode,
+}
+
+struct SnapshotEntry {
+    rel_path: &byte,
+    abs_path: &byte,
+    kind: i32,
+    digest_hex: &byte,
+    content_digest_hex: &byte,
+    size: usize,
+    next: &SnapshotEntry,
+}
+
+struct TreeChild {
+    name: &byte,
+    kind: i32,
+    digest_hex: &byte,
+    next: &TreeChild,
+}
+
+struct VisitMark {
+    label: &byte,
+    state: i32,
+    next: &VisitMark,
 }
 
 struct PatternSegment {
@@ -265,6 +306,47 @@ struct Phase1Context {
     config_count: i32,
     target_count: i32,
     diagnostic: Diagnostic,
+}
+
+struct PlannedAction {
+    owner: &IRTarget,
+    label: &byte,
+    kind: &byte,
+    mnemonic: &byte,
+    command_head: &StringNode,
+    command_tail: &StringNode,
+    input_head: &StringNode,
+    input_tail: &StringNode,
+    output_head: &StringNode,
+    output_tail: &StringNode,
+    dep_head: &StringNode,
+    dep_tail: &StringNode,
+    input_root_digest: &byte,
+    output_root_digest: &byte,
+    action_key: &byte,
+    cache_status: &byte,
+    pending_execution: i32,
+    order_index: i32,
+    next: &PlannedAction,
+}
+
+struct Phase2Context {
+    phase1: &Phase1Context,
+    state_layout: &StateLayout,
+    manifest: &RunManifest,
+    snapshot_head: &SnapshotEntry,
+    action_head: &PlannedAction,
+    action_tail: &PlannedAction,
+    visit_head: &VisitMark,
+    requested_count: i32,
+    matched_count: i32,
+    snapshot_count: i32,
+    action_count: i32,
+    cache_hit_count: i32,
+    seeded_count: i32,
+    no_change_count: i32,
+    pending_count: i32,
+    root_digest: &byte,
 }
 
 struct Token {
@@ -1134,6 +1216,139 @@ fn sorted_string_insert(ctx: &Phase1Context, head: &StringNode, text: &byte, ins
     node.next = current.next;
     current.next = node;
     return head;
+}
+
+fn new_snapshot_entry(ctx: &Phase1Context) &SnapshotEntry {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(SnapshotEntry));
+    if mem == null {
+        return null;
+    }
+    return mem as &SnapshotEntry;
+}
+
+fn new_tree_child(ctx: &Phase1Context) &TreeChild {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(TreeChild));
+    if mem == null {
+        return null;
+    }
+    return mem as &TreeChild;
+}
+
+fn new_visit_mark(ctx: &Phase1Context) &VisitMark {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(VisitMark));
+    if mem == null {
+        return null;
+    }
+    return mem as &VisitMark;
+}
+
+fn new_planned_action(ctx: &Phase1Context) &PlannedAction {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(PlannedAction));
+    if mem == null {
+        return null;
+    }
+    return mem as &PlannedAction;
+}
+
+fn phase2_ctx_init(ctx: &Phase2Context,
+                   phase1: &Phase1Context,
+                   state_layout: &StateLayout,
+                   manifest: &RunManifest,
+                   requested_count: i32,
+                   matched_count: i32) void {
+    ctx.phase1 = phase1;
+    ctx.state_layout = state_layout;
+    ctx.manifest = manifest;
+    ctx.snapshot_head = null;
+    ctx.action_head = null;
+    ctx.action_tail = null;
+    ctx.visit_head = null;
+    ctx.requested_count = requested_count;
+    ctx.matched_count = matched_count;
+    ctx.snapshot_count = 0;
+    ctx.action_count = 0;
+    ctx.cache_hit_count = 0;
+    ctx.seeded_count = 0;
+    ctx.pending_count = 0;
+    ctx.root_digest = null;
+}
+
+fn append_buffer_bytes(buffer: &byte, used: &usize, cap: usize, src: &byte, src_len: usize) i32 {
+    if buffer == null || used == null || src == null {
+        return -1;
+    }
+    if used[0] + src_len + 1usize > cap {
+        return -1;
+    }
+    if src_len > 0 {
+        memcpy(&buffer[used[0]] as &byte, src, src_len);
+    }
+    used[0] = used[0] + src_len;
+    buffer[used[0]] = 0 as byte;
+    return 0;
+}
+
+fn append_buffer_text(buffer: &byte, used: &usize, cap: usize, text: &byte) i32 {
+    if text == null {
+        return append_buffer_bytes(buffer, used, cap, "" as &byte, 0usize);
+    }
+    return append_buffer_bytes(buffer, used, cap, text, strlen(text));
+}
+
+fn append_buffer_byte(buffer: &byte, used: &usize, cap: usize, value: byte) i32 {
+    if buffer == null || used == null {
+        return -1;
+    }
+    if used[0] + 2usize > cap {
+        return -1;
+    }
+    buffer[used[0]] = value;
+    used[0] = used[0] + 1usize;
+    buffer[used[0]] = 0 as byte;
+    return 0;
+}
+
+fn digest_hex_char(nibble: byte) byte {
+    if nibble < 10 as byte {
+        return (48 + nibble as i32) as byte;
+    }
+    return (87 + nibble as i32) as byte;
+}
+
+fn bytes_to_hex_text(ctx: &Phase1Context, bytes: &byte, len: usize) &byte {
+    if ctx == null || bytes == null {
+        return null;
+    }
+    const out: &byte = arena_alloc_zero(&ctx.arena, len * 2usize + 1usize);
+    if out == null {
+        return null;
+    }
+    var i: usize = 0usize;
+    while i < len {
+        out[i * 2usize] = digest_hex_char((bytes[i] >> 4) & (15 as byte));
+        out[i * 2usize + 1usize] = digest_hex_char(bytes[i] & (15 as byte));
+        i = i + 1usize;
+    }
+    const tail_ptr: &byte = out + (len * 2usize);
+    tail_ptr[0] = 0 as byte;
+    return out;
+}
+
+fn blake2s_hex_bytes(ctx: &Phase1Context, data: &byte, data_len: usize) &byte {
+    if ctx == null || data == null {
+        return null;
+    }
+    var digest: [byte: DIGEST_BYTES] = [];
+    const data_slice: &[byte] = data[0: data_len];
+    blake2s_digest(data_slice, digest[0: DIGEST_BYTES]);
+    return bytes_to_hex_text(ctx, &digest[0] as &byte, DIGEST_BYTES);
+}
+
+fn blake2s_hex_text(ctx: &Phase1Context, text: &byte) &byte {
+    if text == null {
+        return null;
+    }
+    return blake2s_hex_bytes(ctx, text, strlen(text));
 }
 
 fn find_source_file(ctx: &Phase1Context, abs_path: &byte) &SourceFile {
@@ -4394,6 +4609,1689 @@ fn resolve_requested_targets(ctx: &Phase1Context,
     return matches;
 }
 
+fn action_append_command(ctx: &Phase1Context, action: &PlannedAction, text: &byte) i32 {
+    const node: &StringNode = new_string_node(ctx, text);
+    if node == null {
+        return -1;
+    }
+    if action.command_head == null {
+        action.command_head = node;
+        action.command_tail = node;
+    } else {
+        action.command_tail.next = node;
+        action.command_tail = node;
+    }
+    return 0;
+}
+
+fn action_insert_input(ctx: &Phase1Context, action: &PlannedAction, text: &byte) void {
+    var inserted: i32 = 0;
+    action.input_head = sorted_string_insert(ctx, action.input_head, text, &inserted);
+    _ = inserted;
+}
+
+fn action_insert_output(ctx: &Phase1Context, action: &PlannedAction, text: &byte) void {
+    var inserted: i32 = 0;
+    action.output_head = sorted_string_insert(ctx, action.output_head, text, &inserted);
+    _ = inserted;
+}
+
+fn action_insert_dep(ctx: &Phase1Context, action: &PlannedAction, text: &byte) void {
+    var inserted: i32 = 0;
+    action.dep_head = sorted_string_insert(ctx, action.dep_head, text, &inserted);
+    _ = inserted;
+}
+
+fn collect_typed_labels_sorted(ctx: &Phase1Context, value: &TypedValue, head: &StringNode) &StringNode {
+    var result: &StringNode = head;
+    if value == null {
+        return result;
+    }
+    if value.kind == TYPED_VALUE_LABEL {
+        var inserted: i32 = 0;
+        result = sorted_string_insert(ctx, result, value.text, &inserted);
+        return result;
+    }
+    if value.kind == TYPED_VALUE_LIST {
+        var item: &TypedValueItem = value.list_head;
+        while item != null {
+            result = collect_typed_labels_sorted(ctx, item.value, result);
+            item = item.next;
+        }
+        return result;
+    }
+    if value.kind == TYPED_VALUE_CALL && string_equals(value.call_name, "select" as &byte) != 0 {
+        var arg: &TypedValueItem = value.arg_head;
+        while arg != null {
+            if arg.value != null && arg.value.kind == TYPED_VALUE_MAP {
+                var entry: &TypedMapEntry = arg.value.map_head;
+                while entry != null {
+                    result = collect_typed_labels_sorted(ctx, entry.value, result);
+                    entry = entry.next;
+                }
+            } else {
+                result = collect_typed_labels_sorted(ctx, arg.value, result);
+            }
+            arg = arg.next;
+        }
+    }
+    return result;
+}
+
+fn collect_typed_strings_sorted(ctx: &Phase1Context, value: &TypedValue, head: &StringNode) &StringNode {
+    var result: &StringNode = head;
+    if value == null {
+        return result;
+    }
+    if value.kind == TYPED_VALUE_STRING {
+        var inserted: i32 = 0;
+        result = sorted_string_insert(ctx, result, value.text, &inserted);
+        return result;
+    }
+    if value.kind == TYPED_VALUE_LIST {
+        var item: &TypedValueItem = value.list_head;
+        while item != null {
+            result = collect_typed_strings_sorted(ctx, item.value, result);
+            item = item.next;
+        }
+        return result;
+    }
+    if value.kind == TYPED_VALUE_CALL && string_equals(value.call_name, "select" as &byte) != 0 {
+        var arg: &TypedValueItem = value.arg_head;
+        while arg != null {
+            if arg.value != null && arg.value.kind == TYPED_VALUE_MAP {
+                var entry: &TypedMapEntry = arg.value.map_head;
+                while entry != null {
+                    result = collect_typed_strings_sorted(ctx, entry.value, result);
+                    entry = entry.next;
+                }
+            } else {
+                result = collect_typed_strings_sorted(ctx, arg.value, result);
+            }
+            arg = arg.next;
+        }
+    }
+    return result;
+}
+
+fn insert_tree_child_sorted(ctx: &Phase1Context,
+                            head: &TreeChild,
+                            name: &byte,
+                            kind: i32,
+                            digest_hex: &byte) &TreeChild {
+    const child: &TreeChild = new_tree_child(ctx);
+    if child == null {
+        return head;
+    }
+    child.name = arena_copy_cstr(&ctx.arena, name);
+    child.kind = kind;
+    child.digest_hex = arena_copy_cstr(&ctx.arena, digest_hex);
+    child.next = null;
+
+    if head == null || cstr_compare(name, head.name) < 0 {
+        child.next = head;
+        return child;
+    }
+
+    var current: &TreeChild = head;
+    while current.next != null && cstr_compare(current.next.name, name) < 0 {
+        current = current.next;
+    }
+    if current.next != null && string_equals(current.next.name, name) != 0 {
+        return head;
+    }
+    if string_equals(current.name, name) != 0 {
+        return head;
+    }
+    child.next = current.next;
+    current.next = child;
+    return head;
+}
+
+fn find_snapshot_entry(ctx: &Phase2Context, rel_path: &byte, kind: i32) &SnapshotEntry {
+    var entry: &SnapshotEntry = ctx.snapshot_head;
+    while entry != null {
+        if entry.kind == kind && string_equals(entry.rel_path, rel_path) != 0 {
+            return entry;
+        }
+        entry = entry.next;
+    }
+    return null;
+}
+
+fn find_planned_action_by_label(ctx: &Phase2Context, label: &byte) &PlannedAction {
+    var action: &PlannedAction = ctx.action_head;
+    while action != null {
+        if string_equals(action.label, label) != 0 {
+            return action;
+        }
+        action = action.next;
+    }
+    return null;
+}
+
+fn find_visit_mark(ctx: &Phase2Context, label: &byte) &VisitMark {
+    var mark: &VisitMark = ctx.visit_head;
+    while mark != null {
+        if string_equals(mark.label, label) != 0 {
+            return mark;
+        }
+        mark = mark.next;
+    }
+    return null;
+}
+
+fn string_has_wildcard(text: &byte) i32 {
+    if text == null {
+        return 0;
+    }
+    var i: usize = 0usize;
+    while text[i] != 0 as byte {
+        if text[i] == 42 as byte || text[i] == 63 as byte {
+            return 1;
+        }
+        i = i + 1usize;
+    }
+    return 0;
+}
+
+fn should_skip_snapshot_name(name: &byte) i32 {
+    if name == null {
+        return 0;
+    }
+    if string_equals(name, ".git" as &byte) != 0 ||
+        string_equals(name, ".uya-build" as &byte) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn resolve_target_path(ctx: &Phase1Context,
+                       target: &IRTarget,
+                       raw: &byte,
+                       rel_out: &byte,
+                       abs_out: &byte) i32 {
+    if ctx == null || target == null || raw == null {
+        return -1;
+    }
+    if join_and_normalize_path(target.file.dir_abs, raw, abs_out, PATH_MAX) != 0 {
+        return -1;
+    }
+    if path_relative_to_root(ctx.workspace_root, abs_out, rel_out, PATH_MAX) != 0 {
+        return -1;
+    }
+    if rel_out[0] == 0 as byte {
+        return copy_string(rel_out, PATH_MAX, "." as &byte);
+    }
+    return 0;
+}
+
+fn persist_bytes(path: &byte, data: &byte, data_len: usize) i32 {
+    if path == null || data == null {
+        return -1;
+    }
+    if path_is_file(path) != 0 {
+        return 0;
+    }
+    const file: &FILE = fopen(path as &const byte, "wb" as &const byte);
+    if file == null {
+        return -1;
+    }
+    const written: usize = fwrite(data as &const byte, 1usize, data_len, file);
+    _ = fflush(file);
+    if fclose(file) != 0 {
+        return -1;
+    }
+    if written != data_len {
+        return -1;
+    }
+    return 0;
+}
+
+fn persist_text(path: &byte, text: &byte) i32 {
+    if path == null || text == null {
+        return -1;
+    }
+    return persist_bytes(path, text, strlen(text));
+}
+
+fn snapshot_store_blob(ctx: &Phase2Context, digest_hex: &byte, data: &byte, data_len: usize) i32 {
+    var path: [byte: PATH_MAX] = [];
+    if join_path(&ctx.state_layout.cas_blobs[0] as &byte, digest_hex, &path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    return persist_bytes(&path[0] as &byte, data, data_len);
+}
+
+fn snapshot_store_tree_json(ctx: &Phase2Context, digest_hex: &byte, text: &byte) i32 {
+    var path: [byte: PATH_MAX] = [];
+    if join_path(&ctx.state_layout.cas_trees[0] as &byte, digest_hex, &path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    return persist_text(&path[0] as &byte, text);
+}
+
+fn action_store_manifest_json(ctx: &Phase2Context, digest_hex: &byte, text: &byte) i32 {
+    var path: [byte: PATH_MAX] = [];
+    if join_path(&ctx.state_layout.cas_manifests[0] as &byte, digest_hex, &path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    return persist_text(&path[0] as &byte, text);
+}
+
+fn snapshot_file(ctx: &Phase2Context, abs_path: &byte, rel_path: &byte) &SnapshotEntry {
+    const existing: &SnapshotEntry = find_snapshot_entry(ctx, rel_path, SNAPSHOT_FILE);
+    if existing != null {
+        return existing;
+    }
+
+    var size_out: usize = 0usize;
+    const content: &byte = read_file_into_arena(ctx.phase1, abs_path, &size_out);
+    if content == null {
+        _ = set_diagnostic(ctx.phase1,
+                           EXIT_IO,
+                           "UYABUILD_E_INPUT_READ" as &byte,
+                           "failed to read declared input" as &byte,
+                           rel_path,
+                           rel_path,
+                           0,
+                           0);
+        return null;
+    }
+
+    const content_digest: &byte = blake2s_hex_bytes(ctx.phase1, content, size_out);
+    if content_digest == null {
+        return null;
+    }
+
+    var manifest: [byte: MAX_DIGEST_MANIFEST] = [];
+    var used: usize = 0usize;
+    var size_buf: [byte: 64] = [];
+    _ = snprintf(&size_buf[0] as *byte, 64usize, "%zu" as *byte, size_out);
+    if append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "file\n" as &byte) != 0 ||
+        append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, rel_path) != 0 ||
+        append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 ||
+        append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, content_digest) != 0 ||
+        append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 ||
+        append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, &size_buf[0] as &byte) != 0 {
+        return null;
+    }
+
+    const digest_hex: &byte = blake2s_hex_bytes(ctx.phase1, &manifest[0] as &byte, used);
+    if digest_hex == null {
+        return null;
+    }
+
+    const entry: &SnapshotEntry = new_snapshot_entry(ctx.phase1);
+    if entry == null {
+        return null;
+    }
+    entry.rel_path = arena_copy_cstr(&ctx.phase1.arena, rel_path);
+    entry.abs_path = arena_copy_cstr(&ctx.phase1.arena, abs_path);
+    entry.kind = SNAPSHOT_FILE;
+    entry.digest_hex = digest_hex;
+    entry.content_digest_hex = content_digest;
+    entry.size = size_out;
+    entry.next = ctx.snapshot_head;
+    ctx.snapshot_head = entry;
+    ctx.snapshot_count = ctx.snapshot_count + 1;
+
+    _ = snapshot_store_blob(ctx, content_digest, content, size_out);
+    _ = snapshot_store_tree_json(ctx, digest_hex, &manifest[0] as &byte);
+    return entry;
+}
+
+fn snapshot_directory(ctx: &Phase2Context, abs_path: &byte, rel_path: &byte) &SnapshotEntry {
+    const existing: &SnapshotEntry = find_snapshot_entry(ctx, rel_path, SNAPSHOT_DIR);
+    if existing != null {
+        return existing;
+    }
+
+    const dir: &DIR = opendir(abs_path as &const byte);
+    if dir == null {
+        _ = set_diagnostic(ctx.phase1,
+                           EXIT_IO,
+                           "UYABUILD_E_INPUT_READ" as &byte,
+                           "failed to open declared input directory" as &byte,
+                           rel_path,
+                           rel_path,
+                           0,
+                           0);
+        return null;
+    }
+
+    var children: &TreeChild = null;
+    var child_count: i32 = 0;
+    var entry_dir: &Dirent = readdir(dir);
+    while entry_dir != null {
+        const name: &byte = &entry_dir.d_name[0] as &byte;
+        if is_dirent_dot(name) != 0 || should_skip_snapshot_name(name) != 0 {
+            entry_dir = readdir(dir);
+            continue;
+        }
+
+        var child_abs: [byte: PATH_MAX] = [];
+        var child_rel: [byte: PATH_MAX] = [];
+        if join_path(abs_path, name, &child_abs[0] as &byte, PATH_MAX) != 0 ||
+            join_path(rel_path, name, &child_rel[0] as &byte, PATH_MAX) != 0 {
+            _ = closedir(dir);
+            return null;
+        }
+
+        var child_snapshot: &SnapshotEntry = null;
+        var child_kind: i32 = 0;
+        if dirent_is_directory(entry_dir, &child_abs[0] as &byte) != 0 {
+            child_kind = SNAPSHOT_DIR;
+            child_snapshot = snapshot_directory(ctx, &child_abs[0] as &byte, &child_rel[0] as &byte);
+        } else if dirent_is_regular_file(entry_dir, &child_abs[0] as &byte) != 0 {
+            child_kind = SNAPSHOT_FILE;
+            child_snapshot = snapshot_file(ctx, &child_abs[0] as &byte, &child_rel[0] as &byte);
+        }
+        if child_snapshot == null {
+            _ = closedir(dir);
+            return null;
+        }
+
+        children = insert_tree_child_sorted(ctx.phase1, children, name, child_kind, child_snapshot.digest_hex);
+        child_count = child_count + 1;
+        entry_dir = readdir(dir);
+    }
+    _ = closedir(dir);
+
+    var manifest: [byte: MAX_DIGEST_MANIFEST] = [];
+    var used: usize = 0usize;
+    if append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "dir\n" as &byte) != 0 ||
+        append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, rel_path) != 0 ||
+        append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 {
+        return null;
+    }
+    var child: &TreeChild = children;
+    while child != null {
+        if append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, child.name) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, ":" as &byte) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, child.digest_hex) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 {
+            return null;
+        }
+        child = child.next;
+    }
+
+    const digest_hex: &byte = blake2s_hex_bytes(ctx.phase1, &manifest[0] as &byte, used);
+    if digest_hex == null {
+        return null;
+    }
+
+    const snapshot: &SnapshotEntry = new_snapshot_entry(ctx.phase1);
+    if snapshot == null {
+        return null;
+    }
+    snapshot.rel_path = arena_copy_cstr(&ctx.phase1.arena, rel_path);
+    snapshot.abs_path = arena_copy_cstr(&ctx.phase1.arena, abs_path);
+    snapshot.kind = SNAPSHOT_DIR;
+    snapshot.digest_hex = digest_hex;
+    snapshot.content_digest_hex = digest_hex;
+    snapshot.size = i32_to_usize_checked(child_count);
+    snapshot.next = ctx.snapshot_head;
+    ctx.snapshot_head = snapshot;
+    ctx.snapshot_count = ctx.snapshot_count + 1;
+
+    _ = snapshot_store_tree_json(ctx, digest_hex, &manifest[0] as &byte);
+    return snapshot;
+}
+
+fn snapshot_workspace_path(ctx: &Phase2Context, rel_path: &byte, must_exist: i32) &SnapshotEntry {
+    var abs_path: [byte: PATH_MAX] = [];
+    if join_and_normalize_path(ctx.phase1.workspace_root, rel_path, &abs_path[0] as &byte, PATH_MAX) != 0 {
+        return null;
+    }
+    if path_is_file(&abs_path[0] as &byte) != 0 {
+        return snapshot_file(ctx, &abs_path[0] as &byte, rel_path);
+    }
+    if path_is_dir(&abs_path[0] as &byte) != 0 {
+        return snapshot_directory(ctx, &abs_path[0] as &byte, rel_path);
+    }
+    if must_exist != 0 {
+        _ = set_diagnostic(ctx.phase1,
+                           EXIT_IO,
+                           "UYABUILD_E_INPUT_MISSING" as &byte,
+                           "declared input path does not exist" as &byte,
+                           rel_path,
+                           rel_path,
+                           0,
+                           0);
+    }
+    return null;
+}
+
+fn action_collect_observed_outputs(ctx: &Phase2Context, action: &PlannedAction) &byte {
+    if action.output_head == null {
+        return null;
+    }
+    var manifest: [byte: MAX_DIGEST_MANIFEST] = [];
+    var used: usize = 0usize;
+    if append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "outputs\n" as &byte) != 0 {
+        return null;
+    }
+    var output: &StringNode = action.output_head;
+    while output != null {
+        const snapshot: &SnapshotEntry = snapshot_workspace_path(ctx, output.text, 0);
+        if snapshot == null {
+            return null;
+        }
+        if append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, output.text) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, ":" as &byte) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, snapshot.digest_hex) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 {
+            return null;
+        }
+        output = output.next;
+    }
+    return blake2s_hex_bytes(ctx.phase1, &manifest[0] as &byte, used);
+}
+
+fn collect_target_dependencies(ctx: &Phase1Context, target: &IRTarget) &StringNode {
+    var deps: &StringNode = null;
+    const deps_field: &IRField = find_ir_field(target.attrs, "deps" as &byte);
+    if deps_field != null {
+        deps = collect_typed_labels_sorted(ctx, deps_field.value, deps);
+    }
+    if string_equals(target.kind, "node.app" as &byte) != 0 {
+        const workspace_field: &IRField = find_ir_field(target.attrs, "workspace" as &byte);
+        if workspace_field != null {
+            deps = collect_typed_labels_sorted(ctx, workspace_field.value, deps);
+        }
+    }
+    return deps;
+}
+
+fn action_add_input_spec(ctx: &Phase2Context, action: &PlannedAction, target: &IRTarget, raw: &byte) i32 {
+    if string_has_wildcard(raw) != 0 {
+        var matched_count: i32 = 0;
+        var matches: &StringNode = collect_glob_matches(ctx.phase1, target.file.dir_abs, raw, &matched_count);
+        if matched_count == 0 {
+            _ = set_diagnostic(ctx.phase1,
+                               EXIT_CONFIG,
+                               "UYABUILD_E_INPUT_GLOB_EMPTY" as &byte,
+                               "declared input glob matched nothing" as &byte,
+                               raw,
+                               target.file.rel_path,
+                               target.span.start.line,
+                               target.span.start.column);
+            return -1;
+        }
+        while matches != null {
+            var rel: [byte: PATH_MAX] = [];
+            var abs: [byte: PATH_MAX] = [];
+            if resolve_target_path(ctx.phase1, target, matches.text, &rel[0] as &byte, &abs[0] as &byte) != 0 {
+                return -1;
+            }
+            action_insert_input(ctx.phase1, action, &rel[0] as &byte);
+            matches = matches.next;
+        }
+        return 0;
+    }
+
+    var rel_out: [byte: PATH_MAX] = [];
+    var abs_out: [byte: PATH_MAX] = [];
+    if resolve_target_path(ctx.phase1, target, raw, &rel_out[0] as &byte, &abs_out[0] as &byte) != 0 {
+        return -1;
+    }
+    action_insert_input(ctx.phase1, action, &rel_out[0] as &byte);
+    return 0;
+}
+
+fn action_add_output_path(ctx: &Phase1Context, action: &PlannedAction, target: &IRTarget, raw: &byte) i32 {
+    var rel_out: [byte: PATH_MAX] = [];
+    var abs_out: [byte: PATH_MAX] = [];
+    if resolve_target_path(ctx, target, raw, &rel_out[0] as &byte, &abs_out[0] as &byte) != 0 {
+        return -1;
+    }
+    action_insert_output(ctx, action, &rel_out[0] as &byte);
+    return 0;
+}
+
+fn action_add_placeholder_output(ctx: &Phase1Context, action: &PlannedAction, target: &IRTarget, suffix: &byte) i32 {
+    var raw: [byte: PATH_MAX] = [];
+    if target.package_path != null && target.package_path[0] != 0 as byte {
+        _ = snprintf(&raw[0] as *byte,
+                     PATH_MAX,
+                     "out/%s/%s%s" as *byte,
+                     target.package_path as *byte,
+                     target.name as *byte,
+                     suffix as *byte);
+    } else {
+        _ = snprintf(&raw[0] as *byte,
+                     PATH_MAX,
+                     "out/%s%s" as *byte,
+                     target.name as *byte,
+                     suffix as *byte);
+    }
+    return action_add_output_path(ctx, action, target, &raw[0] as &byte);
+}
+
+fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: &IRTarget) i32 {
+    action.owner = target;
+    action.label = target.label;
+    action.kind = target.kind;
+    action.mnemonic = target.kind;
+    action.cache_status = "pending-execution" as &byte;
+    action.pending_execution = 1;
+
+    var deps: &StringNode = collect_target_dependencies(ctx.phase1, target);
+    while deps != null {
+        action_insert_dep(ctx.phase1, action, deps.text);
+        deps = deps.next;
+    }
+
+    if string_equals(target.kind, "legacy.shell" as &byte) != 0 ||
+        string_equals(target.kind, "task" as &byte) != 0 {
+        const command_field: &IRField = find_ir_field(target.attrs, "script" as &byte);
+        var effective_field: &IRField = command_field;
+        if effective_field == null {
+            effective_field = find_ir_field(target.attrs, "run" as &byte);
+        }
+        if effective_field != null && effective_field.value != null && effective_field.value.kind == TYPED_VALUE_LIST {
+            var arg: &TypedValueItem = effective_field.value.list_head;
+            while arg != null {
+                if arg.value != null && arg.value.text != null {
+                    if action_append_command(ctx.phase1, action, arg.value.text) != 0 {
+                        return -1;
+                    }
+                }
+                arg = arg.next;
+            }
+        }
+        const inputs_field: &IRField = find_ir_field(target.attrs, "inputs" as &byte);
+        if inputs_field != null {
+            var inputs: &StringNode = collect_typed_strings_sorted(ctx.phase1, inputs_field.value, null);
+            while inputs != null {
+                if action_add_input_spec(ctx, action, target, inputs.text) != 0 {
+                    return -1;
+                }
+                inputs = inputs.next;
+            }
+        }
+        const outputs_field: &IRField = find_ir_field(target.attrs, "outputs" as &byte);
+        if outputs_field != null {
+            var outputs: &StringNode = collect_typed_strings_sorted(ctx.phase1, outputs_field.value, null);
+            while outputs != null {
+                if action_add_output_path(ctx.phase1, action, target, outputs.text) != 0 {
+                    return -1;
+                }
+                outputs = outputs.next;
+            }
+        }
+        return 0;
+    }
+
+    if string_equals(target.kind, "cxx.library" as &byte) != 0 {
+        _ = action_append_command(ctx.phase1, action, "uya-cxx-archive" as &byte);
+        _ = action_append_command(ctx.phase1, action, target.label);
+        const srcs_field: &IRField = find_ir_field(target.attrs, "srcs" as &byte);
+        const hdrs_field: &IRField = find_ir_field(target.attrs, "hdrs" as &byte);
+        var inputs: &StringNode = null;
+        if srcs_field != null { inputs = collect_typed_strings_sorted(ctx.phase1, srcs_field.value, inputs); }
+        if hdrs_field != null { inputs = collect_typed_strings_sorted(ctx.phase1, hdrs_field.value, inputs); }
+        while inputs != null {
+            if action_add_input_spec(ctx, action, target, inputs.text) != 0 {
+                return -1;
+            }
+            inputs = inputs.next;
+        }
+        return action_add_placeholder_output(ctx.phase1, action, target, ".a" as &byte);
+    }
+
+    if string_equals(target.kind, "cxx.binary" as &byte) != 0 {
+        _ = action_append_command(ctx.phase1, action, "uya-cxx-link" as &byte);
+        _ = action_append_command(ctx.phase1, action, target.label);
+        const srcs_field: &IRField = find_ir_field(target.attrs, "srcs" as &byte);
+        if srcs_field != null {
+            var inputs: &StringNode = collect_typed_strings_sorted(ctx.phase1, srcs_field.value, null);
+            while inputs != null {
+                if action_add_input_spec(ctx, action, target, inputs.text) != 0 {
+                    return -1;
+                }
+                inputs = inputs.next;
+            }
+        }
+        const out_field: &IRField = find_ir_field(target.attrs, "out" as &byte);
+        if out_field != null && out_field.value != null && out_field.value.text != null {
+            return action_add_output_path(ctx.phase1, action, target, out_field.value.text);
+        }
+        return action_add_placeholder_output(ctx.phase1, action, target, "" as &byte);
+    }
+
+    if string_equals(target.kind, "node.workspace" as &byte) != 0 {
+        _ = action_append_command(ctx.phase1, action, "npm" as &byte);
+        _ = action_append_command(ctx.phase1, action, "ci" as &byte);
+        const root_field: &IRField = find_ir_field(target.attrs, "root" as &byte);
+        const lock_field: &IRField = find_ir_field(target.attrs, "lockfile" as &byte);
+        if root_field != null && root_field.value != null && root_field.value.text != null {
+            if action_add_input_spec(ctx, action, target, root_field.value.text) != 0 {
+                return -1;
+            }
+        }
+        if lock_field != null && lock_field.value != null && lock_field.value.text != null {
+            if action_add_input_spec(ctx, action, target, lock_field.value.text) != 0 {
+                return -1;
+            }
+        }
+        return action_add_placeholder_output(ctx.phase1, action, target, ".workspace.json" as &byte);
+    }
+
+    if string_equals(target.kind, "node.app" as &byte) != 0 {
+        _ = action_append_command(ctx.phase1, action, "npm" as &byte);
+        _ = action_append_command(ctx.phase1, action, "run" as &byte);
+        _ = action_append_command(ctx.phase1, action, "build" as &byte);
+        const package_field: &IRField = find_ir_field(target.attrs, "package" as &byte);
+        if package_field != null && package_field.value != null && package_field.value.text != null {
+            if action_add_input_spec(ctx, action, target, package_field.value.text) != 0 {
+                return -1;
+            }
+        }
+        const out_field: &IRField = find_ir_field(target.attrs, "out" as &byte);
+        if out_field != null && out_field.value != null && out_field.value.text != null {
+            return action_add_output_path(ctx.phase1, action, target, out_field.value.text);
+        }
+        return action_add_placeholder_output(ctx.phase1, action, target, ".app" as &byte);
+    }
+
+    if string_equals(target.kind, "oci.image" as &byte) != 0 {
+        _ = action_append_command(ctx.phase1, action, "docker" as &byte);
+        _ = action_append_command(ctx.phase1, action, "buildx" as &byte);
+        _ = action_append_command(ctx.phase1, action, "build" as &byte);
+        const dockerfile_field: &IRField = find_ir_field(target.attrs, "dockerfile" as &byte);
+        const context_field: &IRField = find_ir_field(target.attrs, "context" as &byte);
+        if dockerfile_field != null && dockerfile_field.value != null && dockerfile_field.value.text != null {
+            if action_add_input_spec(ctx, action, target, dockerfile_field.value.text) != 0 {
+                return -1;
+            }
+        }
+        if context_field != null && context_field.value != null && context_field.value.text != null {
+            if action_add_input_spec(ctx, action, target, context_field.value.text) != 0 {
+                return -1;
+            }
+        }
+        return action_add_placeholder_output(ctx.phase1, action, target, ".image.json" as &byte);
+    }
+
+    return 0;
+}
+
+fn compute_action_digests(ctx: &Phase2Context, action: &PlannedAction) i32 {
+    var input_manifest: [byte: MAX_DIGEST_MANIFEST] = [];
+    var input_used: usize = 0usize;
+    if append_buffer_text(&input_manifest[0] as &byte, &input_used, MAX_DIGEST_MANIFEST, "inputs\n" as &byte) != 0 {
+        return -1;
+    }
+    var input: &StringNode = action.input_head;
+    while input != null {
+        const snapshot: &SnapshotEntry = snapshot_workspace_path(ctx, input.text, 1);
+        if snapshot == null {
+            return -1;
+        }
+        if append_buffer_text(&input_manifest[0] as &byte, &input_used, MAX_DIGEST_MANIFEST, input.text) != 0 ||
+            append_buffer_text(&input_manifest[0] as &byte, &input_used, MAX_DIGEST_MANIFEST, ":" as &byte) != 0 ||
+            append_buffer_text(&input_manifest[0] as &byte, &input_used, MAX_DIGEST_MANIFEST, snapshot.digest_hex) != 0 ||
+            append_buffer_text(&input_manifest[0] as &byte, &input_used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 {
+            return -1;
+        }
+        input = input.next;
+    }
+    action.input_root_digest = blake2s_hex_bytes(ctx.phase1, &input_manifest[0] as &byte, input_used);
+    action.output_root_digest = action_collect_observed_outputs(ctx, action);
+
+    var manifest: [byte: MAX_DIGEST_MANIFEST] = [];
+    var used: usize = 0usize;
+    if append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "action\n" as &byte) != 0 ||
+        append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, action.kind) != 0 ||
+        append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 ||
+        append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, action.label) != 0 ||
+        append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 ||
+        append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, action.input_root_digest) != 0 ||
+        append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 {
+        return -1;
+    }
+
+    var dep: &StringNode = action.dep_head;
+    while dep != null {
+        const dep_action: &PlannedAction = find_planned_action_by_label(ctx, dep.text);
+        if dep_action == null || dep_action.action_key == null {
+            return -1;
+        }
+        var dep_digest: &byte = dep_action.action_key;
+        var dep_mode: &byte = "action" as &byte;
+        if dep_action.output_root_digest != null {
+            dep_digest = dep_action.output_root_digest;
+            dep_mode = "output" as &byte;
+        }
+        if append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, dep.text) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, ":" as &byte) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, dep_mode) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, ":" as &byte) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, dep_digest) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 {
+            return -1;
+        }
+        dep = dep.next;
+    }
+
+    var output: &StringNode = action.output_head;
+    while output != null {
+        if append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, output.text) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 {
+            return -1;
+        }
+        output = output.next;
+    }
+
+    var command: &StringNode = action.command_head;
+    while command != null {
+        if append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, command.text) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 {
+            return -1;
+        }
+        command = command.next;
+    }
+
+    action.action_key = blake2s_hex_bytes(ctx.phase1, &manifest[0] as &byte, used);
+    if action.action_key == null {
+        return -1;
+    }
+    var cached_output_digest: [byte: DIGEST_HEX_BYTES + 1usize] = [];
+    var previous_output_digest: [byte: DIGEST_HEX_BYTES + 1usize] = [];
+    if action.output_root_digest != null {
+        if read_cache_output_digest(ctx, action.action_key, &cached_output_digest[0] as &byte, DIGEST_HEX_BYTES + 1usize) == 0 &&
+            string_equals(&cached_output_digest[0] as &byte, action.output_root_digest) != 0 {
+            action.cache_status = "local-hit" as &byte;
+            action.pending_execution = 0;
+            ctx.cache_hit_count = ctx.cache_hit_count + 1;
+        } else if read_latest_owner_output_digest(ctx,
+                                                  action.label,
+                                                  &previous_output_digest[0] as &byte,
+                                                  DIGEST_HEX_BYTES + 1usize) == 0 &&
+            string_equals(&previous_output_digest[0] as &byte, action.output_root_digest) != 0 {
+            action.cache_status = "success-no-change" as &byte;
+            action.pending_execution = 0;
+            ctx.no_change_count = ctx.no_change_count + 1;
+        } else {
+            action.cache_status = "seeded-output" as &byte;
+            action.pending_execution = 0;
+            ctx.seeded_count = ctx.seeded_count + 1;
+        }
+    } else {
+        action.cache_status = "pending-execution" as &byte;
+        action.pending_execution = 1;
+        ctx.pending_count = ctx.pending_count + 1;
+    }
+    _ = action_store_manifest_json(ctx, action.action_key, &manifest[0] as &byte);
+    return 0;
+}
+
+fn plan_target_recursive(ctx: &Phase2Context, label: &byte) i32 {
+    var mark: &VisitMark = find_visit_mark(ctx, label);
+    if mark != null {
+        if mark.state == VISIT_STATE_DONE {
+            return 0;
+        }
+        if mark.state == VISIT_STATE_VISITING {
+            return phase1_error(ctx.phase1,
+                                "UYABUILD_E_TARGET_CYCLE" as &byte,
+                                "target dependency cycle detected" as &byte,
+                                label,
+                                "uya.build" as &byte,
+                                1,
+                                1);
+        }
+    } else {
+        mark = new_visit_mark(ctx.phase1);
+        if mark == null {
+            return -1;
+        }
+        mark.label = arena_copy_cstr(&ctx.phase1.arena, label);
+        mark.state = VISIT_STATE_VISITING;
+        mark.next = ctx.visit_head;
+        ctx.visit_head = mark;
+    }
+
+    const target: &IRTarget = find_target_by_label(ctx.phase1, label);
+    if target == null {
+        return phase1_error(ctx.phase1,
+                            "UYABUILD_E_TARGET_NOT_FOUND" as &byte,
+                            "planned target was not found in the typed graph" as &byte,
+                            label,
+                            "uya.build" as &byte,
+                            1,
+                            1);
+    }
+
+    var deps: &StringNode = collect_target_dependencies(ctx.phase1, target);
+    while deps != null {
+        if plan_target_recursive(ctx, deps.text) != 0 {
+            return -1;
+        }
+        deps = deps.next;
+    }
+
+    if find_planned_action_by_label(ctx, label) == null {
+        const action: &PlannedAction = new_planned_action(ctx.phase1);
+        if action == null {
+            return -1;
+        }
+        if populate_planned_action(ctx, action, target) != 0 {
+            return -1;
+        }
+        action.order_index = ctx.action_count;
+        if compute_action_digests(ctx, action) != 0 {
+            return -1;
+        }
+        if ctx.action_head == null {
+            ctx.action_head = action;
+            ctx.action_tail = action;
+        } else {
+            ctx.action_tail.next = action;
+            ctx.action_tail = action;
+        }
+        ctx.action_count = ctx.action_count + 1;
+    }
+
+    mark.state = VISIT_STATE_DONE;
+    return 0;
+}
+
+fn compute_plan_root_digest(ctx: &Phase2Context, matched: &StringNode) &byte {
+    var manifest: [byte: MAX_DIGEST_MANIFEST] = [];
+    var used: usize = 0usize;
+    if append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "plan\n" as &byte) != 0 {
+        return null;
+    }
+    var node: &StringNode = matched;
+    while node != null {
+        if append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, node.text) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 {
+            return null;
+        }
+        node = node.next;
+    }
+    var action: &PlannedAction = ctx.action_head;
+    while action != null {
+        if append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, action.label) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, ":" as &byte) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, action.action_key) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 {
+            return null;
+        }
+        action = action.next;
+    }
+    return blake2s_hex_bytes(ctx.phase1, &manifest[0] as &byte, used);
+}
+
+fn build_phase2_plan(ctx: &Phase2Context, matched: &StringNode) i32 {
+    var node: &StringNode = matched;
+    while node != null {
+        if plan_target_recursive(ctx, node.text) != 0 {
+            return -1;
+        }
+        node = node.next;
+    }
+    ctx.root_digest = compute_plan_root_digest(ctx, matched);
+    if ctx.root_digest == null {
+        return -1;
+    }
+    return 0;
+}
+
+fn extract_json_string_field(content: &byte, field_name: &byte, out: &byte, out_cap: usize) i32 {
+    if content == null || field_name == null || out == null || out_cap == 0 {
+        return -1;
+    }
+    var pattern: [byte: 128] = [];
+    _ = snprintf(&pattern[0] as *byte, 128usize, "\"%s\":\"" as *byte, field_name as *byte);
+    const pattern_len: usize = strlen(&pattern[0] as &byte);
+    var pos: usize = 0usize;
+    while content[pos] != 0 as byte {
+        var matched: i32 = 1;
+        var i: usize = 0usize;
+        while i < pattern_len {
+            if content[pos + i] == 0 as byte || content[pos + i] != pattern[i] {
+                matched = 0;
+                break;
+            }
+            i = i + 1usize;
+        }
+        if matched != 0 {
+            var end: usize = pos + pattern_len;
+            while content[end] != 0 as byte && content[end] != 34 as byte {
+                end = end + 1usize;
+            }
+            const value_len: usize = end - (pos + pattern_len);
+            if value_len + 1usize > out_cap {
+                return -1;
+            }
+            memcpy(out, &content[pos + pattern_len] as &byte, value_len);
+            out[value_len] = 0 as byte;
+            return 0;
+        }
+        pos = pos + 1usize;
+    }
+    return -1;
+}
+
+fn extract_json_string_array_field(ctx: &Phase1Context,
+                                   content: &byte,
+                                   field_name: &byte,
+                                   out: [&byte: MAX_ARGS],
+                                   out_count: &i32) i32 {
+    if ctx == null || content == null || field_name == null || out_count == null {
+        return -1;
+    }
+    out_count[0] = 0;
+
+    var pattern: [byte: 128] = [];
+    _ = snprintf(&pattern[0] as *byte, 128usize, "\"%s\":[" as *byte, field_name as *byte);
+    const pattern_len: usize = strlen(&pattern[0] as &byte);
+    var pos: usize = 0usize;
+    while content[pos] != 0 as byte {
+        var matched: i32 = 1;
+        var i: usize = 0usize;
+        while i < pattern_len {
+            if content[pos + i] == 0 as byte || content[pos + i] != pattern[i] {
+                matched = 0;
+                break;
+            }
+            i = i + 1usize;
+        }
+        if matched != 0 {
+            pos = pos + pattern_len;
+            while content[pos] != 0 as byte && content[pos] != 93 as byte {
+                if content[pos] == 44 as byte {
+                    pos = pos + 1usize;
+                    continue;
+                }
+                if content[pos] != 34 as byte {
+                    pos = pos + 1usize;
+                    continue;
+                }
+                const start: usize = pos + 1usize;
+                var end: usize = start;
+                while content[end] != 0 as byte && content[end] != 34 as byte {
+                    end = end + 1usize;
+                }
+                if content[end] != 34 as byte {
+                    return -1;
+                }
+                if out_count[0] >= MAX_ARGS {
+                    return -1;
+                }
+                const out_index: usize = i32_to_usize_checked(out_count[0]);
+                if out_index >= MAX_ARGS as usize {
+                    return -1;
+                }
+                out[out_index] = arena_copy_range(&ctx.arena, content, start, end - start);
+                if out[out_index] == null {
+                    return -1;
+                }
+                out_count[0] = out_count[0] + 1;
+                pos = end + 1usize;
+            }
+            if content[pos] != 93 as byte {
+                return -1;
+            }
+            return 0;
+        }
+        pos = pos + 1usize;
+    }
+    return -1;
+}
+
+fn is_reusable_action_status(status: &byte) i32 {
+    if status == null {
+        return 0;
+    }
+    if string_equals(status, "pending-execution" as &byte) != 0 {
+        return 0;
+    }
+    return 1;
+}
+
+fn build_index_entry_path(ctx: &Phase2Context, index_name: &byte, key: &byte, out: &byte, out_cap: usize) i32 {
+    if ctx == null || index_name == null || key == null || out == null {
+        return -1;
+    }
+    var dir_path: [byte: PATH_MAX] = [];
+    if join_path(&ctx.state_layout.meta_indexes[0] as &byte, index_name, &dir_path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    if ensure_dir_recursive(&dir_path[0] as &byte) != 0 {
+        return -1;
+    }
+    const key_digest: &byte = blake2s_hex_text(ctx.phase1, key);
+    if key_digest == null {
+        return -1;
+    }
+    return join_path(&dir_path[0] as &byte, key_digest, out, out_cap);
+}
+
+fn read_index_doc_ids(ctx: &Phase2Context,
+                      index_name: &byte,
+                      key: &byte,
+                      out: [&byte: MAX_ARGS],
+                      out_count: &i32) i32 {
+    if ctx == null || out_count == null {
+        return -1;
+    }
+    var path: [byte: PATH_MAX] = [];
+    if build_index_entry_path(ctx, index_name, key, &path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    if path_is_file(&path[0] as &byte) == 0 {
+        out_count[0] = 0;
+        return -1;
+    }
+    var size_out: usize = 0usize;
+    const content: &byte = read_file_into_arena(ctx.phase1, &path[0] as &byte, &size_out);
+    _ = size_out;
+    if content == null {
+        return -1;
+    }
+
+    out_count[0] = 0;
+    var pattern: [byte: 128] = [];
+    _ = snprintf(&pattern[0] as *byte, 128usize, "\"%s\":[" as *byte, "doc_ids" as *byte);
+    const pattern_len: usize = strlen(&pattern[0] as &byte);
+    var pos: usize = 0usize;
+    while content[pos] != 0 as byte {
+        var matched: i32 = 1;
+        var i: usize = 0usize;
+        while i < pattern_len {
+            if content[pos + i] == 0 as byte || content[pos + i] != pattern[i] {
+                matched = 0;
+                break;
+            }
+            i = i + 1usize;
+        }
+        if matched != 0 {
+            pos = pos + pattern_len;
+            while content[pos] != 0 as byte && content[pos] != 93 as byte {
+                if content[pos] == 44 as byte {
+                    pos = pos + 1usize;
+                    continue;
+                }
+                if content[pos] != 34 as byte {
+                    pos = pos + 1usize;
+                    continue;
+                }
+                const start: usize = pos + 1usize;
+                var end: usize = start;
+                while content[end] != 0 as byte && content[end] != 34 as byte {
+                    end = end + 1usize;
+                }
+                if content[end] != 34 as byte || out_count[0] >= MAX_ARGS {
+                    return -1;
+                }
+                const out_index: usize = i32_to_usize_checked(out_count[0]);
+                if out_index >= MAX_ARGS as usize {
+                    return -1;
+                }
+                out[out_index] = arena_copy_range(&ctx.phase1.arena, content, start, end - start);
+                if out[out_index] == null {
+                    return -1;
+                }
+                out_count[0] = out_count[0] + 1;
+                pos = end + 1usize;
+            }
+            if content[pos] != 93 as byte {
+                return -1;
+            }
+            return 0;
+        }
+        pos = pos + 1usize;
+    }
+    return -1;
+}
+
+fn write_index_doc_ids(ctx: &Phase2Context,
+                       index_name: &byte,
+                       key: &byte,
+                       doc_ids: [&byte: MAX_ARGS],
+                       doc_count: i32) i32 {
+    if ctx == null {
+        return -1;
+    }
+    var path: [byte: PATH_MAX] = [];
+    if build_index_entry_path(ctx, index_name, key, &path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    const file: &FILE = fopen(&path[0] as &const byte, "w" as &const byte);
+    if file == null {
+        return -1;
+    }
+    fputs("{\"index\":\"" as *byte, file);
+    write_json_escape(file, index_name);
+    fputs("\",\"key\":\"" as *byte, file);
+    write_json_escape(file, key);
+    fputs("\",\"doc_ids\":[" as *byte, file);
+    var i: i32 = 0;
+    while i < doc_count {
+        if i > 0 {
+            fputs("," as *byte, file);
+        }
+        fputc(34, file);
+        write_json_escape(file, doc_ids[i as usize]);
+        fputc(34, file);
+        i = i + 1;
+    }
+    fputs("]}\n" as *byte, file);
+    _ = fflush(file);
+    if fclose(file) != 0 {
+        return -1;
+    }
+    return 0;
+}
+
+fn append_index_doc_id(ctx: &Phase2Context, index_name: &byte, key: &byte, doc_id: &byte) i32 {
+    if ctx == null || index_name == null || key == null || doc_id == null {
+        return -1;
+    }
+    var path: [byte: PATH_MAX] = [];
+    if build_index_entry_path(ctx, index_name, key, &path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    var doc_ids: [&byte: MAX_ARGS] = [];
+    var doc_count: i32 = 0;
+    if path_is_file(&path[0] as &byte) != 0 {
+        var size_out: usize = 0usize;
+        const content: &byte = read_file_into_arena(ctx.phase1, &path[0] as &byte, &size_out);
+        _ = size_out;
+        if content == null {
+            return -1;
+        }
+
+        var pattern: [byte: 128] = [];
+        _ = snprintf(&pattern[0] as *byte, 128usize, "\"%s\":[" as *byte, "doc_ids" as *byte);
+        const pattern_len: usize = strlen(&pattern[0] as &byte);
+        var pos: usize = 0usize;
+        while content[pos] != 0 as byte {
+            var matched: i32 = 1;
+            var i: usize = 0usize;
+            while i < pattern_len {
+                if content[pos + i] == 0 as byte || content[pos + i] != pattern[i] {
+                    matched = 0;
+                    break;
+                }
+                i = i + 1usize;
+            }
+            if matched != 0 {
+                pos = pos + pattern_len;
+                while content[pos] != 0 as byte && content[pos] != 93 as byte {
+                    if content[pos] == 44 as byte {
+                        pos = pos + 1usize;
+                        continue;
+                    }
+                    if content[pos] != 34 as byte {
+                        pos = pos + 1usize;
+                        continue;
+                    }
+                    const start: usize = pos + 1usize;
+                    var end: usize = start;
+                    while content[end] != 0 as byte && content[end] != 34 as byte {
+                        end = end + 1usize;
+                    }
+                    if content[end] != 34 as byte || doc_count >= MAX_ARGS {
+                        return -1;
+                    }
+                    const parsed_index: usize = i32_to_usize_checked(doc_count);
+                    if parsed_index >= MAX_ARGS as usize {
+                        return -1;
+                    }
+                    doc_ids[parsed_index] = arena_copy_range(&ctx.phase1.arena, content, start, end - start);
+                    if doc_ids[parsed_index] == null {
+                        return -1;
+                    }
+                    doc_count = doc_count + 1;
+                    pos = end + 1usize;
+                }
+                break;
+            }
+            pos = pos + 1usize;
+        }
+    }
+
+    var i: i32 = 0;
+    while i < doc_count {
+        if string_equals(doc_ids[i as usize], doc_id) != 0 {
+            return 0;
+        }
+        i = i + 1;
+    }
+    if doc_count >= MAX_ARGS {
+        return -1;
+    }
+    const next_index: usize = i32_to_usize_checked(doc_count);
+    if next_index >= MAX_ARGS as usize {
+        return -1;
+    }
+    doc_ids[next_index] = arena_copy_cstr(&ctx.phase1.arena, doc_id);
+    if doc_ids[next_index] == null {
+        return -1;
+    }
+    doc_count = doc_count + 1;
+    return write_index_doc_ids(ctx, index_name, key, doc_ids, doc_count);
+}
+
+fn read_action_status_and_output_digest(ctx: &Phase2Context,
+                                        action_doc_id: &byte,
+                                        output_digest: &byte,
+                                        output_digest_cap: usize,
+                                        status_out: &byte,
+                                        status_cap: usize) i32 {
+    if ctx == null || action_doc_id == null || output_digest == null || status_out == null {
+        return -1;
+    }
+    var path: [byte: PATH_MAX] = [];
+    if join_path(&ctx.state_layout.meta_actions[0] as &byte, action_doc_id, &path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    if path_is_file(&path[0] as &byte) == 0 {
+        return -1;
+    }
+    var size_out: usize = 0usize;
+    const content: &byte = read_file_into_arena(ctx.phase1, &path[0] as &byte, &size_out);
+    _ = size_out;
+    if content == null {
+        return -1;
+    }
+    if extract_json_string_field(content, "cache_status" as &byte, status_out, status_cap) != 0 {
+        return -1;
+    }
+    if extract_json_string_field(content, "output_root_digest" as &byte, output_digest, output_digest_cap) != 0 {
+        return -1;
+    }
+    return 0;
+}
+
+fn read_latest_owner_output_digest(ctx: &Phase2Context, owner: &byte, out: &byte, out_cap: usize) i32 {
+    if ctx == null || owner == null || out == null {
+        return -1;
+    }
+    var path: [byte: PATH_MAX] = [];
+    if build_index_entry_path(ctx, "actions.by_owner" as &byte, owner, &path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    if path_is_file(&path[0] as &byte) == 0 {
+        return -1;
+    }
+    var doc_ids: [&byte: MAX_ARGS] = [];
+    var doc_count: i32 = 0;
+    var size_out: usize = 0usize;
+    const content: &byte = read_file_into_arena(ctx.phase1, &path[0] as &byte, &size_out);
+    _ = size_out;
+    if content == null {
+        return -1;
+    }
+
+    var pattern: [byte: 128] = [];
+    _ = snprintf(&pattern[0] as *byte, 128usize, "\"%s\":[" as *byte, "doc_ids" as *byte);
+    const pattern_len: usize = strlen(&pattern[0] as &byte);
+    var pos: usize = 0usize;
+    while content[pos] != 0 as byte {
+        var matched: i32 = 1;
+        var i: usize = 0usize;
+        while i < pattern_len {
+            if content[pos + i] == 0 as byte || content[pos + i] != pattern[i] {
+                matched = 0;
+                break;
+            }
+            i = i + 1usize;
+        }
+        if matched != 0 {
+            pos = pos + pattern_len;
+            while content[pos] != 0 as byte && content[pos] != 93 as byte {
+                if content[pos] == 44 as byte {
+                    pos = pos + 1usize;
+                    continue;
+                }
+                if content[pos] != 34 as byte {
+                    pos = pos + 1usize;
+                    continue;
+                }
+                const start: usize = pos + 1usize;
+                var end: usize = start;
+                while content[end] != 0 as byte && content[end] != 34 as byte {
+                    end = end + 1usize;
+                }
+                if content[end] != 34 as byte || doc_count >= MAX_ARGS {
+                    return -1;
+                }
+                const parsed_index: usize = i32_to_usize_checked(doc_count);
+                if parsed_index >= MAX_ARGS as usize {
+                    return -1;
+                }
+                doc_ids[parsed_index] = arena_copy_range(&ctx.phase1.arena, content, start, end - start);
+                if doc_ids[parsed_index] == null {
+                    return -1;
+                }
+                doc_count = doc_count + 1;
+                pos = end + 1usize;
+            }
+            break;
+        }
+        pos = pos + 1usize;
+    }
+    if doc_count == 0 {
+        return -1;
+    }
+    var index: i32 = doc_count - 1;
+    while index >= 0 {
+        var status_buf: [byte: 64] = [];
+        const doc_index: usize = i32_to_usize_checked(index);
+        if doc_index >= MAX_ARGS as usize {
+            return -1;
+        }
+        if read_action_status_and_output_digest(ctx,
+                                                doc_ids[doc_index],
+                                                out,
+                                                out_cap,
+                                                &status_buf[0] as &byte,
+                                                64usize) == 0 &&
+            is_reusable_action_status(&status_buf[0] as &byte) != 0 {
+            return 0;
+        }
+        index = index - 1;
+    }
+    return -1;
+}
+
+fn read_cache_output_digest(ctx: &Phase2Context, action_key: &byte, out: &byte, out_cap: usize) i32 {
+    var cache_doc_id: &byte = action_key;
+    var index_path: [byte: PATH_MAX] = [];
+    if build_index_entry_path(ctx, "cache_entries.by_action_digest" as &byte, action_key, &index_path[0] as &byte, PATH_MAX) == 0 &&
+        path_is_file(&index_path[0] as &byte) != 0 {
+        var doc_ids: [&byte: MAX_ARGS] = [];
+        var doc_count: i32 = 0;
+        var size_out: usize = 0usize;
+        const index_content: &byte = read_file_into_arena(ctx.phase1, &index_path[0] as &byte, &size_out);
+        _ = size_out;
+        if index_content != null {
+            var pattern: [byte: 128] = [];
+            _ = snprintf(&pattern[0] as *byte, 128usize, "\"%s\":[" as *byte, "doc_ids" as *byte);
+            const pattern_len: usize = strlen(&pattern[0] as &byte);
+            var pos: usize = 0usize;
+            while index_content[pos] != 0 as byte {
+                var matched: i32 = 1;
+                var i: usize = 0usize;
+                while i < pattern_len {
+                    if index_content[pos + i] == 0 as byte || index_content[pos + i] != pattern[i] {
+                        matched = 0;
+                        break;
+                    }
+                    i = i + 1usize;
+                }
+                if matched != 0 {
+                    pos = pos + pattern_len;
+                    while index_content[pos] != 0 as byte && index_content[pos] != 93 as byte {
+                        if index_content[pos] == 44 as byte {
+                            pos = pos + 1usize;
+                            continue;
+                        }
+                        if index_content[pos] != 34 as byte {
+                            pos = pos + 1usize;
+                            continue;
+                        }
+                        const start: usize = pos + 1usize;
+                        var end: usize = start;
+                        while index_content[end] != 0 as byte && index_content[end] != 34 as byte {
+                            end = end + 1usize;
+                        }
+                        if index_content[end] != 34 as byte || doc_count >= MAX_ARGS {
+                            return -1;
+                        }
+                        const parsed_index: usize = i32_to_usize_checked(doc_count);
+                        if parsed_index >= MAX_ARGS as usize {
+                            return -1;
+                        }
+                        doc_ids[parsed_index] = arena_copy_range(&ctx.phase1.arena, index_content, start, end - start);
+                        if doc_ids[parsed_index] == null {
+                            return -1;
+                        }
+                        doc_count = doc_count + 1;
+                        pos = end + 1usize;
+                    }
+                    break;
+                }
+                pos = pos + 1usize;
+            }
+            if doc_count > 0 {
+                const cache_index: usize = i32_to_usize_checked(doc_count - 1);
+                if cache_index >= MAX_ARGS as usize {
+                    return -1;
+                }
+                cache_doc_id = doc_ids[cache_index];
+            }
+        }
+    }
+    var path: [byte: PATH_MAX] = [];
+    if join_path(&ctx.state_layout.meta_cache_entries[0] as &byte, cache_doc_id, &path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    if path_is_file(&path[0] as &byte) == 0 {
+        return -1;
+    }
+    var size_out: usize = 0usize;
+    const content: &byte = read_file_into_arena(ctx.phase1, &path[0] as &byte, &size_out);
+    _ = size_out;
+    if content == null {
+        return -1;
+    }
+    return extract_json_string_field(content, "output_root_digest" as &byte, out, out_cap);
+}
+
+fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &StringNode) i32 {
+    var build_run_path: [byte: PATH_MAX] = [];
+    if join_path(&ctx.state_layout.meta_build_runs[0] as &byte, &ctx.manifest.run_id[0] as &byte, &build_run_path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    const build_run_file: &FILE = fopen(&build_run_path[0] as &const byte, "w" as &const byte);
+    if build_run_file == null {
+        return -1;
+    }
+    fputs("{\"run_id\":\"" as *byte, build_run_file);
+    write_json_escape(build_run_file, &ctx.manifest.run_id[0] as &byte);
+    fputs("\",\"subcommand\":\"" as *byte, build_run_file);
+    write_json_escape(build_run_file, subcommand);
+    fputs("\",\"root_digest\":\"" as *byte, build_run_file);
+    write_json_escape(build_run_file, ctx.root_digest);
+    fputs("\",\"matched\":" as *byte, build_run_file);
+    emit_string_node_array_json(build_run_file, matched);
+    fputs(",\"actions\":" as *byte, build_run_file);
+    fprintf(build_run_file, "%d" as *byte, ctx.action_count);
+    fputs(",\"cache_hits\":" as *byte, build_run_file);
+    fprintf(build_run_file, "%d" as *byte, ctx.cache_hit_count);
+    fputs(",\"seeded\":" as *byte, build_run_file);
+    fprintf(build_run_file, "%d" as *byte, ctx.seeded_count);
+    fputs(",\"no_change\":" as *byte, build_run_file);
+    fprintf(build_run_file, "%d" as *byte, ctx.no_change_count);
+    fputs(",\"pending\":" as *byte, build_run_file);
+    fprintf(build_run_file, "%d" as *byte, ctx.pending_count);
+    fputs("}\n" as *byte, build_run_file);
+    _ = fflush(build_run_file);
+    if fclose(build_run_file) != 0 {
+        return -1;
+    }
+    if append_index_doc_id(ctx,
+                           "build_runs.by_run_id" as &byte,
+                           &ctx.manifest.run_id[0] as &byte,
+                           &ctx.manifest.run_id[0] as &byte) != 0 {
+        return -1;
+    }
+
+    var events_path: [byte: PATH_MAX] = [];
+    if join_path(&ctx.state_layout.meta_events[0] as &byte, &ctx.manifest.run_id[0] as &byte, &events_path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    const events_file: &FILE = fopen(&events_path[0] as &const byte, "w" as &const byte);
+    if events_file == null {
+        return -1;
+    }
+    fputs("{\"event\":\"BuildPlanned\",\"run_id\":\"" as *byte, events_file);
+    write_json_escape(events_file, &ctx.manifest.run_id[0] as &byte);
+    fputs("\",\"root_digest\":\"" as *byte, events_file);
+    write_json_escape(events_file, ctx.root_digest);
+    fputs("\",\"actions\":" as *byte, events_file);
+    fprintf(events_file, "%d" as *byte, ctx.action_count);
+    fputs("}\n" as *byte, events_file);
+
+    var action: &PlannedAction = ctx.action_head;
+    while action != null {
+        var action_path: [byte: PATH_MAX] = [];
+        if join_path(&ctx.state_layout.meta_actions[0] as &byte, action.action_key, &action_path[0] as &byte, PATH_MAX) != 0 {
+            _ = fclose(events_file);
+            return -1;
+        }
+        const action_file: &FILE = fopen(&action_path[0] as &const byte, "w" as &const byte);
+        if action_file == null {
+            _ = fclose(events_file);
+            return -1;
+        }
+        fputs("{\"action_key\":\"" as *byte, action_file);
+        write_json_escape(action_file, action.action_key);
+        fputs("\",\"run_id\":\"" as *byte, action_file);
+        write_json_escape(action_file, &ctx.manifest.run_id[0] as &byte);
+        fputs("\",\"label\":\"" as *byte, action_file);
+        write_json_escape(action_file, action.label);
+        fputs("\",\"kind\":\"" as *byte, action_file);
+        write_json_escape(action_file, action.kind);
+        fputs("\",\"cache_status\":\"" as *byte, action_file);
+        write_json_escape(action_file, action.cache_status);
+        fputs("\",\"input_root_digest\":\"" as *byte, action_file);
+        write_json_escape(action_file, action.input_root_digest);
+        fputs("\",\"output_root_digest\":" as *byte, action_file);
+        if action.output_root_digest != null {
+            fputc(34, action_file);
+            write_json_escape(action_file, action.output_root_digest);
+            fputc(34, action_file);
+        } else {
+            fputs("null" as *byte, action_file);
+        }
+        fputs("}\n" as *byte, action_file);
+        _ = fflush(action_file);
+        if fclose(action_file) != 0 {
+            _ = fclose(events_file);
+            return -1;
+        }
+        if append_index_doc_id(ctx, "actions.by_digest" as &byte, action.action_key, action.action_key) != 0 ||
+            append_index_doc_id(ctx, "actions.by_owner" as &byte, action.label, action.action_key) != 0 ||
+            append_index_doc_id(ctx, "actions.by_status" as &byte, action.cache_status, action.action_key) != 0 {
+            _ = fclose(events_file);
+            return -1;
+        }
+
+        fputs("{\"event\":\"ActionPlanned\",\"run_id\":\"" as *byte, events_file);
+        write_json_escape(events_file, &ctx.manifest.run_id[0] as &byte);
+        fputs("\",\"action_key\":\"" as *byte, events_file);
+        write_json_escape(events_file, action.action_key);
+        fputs("\",\"label\":\"" as *byte, events_file);
+        write_json_escape(events_file, action.label);
+        fputs("\",\"status\":\"" as *byte, events_file);
+        write_json_escape(events_file, action.cache_status);
+        fputs("\"}\n" as *byte, events_file);
+
+        var cache_path: [byte: PATH_MAX] = [];
+        if join_path(&ctx.state_layout.meta_cache_entries[0] as &byte, action.action_key, &cache_path[0] as &byte, PATH_MAX) != 0 {
+            _ = fclose(events_file);
+            return -1;
+        }
+        const cache_file: &FILE = fopen(&cache_path[0] as &const byte, "w" as &const byte);
+        if cache_file == null {
+            _ = fclose(events_file);
+            return -1;
+        }
+        fputs("{\"action_key\":\"" as *byte, cache_file);
+        write_json_escape(cache_file, action.action_key);
+        fputs("\",\"owner\":\"" as *byte, cache_file);
+        write_json_escape(cache_file, action.label);
+        fputs("\",\"output_root_digest\":" as *byte, cache_file);
+        if action.output_root_digest != null {
+            fputc(34, cache_file);
+            write_json_escape(cache_file, action.output_root_digest);
+            fputc(34, cache_file);
+        } else {
+            fputs("null" as *byte, cache_file);
+        }
+        fputs(",\"status\":\"" as *byte, cache_file);
+        write_json_escape(cache_file, action.cache_status);
+        fputs("\"}\n" as *byte, cache_file);
+        _ = fflush(cache_file);
+        if fclose(cache_file) != 0 {
+            _ = fclose(events_file);
+            return -1;
+        }
+        if append_index_doc_id(ctx,
+                               "cache_entries.by_action_digest" as &byte,
+                               action.action_key,
+                               action.action_key) != 0 {
+            _ = fclose(events_file);
+            return -1;
+        }
+
+        var output: &StringNode = action.output_head;
+        while output != null {
+            const artifact_id: &byte = blake2s_hex_text(ctx.phase1, output.text);
+            var artifact_path: [byte: PATH_MAX] = [];
+            if artifact_id == null ||
+                join_path(&ctx.state_layout.meta_artifacts[0] as &byte, artifact_id, &artifact_path[0] as &byte, PATH_MAX) != 0 {
+                _ = fclose(events_file);
+                return -1;
+            }
+            const artifact_file: &FILE = fopen(&artifact_path[0] as &const byte, "w" as &const byte);
+            if artifact_file == null {
+                _ = fclose(events_file);
+                return -1;
+            }
+            const snapshot: &SnapshotEntry = snapshot_workspace_path(ctx, output.text, 0);
+            fputs("{\"artifact_id\":\"" as *byte, artifact_file);
+            write_json_escape(artifact_file, artifact_id);
+            fputs("\",\"path\":\"" as *byte, artifact_file);
+            write_json_escape(artifact_file, output.text);
+            fputs("\",\"producer\":\"" as *byte, artifact_file);
+            write_json_escape(artifact_file, action.action_key);
+            fputs("\",\"digest\":" as *byte, artifact_file);
+            if snapshot != null {
+                fputc(34, artifact_file);
+                write_json_escape(artifact_file, snapshot.digest_hex);
+                fputc(34, artifact_file);
+            } else {
+                fputs("null" as *byte, artifact_file);
+            }
+            fputs("}\n" as *byte, artifact_file);
+            _ = fflush(artifact_file);
+            if fclose(artifact_file) != 0 {
+                _ = fclose(events_file);
+                return -1;
+            }
+            if append_index_doc_id(ctx, "artifacts.by_path" as &byte, output.text, artifact_id) != 0 {
+                _ = fclose(events_file);
+                return -1;
+            }
+            output = output.next;
+        }
+
+        action = action.next;
+    }
+
+    _ = fflush(events_file);
+    if fclose(events_file) != 0 {
+        return -1;
+    }
+    if append_index_doc_id(ctx,
+                           "events.by_run_id" as &byte,
+                           &ctx.manifest.run_id[0] as &byte,
+                           &ctx.manifest.run_id[0] as &byte) != 0 {
+        return -1;
+    }
+    return 0;
+}
+
 fn emit_string_node_array_json(stream: &FILE, head: &StringNode) void {
     fputs("[" as *byte, stream);
     var first: i32 = 1;
@@ -4411,8 +6309,68 @@ fn emit_string_node_array_json(stream: &FILE, head: &StringNode) void {
     fputs("]" as *byte, stream);
 }
 
-fn emit_plan_json(ctx: &Phase1Context, requested: [&byte: MAX_ARGS], requested_count: i32, matched: &StringNode) void {
-    fputs("{\"ok\":true,\"phase\":1," as *byte, libc.stdout);
+fn emit_action_json(stream: &FILE, action: &PlannedAction) void {
+    fputs("{\"label\":\"" as *byte, stream);
+    write_json_escape(stream, action.label);
+    fputs("\",\"kind\":\"" as *byte, stream);
+    write_json_escape(stream, action.kind);
+    fputs("\",\"order\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, action.order_index);
+    fputs(",\"action_key\":\"" as *byte, stream);
+    write_json_escape(stream, action.action_key);
+    fputs("\",\"input_root_digest\":\"" as *byte, stream);
+    write_json_escape(stream, action.input_root_digest);
+    fputs("\",\"output_root_digest\":" as *byte, stream);
+    if action.output_root_digest != null {
+        fputc(34, stream);
+        write_json_escape(stream, action.output_root_digest);
+        fputc(34, stream);
+    } else {
+        fputs("null" as *byte, stream);
+    }
+    fputs(",\"cache_status\":\"" as *byte, stream);
+    write_json_escape(stream, action.cache_status);
+    fputs("\",\"pending_execution\":" as *byte, stream);
+    if action.pending_execution != 0 {
+        fputs("true" as *byte, stream);
+    } else {
+        fputs("false" as *byte, stream);
+    }
+    fputs(",\"deps\":" as *byte, stream);
+    emit_string_node_array_json(stream, action.dep_head);
+    fputs(",\"command\":" as *byte, stream);
+    emit_string_node_array_json(stream, action.command_head);
+    fputs(",\"inputs\":" as *byte, stream);
+    emit_string_node_array_json(stream, action.input_head);
+    fputs(",\"outputs\":" as *byte, stream);
+    emit_string_node_array_json(stream, action.output_head);
+    fputs("}" as *byte, stream);
+}
+
+fn emit_phase2_summary_json(stream: &FILE, ctx: &Phase2Context) void {
+    fputs("{\"root_digest\":\"" as *byte, stream);
+    write_json_escape(stream, ctx.root_digest);
+    fputs("\",\"snapshots\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, ctx.snapshot_count);
+    fputs(",\"actions\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, ctx.action_count);
+    fputs(",\"cache_hits\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, ctx.cache_hit_count);
+    fputs(",\"seeded\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, ctx.seeded_count);
+    fputs(",\"no_change\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, ctx.no_change_count);
+    fputs(",\"pending\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, ctx.pending_count);
+    fputs("}" as *byte, stream);
+}
+
+fn emit_plan_json(ctx: &Phase1Context,
+                  phase2: &Phase2Context,
+                  requested: [&byte: MAX_ARGS],
+                  requested_count: i32,
+                  matched: &StringNode) void {
+    fputs("{\"ok\":true,\"phase\":2," as *byte, libc.stdout);
     fputs("\"workspace\":{" as *byte, libc.stdout);
     fputs("\"name\":\"" as *byte, libc.stdout);
     write_json_escape(libc.stdout, ctx.workspace_ir.name);
@@ -4527,6 +6485,20 @@ fn emit_plan_json(ctx: &Phase1Context, requested: [&byte: MAX_ARGS], requested_c
     }
     fputs("],\"matched\":" as *byte, libc.stdout);
     emit_string_node_array_json(libc.stdout, matched);
+    fputs(",\"planning\":" as *byte, libc.stdout);
+    emit_phase2_summary_json(libc.stdout, phase2);
+    fputs(",\"action_graph\":[" as *byte, libc.stdout);
+    var first_action: i32 = 1;
+    var action: &PlannedAction = phase2.action_head;
+    while action != null {
+        if first_action == 0 {
+            fputs("," as *byte, libc.stdout);
+        }
+        emit_action_json(libc.stdout, action);
+        first_action = 0;
+        action = action.next;
+    }
+    fputs("]" as *byte, libc.stdout);
     fputs("}\n" as *byte, libc.stdout);
     _ = fflush(libc.stdout);
 }
@@ -4551,12 +6523,71 @@ fn emit_query_text(matches: &StringNode) void {
     _ = fflush(libc.stdout);
 }
 
-fn emit_plan_text(ctx: &Phase1Context, matched: &StringNode) void {
+fn emit_plan_text(ctx: &Phase1Context, phase2: &Phase2Context, matched: &StringNode) void {
     fprintf(libc.stdout, "workspace: %s\n" as *byte, ctx.workspace_ir.name as *byte);
+    fprintf(libc.stdout, "phase: %d\n" as *byte, PHASE_NUMBER);
     fprintf(libc.stdout, "files: %d\n" as *byte, ctx.file_count);
     fprintf(libc.stdout, "rule_packs: %d\n" as *byte, ctx.use_count);
     fprintf(libc.stdout, "configs: %d\n" as *byte, ctx.config_count);
     fprintf(libc.stdout, "targets: %d\n" as *byte, ctx.target_count);
+    fprintf(libc.stdout, "snapshots: %d\n" as *byte, phase2.snapshot_count);
+    fprintf(libc.stdout, "actions: %d\n" as *byte, phase2.action_count);
+    fprintf(libc.stdout, "cache_hits: %d\n" as *byte, phase2.cache_hit_count);
+    fprintf(libc.stdout, "seeded_outputs: %d\n" as *byte, phase2.seeded_count);
+    fprintf(libc.stdout, "success_no_change: %d\n" as *byte, phase2.no_change_count);
+    fprintf(libc.stdout, "pending_execution: %d\n" as *byte, phase2.pending_count);
+    fprintf(libc.stdout, "root_digest: %s\n" as *byte, phase2.root_digest as *byte);
+    fputs("matched:\n" as *byte, libc.stdout);
+    var node: &StringNode = matched;
+    while node != null {
+        fprintf(libc.stdout, "  %s\n" as *byte, node.text as *byte);
+        node = node.next;
+    }
+    fputs("actions:\n" as *byte, libc.stdout);
+    var action: &PlannedAction = phase2.action_head;
+    while action != null {
+        fprintf(libc.stdout,
+                "  %s %s [%s]\n" as *byte,
+                action.label as *byte,
+                action.kind as *byte,
+                action.cache_status as *byte);
+        action = action.next;
+    }
+    _ = fflush(libc.stdout);
+}
+
+fn emit_build_json(ctx: &Phase1Context, phase2: &Phase2Context, matched: &StringNode) void {
+    fputs("{\"ok\":true,\"phase\":2,\"mode\":\"planning-only\",\"workspace\":\"" as *byte, libc.stdout);
+    write_json_escape(libc.stdout, ctx.workspace_ir.name);
+    fputs("\",\"matched\":" as *byte, libc.stdout);
+    emit_string_node_array_json(libc.stdout, matched);
+    fputs(",\"planning\":" as *byte, libc.stdout);
+    emit_phase2_summary_json(libc.stdout, phase2);
+    fputs(",\"action_graph\":[" as *byte, libc.stdout);
+    var first_action: i32 = 1;
+    var action: &PlannedAction = phase2.action_head;
+    while action != null {
+        if first_action == 0 {
+            fputs("," as *byte, libc.stdout);
+        }
+        emit_action_json(libc.stdout, action);
+        first_action = 0;
+        action = action.next;
+    }
+    fputs("]}\n" as *byte, libc.stdout);
+    _ = fflush(libc.stdout);
+}
+
+fn emit_build_text(ctx: &Phase1Context, phase2: &Phase2Context, matched: &StringNode) void {
+    fprintf(libc.stdout, "workspace: %s\n" as *byte, ctx.workspace_ir.name as *byte);
+    fprintf(libc.stdout, "phase: %d\n" as *byte, PHASE_NUMBER);
+    fprintf(libc.stdout, "matched_targets: %d\n" as *byte, phase2.matched_count);
+    fprintf(libc.stdout, "planned_actions: %d\n" as *byte, phase2.action_count);
+    fprintf(libc.stdout, "cache_hits: %d\n" as *byte, phase2.cache_hit_count);
+    fprintf(libc.stdout, "seeded_outputs: %d\n" as *byte, phase2.seeded_count);
+    fprintf(libc.stdout, "success_no_change: %d\n" as *byte, phase2.no_change_count);
+    fprintf(libc.stdout, "pending_execution: %d\n" as *byte, phase2.pending_count);
+    fprintf(libc.stdout, "root_digest: %s\n" as *byte, phase2.root_digest as *byte);
     fputs("matched:\n" as *byte, libc.stdout);
     var node: &StringNode = matched;
     while node != null {
@@ -4578,7 +6609,7 @@ fn load_phase1_model(options: &Options, workspace: &Workspace, ctx: &Phase1Conte
 }
 
 fn print_root_help() void {
-    fputs("uyabuild 0.2.0-phase1\n" as *byte, libc.stdout);
+    fprintf(libc.stdout, "uyabuild %s\n" as *byte, VERSION as *byte);
     fputs("\n" as *byte, libc.stdout);
     fputs("Usage:\n" as *byte, libc.stdout);
     fputs("  uyabuild [global-options] <command> [command-options]\n" as *byte, libc.stdout);
@@ -4587,9 +6618,9 @@ fn print_root_help() void {
     fputs("  make bootstrap        build the pure Uya bootstrap binary into bin/uyabuild\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
     fputs("Commands:\n" as *byte, libc.stdout);
-    fputs("  build                 analyze and validate targets (planner/executor begin in later phases)\n" as *byte, libc.stdout);
+    fputs("  build                 analyze, snapshot, and plan targets (execution begins in Phase 3)\n" as *byte, libc.stdout);
     fputs("  query                 inspect the typed target graph\n" as *byte, libc.stdout);
-    fputs("  plan                  emit the typed IR snapshot\n" as *byte, libc.stdout);
+    fputs("  plan                  emit the typed IR plus Phase 2 action graph\n" as *byte, libc.stdout);
     fputs("  version               print the bootstrap version\n" as *byte, libc.stdout);
     fputs("  help                  show command help\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
@@ -4618,8 +6649,10 @@ fn print_build_help() void {
     fputs("  -h, --help            show build help\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
     fputs("Notes:\n" as *byte, libc.stdout);
-    fputs("  Phase 1 validates uya.build, loads includes, resolves labels,\n" as *byte, libc.stdout);
-    fputs("  and produces typed IR before planner/executor phases.\n" as *byte, libc.stdout);
+    fputs("  Phase 2 validates uya.build, snapshots declared inputs, computes\n" as *byte, libc.stdout);
+    fputs("  action keys, and stops before the Phase 3 executor runs pending actions.\n" as *byte, libc.stdout);
+    fputs("  Existing outputs may resolve as local-hit, seeded-output, or\n" as *byte, libc.stdout);
+    fputs("  success-no-change without invoking the executor.\n" as *byte, libc.stdout);
     _ = fflush(libc.stdout);
 }
 
@@ -4645,11 +6678,13 @@ fn print_plan_help() void {
     fputs("Options:\n" as *byte, libc.stdout);
     fputs("  --workspace <path>    override workspace root discovery\n" as *byte, libc.stdout);
     fputs("  --state-dir <path>    override state directory\n" as *byte, libc.stdout);
-    fputs("  --json                emit the typed IR snapshot as JSON\n" as *byte, libc.stdout);
+    fputs("  --json                emit the typed IR and action graph as JSON\n" as *byte, libc.stdout);
     fputs("  -h, --help            show plan help\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
     fputs("Notes:\n" as *byte, libc.stdout);
     fputs("  When no target is provided, workspace.default is used.\n" as *byte, libc.stdout);
+    fputs("  Phase 2 plan output includes snapshots, action keys, cache status,\n" as *byte, libc.stdout);
+    fputs("  and success-no-change decisions for reusable outputs.\n" as *byte, libc.stdout);
     _ = fflush(libc.stdout);
 }
 
@@ -4782,7 +6817,16 @@ fn prepare_state_layout(workspace: &Workspace,
     }
 
     if prepare_state_subdir(&layout.root[0] as &byte, "cas" as &byte, &layout.cas[0] as &byte, PATH_MAX) != 0 ||
+        prepare_state_subdir(&layout.cas[0] as &byte, "blobs" as &byte, &layout.cas_blobs[0] as &byte, PATH_MAX) != 0 ||
+        prepare_state_subdir(&layout.cas[0] as &byte, "trees" as &byte, &layout.cas_trees[0] as &byte, PATH_MAX) != 0 ||
+        prepare_state_subdir(&layout.cas[0] as &byte, "manifests" as &byte, &layout.cas_manifests[0] as &byte, PATH_MAX) != 0 ||
         prepare_state_subdir(&layout.root[0] as &byte, "meta" as &byte, &layout.meta[0] as &byte, PATH_MAX) != 0 ||
+        prepare_state_subdir(&layout.meta[0] as &byte, "build_runs" as &byte, &layout.meta_build_runs[0] as &byte, PATH_MAX) != 0 ||
+        prepare_state_subdir(&layout.meta[0] as &byte, "actions" as &byte, &layout.meta_actions[0] as &byte, PATH_MAX) != 0 ||
+        prepare_state_subdir(&layout.meta[0] as &byte, "artifacts" as &byte, &layout.meta_artifacts[0] as &byte, PATH_MAX) != 0 ||
+        prepare_state_subdir(&layout.meta[0] as &byte, "events" as &byte, &layout.meta_events[0] as &byte, PATH_MAX) != 0 ||
+        prepare_state_subdir(&layout.meta[0] as &byte, "cache_entries" as &byte, &layout.meta_cache_entries[0] as &byte, PATH_MAX) != 0 ||
+        prepare_state_subdir(&layout.meta[0] as &byte, "indexes" as &byte, &layout.meta_indexes[0] as &byte, PATH_MAX) != 0 ||
         prepare_state_subdir(&layout.root[0] as &byte, "runs" as &byte, &layout.runs[0] as &byte, PATH_MAX) != 0 ||
         prepare_state_subdir(&layout.root[0] as &byte, "tmp" as &byte, &layout.tmp[0] as &byte, PATH_MAX) != 0 ||
         prepare_state_subdir(&layout.root[0] as &byte, "locks" as &byte, &layout.locks[0] as &byte, PATH_MAX) != 0 ||
@@ -5048,7 +7092,24 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
     }
 
     var workspace: Workspace = Workspace { root: [], entrypoint: [] };
-    var state_layout: StateLayout = StateLayout { root: [], cas: [], meta: [], runs: [], tmp: [], locks: [], gc: [] };
+    var state_layout: StateLayout = StateLayout {
+        root: [],
+        cas: [],
+        cas_blobs: [],
+        cas_trees: [],
+        cas_manifests: [],
+        meta: [],
+        meta_build_runs: [],
+        meta_actions: [],
+        meta_artifacts: [],
+        meta_events: [],
+        meta_cache_entries: [],
+        meta_indexes: [],
+        runs: [],
+        tmp: [],
+        locks: [],
+        gc: [],
+    };
     var manifest: RunManifest = RunManifest { run_id: [], run_dir: [], manifest_path: [] };
 
     const status: i32 = resolve_runtime_context(&options,
@@ -5101,17 +7162,63 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
                           "declare workspace.default or pass at least one target" as &byte);
     }
 
+    var phase2: Phase2Context = Phase2Context {
+        phase1: null,
+        state_layout: null,
+        manifest: null,
+        snapshot_head: null,
+        action_head: null,
+        action_tail: null,
+        visit_head: null,
+        requested_count: 0,
+        matched_count: 0,
+        snapshot_count: 0,
+        action_count: 0,
+        cache_hit_count: 0,
+        seeded_count: 0,
+        no_change_count: 0,
+        pending_count: 0,
+        root_digest: null,
+    };
+    phase2_ctx_init(&phase2, &phase1, &state_layout, &manifest, target_count, matched_count);
+    if build_phase2_plan(&phase2, matched) != 0 {
+        if phase1.diagnostic.code != null {
+            return emit_diagnostic(options.output_mode, &phase1.diagnostic);
+        }
+        return emit_error(options.output_mode,
+                          EXIT_IO,
+                          "UYABUILD_E_PLAN_FAILED" as &byte,
+                          "failed to build the Phase 2 action graph" as &byte,
+                          "check declared inputs, target cycles, and CAS paths" as &byte);
+    }
+    if persist_phase2_metadata(&phase2, "build" as &byte, matched) != 0 {
+        return emit_error(options.output_mode,
+                          EXIT_IO,
+                          "UYABUILD_E_META_WRITE" as &byte,
+                          "failed to persist Phase 2 metadata" as &byte,
+                          "check .uya-build/meta permissions and path lengths" as &byte);
+    }
+
+    if phase2.pending_count == 0 {
+        if options.output_mode == OUTPUT_JSON {
+            emit_build_json(&phase1, &phase2, matched);
+        } else {
+            emit_build_text(&phase1, &phase2, matched);
+        }
+        return EXIT_OK;
+    }
+
     var detail: [byte: PATH_MAX] = [];
     _ = snprintf(&detail[0] as *byte,
                  PATH_MAX,
-                 "Phase 1 analyzed %d files, %d targets, and matched %d requested targets; planner/executor begin in Phase 2/3" as *byte,
-                 phase1.file_count,
-                 phase1.target_count,
-                 matched_count);
+                 "Phase 2 planned %d actions, seeded %d outputs, and still has %d pending actions that require the Phase 3 executor" as *byte,
+                 phase2.action_count,
+                 phase2.seeded_count,
+                 phase2.pending_count);
     return emit_error(options.output_mode,
                       EXIT_NOT_IMPLEMENTED,
-                      "UYABUILD_E_PHASE_NOT_READY" as &byte,
-                      "build planning and execution are not implemented yet" as &byte,
+                      "UYABUILD_E_EXECUTOR_REQUIRED" as &byte,
+                      "build planning completed, but execution is still deferred to Phase 3" as &byte,
                       &detail[0] as &byte);
 }
 
@@ -5196,7 +7303,24 @@ fn run_query(start_index: i32, base_options: &Options) i32 {
     args[0] = expression;
 
     var workspace: Workspace = Workspace { root: [], entrypoint: [] };
-    var state_layout: StateLayout = StateLayout { root: [], cas: [], meta: [], runs: [], tmp: [], locks: [], gc: [] };
+    var state_layout: StateLayout = StateLayout {
+        root: [],
+        cas: [],
+        cas_blobs: [],
+        cas_trees: [],
+        cas_manifests: [],
+        meta: [],
+        meta_build_runs: [],
+        meta_actions: [],
+        meta_artifacts: [],
+        meta_events: [],
+        meta_cache_entries: [],
+        meta_indexes: [],
+        runs: [],
+        tmp: [],
+        locks: [],
+        gc: [],
+    };
     var manifest: RunManifest = RunManifest { run_id: [], run_dir: [], manifest_path: [] };
 
     const status: i32 = resolve_runtime_context(&options,
@@ -5311,7 +7435,24 @@ fn run_plan(start_index: i32, base_options: &Options) i32 {
     }
 
     var workspace: Workspace = Workspace { root: [], entrypoint: [] };
-    var state_layout: StateLayout = StateLayout { root: [], cas: [], meta: [], runs: [], tmp: [], locks: [], gc: [] };
+    var state_layout: StateLayout = StateLayout {
+        root: [],
+        cas: [],
+        cas_blobs: [],
+        cas_trees: [],
+        cas_manifests: [],
+        meta: [],
+        meta_build_runs: [],
+        meta_actions: [],
+        meta_artifacts: [],
+        meta_events: [],
+        meta_cache_entries: [],
+        meta_indexes: [],
+        runs: [],
+        tmp: [],
+        locks: [],
+        gc: [],
+    };
     var manifest: RunManifest = RunManifest { run_id: [], run_dir: [], manifest_path: [] };
     const status: i32 = resolve_runtime_context(&options,
                                                 &workspace,
@@ -5362,10 +7503,46 @@ fn run_plan(start_index: i32, base_options: &Options) i32 {
                           "plan matched no targets" as &byte,
                           "declare workspace.default or pass explicit targets" as &byte);
     }
+    var phase2: Phase2Context = Phase2Context {
+        phase1: null,
+        state_layout: null,
+        manifest: null,
+        snapshot_head: null,
+        action_head: null,
+        action_tail: null,
+        visit_head: null,
+        requested_count: 0,
+        matched_count: 0,
+        snapshot_count: 0,
+        action_count: 0,
+        cache_hit_count: 0,
+        seeded_count: 0,
+        no_change_count: 0,
+        pending_count: 0,
+        root_digest: null,
+    };
+    phase2_ctx_init(&phase2, &phase1, &state_layout, &manifest, target_count, matched_count);
+    if build_phase2_plan(&phase2, matched) != 0 {
+        if phase1.diagnostic.code != null {
+            return emit_diagnostic(options.output_mode, &phase1.diagnostic);
+        }
+        return emit_error(options.output_mode,
+                          EXIT_IO,
+                          "UYABUILD_E_PLAN_FAILED" as &byte,
+                          "failed to build the Phase 2 action graph" as &byte,
+                          "check declared inputs, target cycles, and CAS paths" as &byte);
+    }
+    if persist_phase2_metadata(&phase2, "plan" as &byte, matched) != 0 {
+        return emit_error(options.output_mode,
+                          EXIT_IO,
+                          "UYABUILD_E_META_WRITE" as &byte,
+                          "failed to persist Phase 2 metadata" as &byte,
+                          "check .uya-build/meta permissions and path lengths" as &byte);
+    }
     if options.output_mode == OUTPUT_JSON {
-        emit_plan_json(&phase1, targets, target_count, matched);
+        emit_plan_json(&phase1, &phase2, targets, target_count, matched);
     } else {
-        emit_plan_text(&phase1, matched);
+        emit_plan_text(&phase1, &phase2, matched);
     }
     return EXIT_OK;
 }

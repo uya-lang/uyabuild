@@ -1,0 +1,20 @@
+workspace {
+  name = "success-no-change"
+  default = ["//app:bundle"]
+  strict = false
+}
+
+use legacy
+
+legacy.shell "//lib:gen" {
+  script = ["sh", "scripts/gen.sh"]
+  inputs = ["scripts/gen.sh", "input.txt"]
+  outputs = ["out/lib.txt"]
+}
+
+legacy.shell "//app:bundle" {
+  script = ["sh", "scripts/bundle.sh"]
+  inputs = ["scripts/bundle.sh", "app.cfg"]
+  deps = ["//lib:gen"]
+  outputs = ["out/app.txt"]
+}

@@ -45,6 +45,12 @@ for case_dir in "$CASES_DIR"/*; do
       fixture_name=${cwd_mode#fixture:}
       workdir="$ROOT_DIR/fixtures/workspaces/$fixture_name"
       ;;
+    fixture-copy:*)
+      fixture_name=${cwd_mode#fixture-copy:}
+      workdir=$(mktemp -d)
+      cleanup_dirs="$cleanup_dirs $workdir"
+      cp -R "$ROOT_DIR/fixtures/workspaces/$fixture_name/." "$workdir"
+      ;;
     temp-empty)
       workdir=$(mktemp -d)
       cleanup_dirs="$cleanup_dirs $workdir"

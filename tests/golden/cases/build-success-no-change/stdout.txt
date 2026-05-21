@@ -1,0 +1,11 @@
+workspace: success-no-change
+phase: 2
+matched_targets: 1
+planned_actions: 2
+cache_hits: 1
+seeded_outputs: 0
+success_no_change: 1
+pending_execution: 0
+root_digest: e5d8519a896417c8b6ecbe1291a1ca6f8fc0f88bce6b75df1c23a025554c9f1f
+matched:
+  //app:bundle
