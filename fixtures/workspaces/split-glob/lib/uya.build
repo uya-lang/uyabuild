@@ -1,0 +1,4 @@
+cxx.library "//lib:core" {
+  srcs = glob("src/**/*.cc")
+  hdrs = ["src/lib.h"]
+}

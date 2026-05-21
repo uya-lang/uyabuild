@@ -17,10 +17,21 @@ use libc.strcmp;
 use libc.strlen;
 use libc.time;
 use libc.time_t;
+use libc.DIR;
+use libc.Dirent;
+use libc.closedir;
+use libc.opendir;
+use libc.readdir;
+use std.io.fread;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+use std.mem.memcpy;
+use std.mem.memset;
 use std.runtime.get_argc;
 use std.runtime.get_argv;
 
-const VERSION: &byte = "0.1.0-phase0" as &byte;
+const VERSION: &byte = "0.2.0-phase1" as &byte;
 
 const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 2;
@@ -36,6 +47,13 @@ const S_IFDIR: u32 = 16384u32;
 const S_IFREG: u32 = 32768u32;
 
 const MAX_ARGS: i32 = 256;
+const PHASE_NUMBER: i32 = 1;
+const PHASE1_ARENA_SIZE: i32 = 16 * 1024 * 1024;
+const MAX_STRING_BUILD: usize = 8192usize;
+
+const DT_UNKNOWN: i32 = 0;
+const DT_DIR: i32 = 4;
+const DT_REG: i32 = 8;
 
 struct Options {
     workspace_override: &byte,
@@ -63,6 +81,261 @@ struct RunManifest {
     run_dir: [byte: PATH_MAX],
     manifest_path: [byte: PATH_MAX],
 }
+
+struct SourcePos {
+    line: i32,
+    column: i32,
+    offset: i32,
+}
+
+struct SourceSpan {
+    start: SourcePos,
+    end: SourcePos,
+}
+
+struct Diagnostic {
+    exit_code: i32,
+    code: &byte,
+    message: &byte,
+    detail: &byte,
+    file: &byte,
+    line: i32,
+    column: i32,
+}
+
+struct StringNode {
+    text: &byte,
+    next: &StringNode,
+}
+
+struct PatternSegment {
+    text: &byte,
+    next: &PatternSegment,
+}
+
+struct SourceFile {
+    abs_path: &byte,
+    rel_path: &byte,
+    dir_abs: &byte,
+    package_path: &byte,
+    content: &byte,
+    size: usize,
+    is_root: i32,
+    decl_head: &AstDecl,
+    decl_tail: &AstDecl,
+    next: &SourceFile,
+}
+
+struct AstValueItem {
+    value: &AstValue,
+    next: &AstValueItem,
+}
+
+struct AstMapEntry {
+    key: &byte,
+    value: &AstValue,
+    span: SourceSpan,
+    next: &AstMapEntry,
+}
+
+struct AstValue {
+    kind: i32,
+    span: SourceSpan,
+    text: &byte,
+    bool_value: i32,
+    list_head: &AstValueItem,
+    list_tail: &AstValueItem,
+    map_head: &AstMapEntry,
+    map_tail: &AstMapEntry,
+    arg_head: &AstValueItem,
+    arg_tail: &AstValueItem,
+}
+
+struct AstField {
+    name: &byte,
+    value: &AstValue,
+    span: SourceSpan,
+    next: &AstField,
+}
+
+struct AstDecl {
+    kind: i32,
+    span: SourceSpan,
+    file: &SourceFile,
+    name: &byte,
+    label_text: &byte,
+    field_head: &AstField,
+    field_tail: &AstField,
+    next: &AstDecl,
+}
+
+struct TypedValueItem {
+    value: &TypedValue,
+    next: &TypedValueItem,
+}
+
+struct TypedMapEntry {
+    key: &byte,
+    value: &TypedValue,
+    next: &TypedMapEntry,
+}
+
+struct TypedValue {
+    kind: i32,
+    span: SourceSpan,
+    text: &byte,
+    bool_value: i32,
+    list_head: &TypedValueItem,
+    list_tail: &TypedValueItem,
+    map_head: &TypedMapEntry,
+    map_tail: &TypedMapEntry,
+    call_name: &byte,
+    arg_head: &TypedValueItem,
+    arg_tail: &TypedValueItem,
+}
+
+struct IRField {
+    name: &byte,
+    value: &TypedValue,
+    next: &IRField,
+}
+
+struct RuleUse {
+    name: &byte,
+    next: &RuleUse,
+}
+
+struct IRConfig {
+    name: &byte,
+    file: &SourceFile,
+    span: SourceSpan,
+    attrs: &IRField,
+    next: &IRConfig,
+}
+
+struct IRTarget {
+    label: &byte,
+    package_path: &byte,
+    name: &byte,
+    kind: &byte,
+    file: &SourceFile,
+    span: SourceSpan,
+    attrs: &IRField,
+    provider_mask: u32,
+    next: &IRTarget,
+}
+
+struct IRWorkspace {
+    source_file: &SourceFile,
+    span: SourceSpan,
+    name: &byte,
+    defaults: &TypedValue,
+    strict: i32,
+    has_name: i32,
+    has_defaults: i32,
+    has_strict: i32,
+}
+
+struct TomlWorkspaceMeta {
+    has_name: i32,
+    has_default: i32,
+    has_strict: i32,
+    name: &byte,
+    defaults: &TypedValue,
+    strict: i32,
+}
+
+struct Phase1Context {
+    arena: Arena,
+    workspace_root: &byte,
+    root_build_path: &byte,
+    root_toml_path: &byte,
+    entrypoint_path: &byte,
+    files_head: &SourceFile,
+    files_tail: &SourceFile,
+    uses_head: &RuleUse,
+    uses_tail: &RuleUse,
+    configs_head: &IRConfig,
+    configs_tail: &IRConfig,
+    targets_head: &IRTarget,
+    workspace_ir: IRWorkspace,
+    toml_meta: TomlWorkspaceMeta,
+    file_count: i32,
+    use_count: i32,
+    config_count: i32,
+    target_count: i32,
+    diagnostic: Diagnostic,
+}
+
+struct Token {
+    kind: i32,
+    text: &byte,
+    span: SourceSpan,
+}
+
+struct BuildParser {
+    ctx: &Phase1Context,
+    file: &SourceFile,
+    source: &byte,
+    size: usize,
+    pos: usize,
+    line: i32,
+    column: i32,
+    current: Token,
+}
+
+const TOKEN_EOF: i32 = 0;
+const TOKEN_IDENT: i32 = 1;
+const TOKEN_STRING: i32 = 2;
+const TOKEN_TRUE: i32 = 3;
+const TOKEN_FALSE: i32 = 4;
+const TOKEN_LBRACE: i32 = 5;
+const TOKEN_RBRACE: i32 = 6;
+const TOKEN_LBRACKET: i32 = 7;
+const TOKEN_RBRACKET: i32 = 8;
+const TOKEN_LPAREN: i32 = 9;
+const TOKEN_RPAREN: i32 = 10;
+const TOKEN_EQUAL: i32 = 11;
+const TOKEN_COMMA: i32 = 12;
+const TOKEN_DOT: i32 = 13;
+
+const AST_DECL_WORKSPACE: i32 = 1;
+const AST_DECL_CONFIG: i32 = 2;
+const AST_DECL_USE: i32 = 3;
+const AST_DECL_INCLUDE: i32 = 4;
+const AST_DECL_TARGET: i32 = 5;
+
+const AST_VALUE_STRING: i32 = 1;
+const AST_VALUE_BOOL: i32 = 2;
+const AST_VALUE_LIST: i32 = 3;
+const AST_VALUE_MAP: i32 = 4;
+const AST_VALUE_IDENT: i32 = 5;
+const AST_VALUE_CALL: i32 = 6;
+
+const TYPED_VALUE_STRING: i32 = 1;
+const TYPED_VALUE_BOOL: i32 = 2;
+const TYPED_VALUE_LIST: i32 = 3;
+const TYPED_VALUE_MAP: i32 = 4;
+const TYPED_VALUE_CALL: i32 = 5;
+const TYPED_VALUE_LABEL: i32 = 6;
+const TYPED_VALUE_IDENT: i32 = 7;
+
+const EXPECT_ANY: i32 = 0;
+const EXPECT_STRING: i32 = 1;
+const EXPECT_BOOL: i32 = 2;
+const EXPECT_STRING_LIST: i32 = 3;
+const EXPECT_LABEL: i32 = 4;
+const EXPECT_LABEL_LIST: i32 = 5;
+const EXPECT_CALL: i32 = 6;
+
+const PROVIDER_CXX_LINKABLE: u32 = 1u32;
+const PROVIDER_NODE_WORKSPACE: u32 = 2u32;
+const PROVIDER_NODE_APP: u32 = 4u32;
+const PROVIDER_OCI_IMAGE: u32 = 8u32;
+const PROVIDER_LEGACY_ACTION: u32 = 16u32;
+const PROVIDER_TASK: u32 = 32u32;
+
+var phase1_arena_storage: [byte: PHASE1_ARENA_SIZE] = [];
 
 fn zero_stat() Stat {
     return Stat {
@@ -318,8 +591,3994 @@ fn workspace_has_entrypoint(root: &byte, entrypoint: &byte, entrypoint_cap: usiz
     return 1;
 }
 
+fn string_has_prefix(text: &byte, prefix: &byte) i32 {
+    if text == null || prefix == null {
+        return 0;
+    }
+    const prefix_len: usize = strlen(prefix);
+    if strlen(text) < prefix_len {
+        return 0;
+    }
+    if strcmp(prefix as *byte, "" as *byte) == 0 {
+        return 1;
+    }
+    var i: usize = 0;
+    while i < prefix_len {
+        if text[i] != prefix[i] {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn string_has_suffix(text: &byte, suffix: &byte) i32 {
+    if text == null || suffix == null {
+        return 0;
+    }
+    const text_len: usize = strlen(text);
+    const suffix_len: usize = strlen(suffix);
+    if suffix_len > text_len {
+        return 0;
+    }
+    var i: usize = 0;
+    while i < suffix_len {
+        if text[text_len - suffix_len + i] != suffix[i] {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn cstr_compare(left: &byte, right: &byte) i32 {
+    if left == null && right == null {
+        return 0;
+    }
+    if left == null {
+        return -1;
+    }
+    if right == null {
+        return 1;
+    }
+    return strcmp(left as *byte, right as *byte);
+}
+
+fn arena_alloc_zero(arena: &Arena, size: usize) &byte {
+    const ptr: &byte = arena_alloc(arena, size);
+    if ptr == null {
+        return null;
+    }
+    memset(ptr, 0, size);
+    return ptr;
+}
+
+fn usize_to_i32_checked(value: usize) i32 {
+    const result: !i32 = value as! i32;
+    return result catch {
+        return 2147483647;
+    };
+}
+
+fn i32_to_usize_checked(value: i32) usize {
+    const result: !usize = value as! usize;
+    return result catch {
+        return 0usize;
+    };
+}
+
+fn clone_span(span: &SourceSpan) SourceSpan {
+    if span == null {
+        return zero_span();
+    }
+    return new_source_span(span.start.line,
+                           span.start.column,
+                           span.start.offset,
+                           span.end.line,
+                           span.end.column,
+                           span.end.offset);
+}
+
+fn arena_copy_cstr(arena: &Arena, text: &byte) &byte {
+    if arena == null || text == null {
+        return null;
+    }
+    const len: usize = strlen(text);
+    var out: &byte = arena_alloc_zero(arena, len + 1);
+    if out == null {
+        return null;
+    }
+    if len > 0 {
+        memcpy(out, text, len);
+    }
+    const tail_ptr: &byte = out + len;
+    tail_ptr[0] = 0 as byte;
+    return out;
+}
+
+fn arena_copy_range(arena: &Arena, base: &byte, start: usize, len: usize) &byte {
+    if arena == null || base == null {
+        return null;
+    }
+    var out: &byte = arena_alloc_zero(arena, len + 1);
+    if out == null {
+        return null;
+    }
+    if len > 0 {
+        memcpy(out, &base[start] as &byte, len);
+    }
+    const tail_ptr: &byte = out + len;
+    tail_ptr[0] = 0 as byte;
+    return out;
+}
+
+fn new_source_pos(line: i32, column: i32, offset: i32) SourcePos {
+    return SourcePos {
+        line: line,
+        column: column,
+        offset: offset,
+    };
+}
+
+fn new_source_span(start_line: i32,
+                   start_column: i32,
+                   start_offset: i32,
+                   end_line: i32,
+                   end_column: i32,
+                   end_offset: i32) SourceSpan {
+    return SourceSpan {
+        start: new_source_pos(start_line, start_column, start_offset),
+        end: new_source_pos(end_line, end_column, end_offset),
+    };
+}
+
+fn zero_span() SourceSpan {
+    return new_source_span(0, 0, 0, 0, 0, 0);
+}
+
+fn set_diagnostic(ctx: &Phase1Context,
+                  exit_code: i32,
+                  code: &byte,
+                  message: &byte,
+                  detail: &byte,
+                  file: &byte,
+                  line: i32,
+                  column: i32) i32 {
+    if ctx == null {
+        return -1;
+    }
+    ctx.diagnostic.exit_code = exit_code;
+    ctx.diagnostic.code = code;
+    ctx.diagnostic.message = message;
+    ctx.diagnostic.detail = detail;
+    ctx.diagnostic.file = file;
+    ctx.diagnostic.line = line;
+    ctx.diagnostic.column = column;
+    return -1;
+}
+
+fn emit_diagnostic(mode: i32, diag: &Diagnostic) i32 {
+    if diag == null {
+        return EXIT_CONFIG;
+    }
+
+    var detail_text: &byte = diag.detail;
+    if detail_text == null {
+        detail_text = "" as &byte;
+    }
+    var file_text: &byte = diag.file;
+    if file_text == null {
+        file_text = "" as &byte;
+    }
+
+    if mode == OUTPUT_JSON {
+        fputs("{\"ok\":false,\"exit_code\":" as *byte, libc.stderr);
+        fprintf(libc.stderr, "%d" as *byte, diag.exit_code);
+        fputs(",\"code\":\"" as *byte, libc.stderr);
+        write_json_escape(libc.stderr, diag.code);
+        fputs("\",\"message\":\"" as *byte, libc.stderr);
+        write_json_escape(libc.stderr, diag.message);
+        fputs("\",\"detail\":\"" as *byte, libc.stderr);
+        write_json_escape(libc.stderr, detail_text);
+        fputs("\",\"file\":\"" as *byte, libc.stderr);
+        write_json_escape(libc.stderr, file_text);
+        fputs("\",\"line\":" as *byte, libc.stderr);
+        fprintf(libc.stderr, "%d" as *byte, diag.line);
+        fputs(",\"column\":" as *byte, libc.stderr);
+        fprintf(libc.stderr, "%d" as *byte, diag.column);
+        fputs("}\n" as *byte, libc.stderr);
+    } else {
+        fprintf(libc.stderr, "%s: %s\n" as *byte, diag.code as *byte, diag.message as *byte);
+        if file_text[0] != 0 as byte && diag.line > 0 && diag.column > 0 {
+            fprintf(libc.stderr, "at: %s:%d:%d\n" as *byte, file_text as *byte, diag.line, diag.column);
+        } else if file_text[0] != 0 as byte {
+            fprintf(libc.stderr, "at: %s\n" as *byte, file_text as *byte);
+        }
+        if detail_text[0] != 0 as byte {
+            fprintf(libc.stderr, "detail: %s\n" as *byte, detail_text as *byte);
+        }
+    }
+
+    _ = fflush(libc.stderr);
+    return diag.exit_code;
+}
+
+fn phase1_error(ctx: &Phase1Context,
+                code: &byte,
+                message: &byte,
+                detail: &byte,
+                file: &byte,
+                line: i32,
+                column: i32) i32 {
+    return set_diagnostic(ctx, EXIT_CONFIG, code, message, detail, file, line, column);
+}
+
+fn normalize_path_text(input: &byte, out: &byte, out_cap: usize) i32 {
+    if input == null || out == null || out_cap == 0 {
+        return -1;
+    }
+
+    var segments: [usize: 512] = [];
+    var segment_count: usize = 0;
+    var out_pos: usize = 0;
+    const absolute: i32 = path_is_absolute(input);
+    var i: usize = 0;
+
+    if absolute != 0 {
+        if out_cap < 2 {
+            return -1;
+        }
+        out[0] = 47 as byte;
+        out_pos = 1;
+        while input[i] == 47 as byte {
+            i = i + 1;
+        }
+    }
+
+    while true {
+        while input[i] == 47 as byte {
+            i = i + 1;
+        }
+        if input[i] == 0 as byte {
+            break;
+        }
+
+        const seg_start: usize = i;
+        while input[i] != 0 as byte && input[i] != 47 as byte {
+            i = i + 1;
+        }
+        const seg_len: usize = i - seg_start;
+
+        if seg_len == 1 && input[seg_start] == 46 as byte {
+            continue;
+        }
+        if seg_len == 2 &&
+            input[seg_start] == 46 as byte &&
+            input[seg_start + 1] == 46 as byte {
+            if segment_count > 0 {
+                const prev_count: usize = segment_count - 1usize;
+                if prev_count >= 512usize {
+                    return -1;
+                }
+                segment_count = prev_count;
+                out_pos = segments[prev_count];
+                out[out_pos] = 0 as byte;
+            } else if absolute == 0 {
+                if out_pos != 0 {
+                    if out_pos + 1 >= out_cap {
+                        return -1;
+                    }
+                    out[out_pos] = 47 as byte;
+                    out_pos = out_pos + 1;
+                }
+                if out_pos + 2 >= out_cap {
+                    return -1;
+                }
+                segments[segment_count] = out_pos;
+                segment_count = segment_count + 1;
+                out[out_pos] = 46 as byte;
+                out[out_pos + 1] = 46 as byte;
+                out_pos = out_pos + 2;
+                out[out_pos] = 0 as byte;
+            }
+            continue;
+        }
+
+        if segment_count >= 512usize {
+            return -1;
+        }
+
+        if out_pos > 0 && out[out_pos - 1] != 47 as byte {
+            if out_pos + 1 >= out_cap {
+                return -1;
+            }
+            out[out_pos] = 47 as byte;
+            out_pos = out_pos + 1;
+        }
+
+        segments[segment_count] = out_pos;
+        segment_count = segment_count + 1;
+
+        if out_pos + seg_len >= out_cap {
+            return -1;
+        }
+
+        memcpy(&out[out_pos] as &byte, &input[seg_start] as &byte, seg_len);
+        out_pos = out_pos + seg_len;
+        out[out_pos] = 0 as byte;
+    }
+
+    if out_pos == 0 {
+        if absolute != 0 {
+            if out_cap < 2 {
+                return -1;
+            }
+            out[0] = 47 as byte;
+            out[1] = 0 as byte;
+        } else {
+            if out_cap < 2 {
+                return -1;
+            }
+            out[0] = 46 as byte;
+            out[1] = 0 as byte;
+        }
+    } else {
+        out[out_pos] = 0 as byte;
+    }
+
+    return 0;
+}
+
+fn join_and_normalize_path(left: &byte, right: &byte, out: &byte, out_cap: usize) i32 {
+    var joined: [byte: PATH_MAX] = [];
+    if right == null || out == null {
+        return -1;
+    }
+    if path_is_absolute(right) != 0 {
+        return normalize_path_text(right, out, out_cap);
+    }
+    if join_path(left, right, &joined[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    return normalize_path_text(&joined[0] as &byte, out, out_cap);
+}
+
+fn path_dirname_text(path: &byte, out: &byte, out_cap: usize) i32 {
+    if path == null || out == null || out_cap == 0 {
+        return -1;
+    }
+    const len: usize = strlen(path);
+    if len == 0 {
+        return copy_string(out, out_cap, "." as &byte);
+    }
+
+    var slash_index: usize = 0usize;
+    var has_slash: i32 = 0;
+    var i: usize = 0;
+    while i < len {
+        if path[i] == 47 as byte {
+            slash_index = i;
+            has_slash = 1;
+        }
+        i = i + 1;
+    }
+
+    if has_slash == 0 {
+        return copy_string(out, out_cap, "." as &byte);
+    }
+    if slash_index == 0 {
+        if out_cap < 2 {
+            return -1;
+        }
+        out[0] = 47 as byte;
+        out[1] = 0 as byte;
+        return 0;
+    }
+
+    const copy_len: usize = slash_index;
+    if copy_len + 1 > out_cap {
+        return -1;
+    }
+    memcpy(out, path, copy_len);
+    out[copy_len] = 0 as byte;
+    return 0;
+}
+
+fn path_relative_to_root(root: &byte, path: &byte, out: &byte, out_cap: usize) i32 {
+    if root == null || path == null || out == null {
+        return -1;
+    }
+    const root_len: usize = strlen(root);
+    if string_has_prefix(path, root) == 0 {
+        return copy_string(out, out_cap, path);
+    }
+    var offset: usize = root_len;
+    if path[offset] == 47 as byte {
+        offset = offset + 1;
+    }
+    return copy_string(out, out_cap, &path[offset] as &byte);
+}
+
+fn package_from_rel_path(rel_path: &byte, out: &byte, out_cap: usize) i32 {
+    var dir_buf: [byte: PATH_MAX] = [];
+    if path_dirname_text(rel_path, &dir_buf[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    if string_equals(&dir_buf[0] as &byte, "." as &byte) != 0 {
+        return copy_string(out, out_cap, "" as &byte);
+    }
+    return copy_string(out, out_cap, &dir_buf[0] as &byte);
+}
+
+fn phase1_ctx_init(ctx: &Phase1Context, workspace_root: &byte, entrypoint_path: &byte) void {
+    arena_init(&ctx.arena, &phase1_arena_storage[0] as &byte, PHASE1_ARENA_SIZE as usize);
+    ctx.workspace_root = arena_copy_cstr(&ctx.arena, workspace_root);
+    ctx.entrypoint_path = arena_copy_cstr(&ctx.arena, entrypoint_path);
+    ctx.root_build_path = null;
+    ctx.root_toml_path = null;
+    ctx.files_head = null;
+    ctx.files_tail = null;
+    ctx.uses_head = null;
+    ctx.uses_tail = null;
+    ctx.configs_head = null;
+    ctx.configs_tail = null;
+    ctx.targets_head = null;
+    ctx.workspace_ir = IRWorkspace {
+        source_file: null,
+        span: zero_span(),
+        name: null,
+        defaults: null,
+        strict: 0,
+        has_name: 0,
+        has_defaults: 0,
+        has_strict: 0,
+    };
+    ctx.toml_meta = TomlWorkspaceMeta {
+        has_name: 0,
+        has_default: 0,
+        has_strict: 0,
+        name: null,
+        defaults: null,
+        strict: 0,
+    };
+    ctx.file_count = 0;
+    ctx.use_count = 0;
+    ctx.config_count = 0;
+    ctx.target_count = 0;
+    ctx.diagnostic = Diagnostic {
+        exit_code: EXIT_CONFIG,
+        code: null,
+        message: null,
+        detail: null,
+        file: null,
+        line: 0,
+        column: 0,
+    };
+}
+
+fn is_dirent_dot(name: &byte) i32 {
+    if name == null {
+        return 0;
+    }
+    if name[0] == 46 as byte && name[1] == 0 as byte {
+        return 1;
+    }
+    if name[0] == 46 as byte && name[1] == 46 as byte && name[2] == 0 as byte {
+        return 1;
+    }
+    return 0;
+}
+
+fn dirent_is_directory(entry: &Dirent, abs_path: &byte) i32 {
+    if entry == null {
+        return 0;
+    }
+    if entry.d_type as i32 == DT_DIR {
+        return 1;
+    }
+    if entry.d_type as i32 == DT_UNKNOWN {
+        return path_is_dir(abs_path);
+    }
+    return 0;
+}
+
+fn dirent_is_regular_file(entry: &Dirent, abs_path: &byte) i32 {
+    if entry == null {
+        return 0;
+    }
+    if entry.d_type as i32 == DT_REG {
+        return 1;
+    }
+    if entry.d_type as i32 == DT_UNKNOWN {
+        return path_is_file(abs_path);
+    }
+    return 0;
+}
+
+fn new_string_node(ctx: &Phase1Context, text: &byte) &StringNode {
+    const node_mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(StringNode));
+    if node_mem == null {
+        return null;
+    }
+    const node: &StringNode = node_mem as &StringNode;
+    node.text = arena_copy_cstr(&ctx.arena, text);
+    node.next = null;
+    return node;
+}
+
+fn sorted_string_insert(ctx: &Phase1Context, head: &StringNode, text: &byte, inserted: &i32) &StringNode {
+    const node: &StringNode = new_string_node(ctx, text);
+    if node == null {
+        inserted[0] = 0;
+        return head;
+    }
+    inserted[0] = 1;
+
+    if head == null || cstr_compare(text, head.text) < 0 {
+        node.next = head;
+        return node;
+    }
+
+    var current: &StringNode = head;
+    while current.next != null && cstr_compare(current.next.text, text) < 0 {
+        current = current.next;
+    }
+    if current.next != null && string_equals(current.next.text, text) != 0 {
+        inserted[0] = 0;
+        return head;
+    }
+    if string_equals(current.text, text) != 0 {
+        inserted[0] = 0;
+        return head;
+    }
+    node.next = current.next;
+    current.next = node;
+    return head;
+}
+
+fn find_source_file(ctx: &Phase1Context, abs_path: &byte) &SourceFile {
+    var file: &SourceFile = ctx.files_head;
+    while file != null {
+        if string_equals(file.abs_path, abs_path) != 0 {
+            return file;
+        }
+        file = file.next;
+    }
+    return null;
+}
+
+fn source_display_path(ctx: &Phase1Context, file: &SourceFile) &byte {
+    _ = ctx;
+    if file == null {
+        return "" as &byte;
+    }
+    return file.rel_path;
+}
+
+fn read_file_into_arena(ctx: &Phase1Context, path: &byte, size_out: &usize) &byte {
+    var st: Stat = zero_stat();
+    if stat(path as &const byte, &st) != 0 {
+        return null;
+    }
+    if st.st_size < 0 {
+        return null;
+    }
+
+    const file_size_result: !usize = st.st_size as! usize;
+    const file_size: usize = file_size_result catch {
+        return null;
+    };
+    var content: &byte = arena_alloc_zero(&ctx.arena, file_size + 1);
+    if content == null {
+        return null;
+    }
+
+    const file: &FILE = fopen(path as *byte, "r" as *byte);
+    if file == null {
+        return null;
+    }
+    const bytes_read: usize = fread(content as *void, 1, file_size, file);
+    _ = fclose(file);
+
+    const end_ptr: &byte = content + bytes_read;
+    end_ptr[0] = 0 as byte;
+    size_out[0] = bytes_read;
+    return content;
+}
+
+fn new_source_file(ctx: &Phase1Context) &SourceFile {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(SourceFile));
+    if mem == null {
+        return null;
+    }
+    return mem as &SourceFile;
+}
+
+fn append_source_file(ctx: &Phase1Context, file: &SourceFile) void {
+    if ctx.files_head == null {
+        ctx.files_head = file;
+        ctx.files_tail = file;
+    } else {
+        ctx.files_tail.next = file;
+        ctx.files_tail = file;
+    }
+    ctx.file_count = ctx.file_count + 1;
+}
+
+fn new_ast_decl(ctx: &Phase1Context) &AstDecl {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(AstDecl));
+    if mem == null {
+        return null;
+    }
+    return mem as &AstDecl;
+}
+
+fn new_ast_field(ctx: &Phase1Context) &AstField {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(AstField));
+    if mem == null {
+        return null;
+    }
+    return mem as &AstField;
+}
+
+fn new_ast_value(ctx: &Phase1Context) &AstValue {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(AstValue));
+    if mem == null {
+        return null;
+    }
+    return mem as &AstValue;
+}
+
+fn new_ast_value_item(ctx: &Phase1Context) &AstValueItem {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(AstValueItem));
+    if mem == null {
+        return null;
+    }
+    return mem as &AstValueItem;
+}
+
+fn new_ast_map_entry(ctx: &Phase1Context) &AstMapEntry {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(AstMapEntry));
+    if mem == null {
+        return null;
+    }
+    return mem as &AstMapEntry;
+}
+
+fn append_ast_decl(file: &SourceFile, decl: &AstDecl) void {
+    if file.decl_head == null {
+        file.decl_head = decl;
+        file.decl_tail = decl;
+    } else {
+        file.decl_tail.next = decl;
+        file.decl_tail = decl;
+    }
+}
+
+fn append_ast_field(decl: &AstDecl, field: &AstField) void {
+    if decl.field_head == null {
+        decl.field_head = field;
+        decl.field_tail = field;
+    } else {
+        decl.field_tail.next = field;
+        decl.field_tail = field;
+    }
+}
+
+fn append_ast_list_item(value: &AstValue, item: &AstValueItem) void {
+    if value.list_head == null {
+        value.list_head = item;
+        value.list_tail = item;
+    } else {
+        value.list_tail.next = item;
+        value.list_tail = item;
+    }
+}
+
+fn append_ast_call_arg(value: &AstValue, item: &AstValueItem) void {
+    if value.arg_head == null {
+        value.arg_head = item;
+        value.arg_tail = item;
+    } else {
+        value.arg_tail.next = item;
+        value.arg_tail = item;
+    }
+}
+
+fn append_ast_map_entry(value: &AstValue, entry: &AstMapEntry) void {
+    if value.map_head == null {
+        value.map_head = entry;
+        value.map_tail = entry;
+    } else {
+        value.map_tail.next = entry;
+        value.map_tail = entry;
+    }
+}
+
+fn new_typed_value(ctx: &Phase1Context) &TypedValue {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(TypedValue));
+    if mem == null {
+        return null;
+    }
+    return mem as &TypedValue;
+}
+
+fn new_typed_value_item(ctx: &Phase1Context) &TypedValueItem {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(TypedValueItem));
+    if mem == null {
+        return null;
+    }
+    return mem as &TypedValueItem;
+}
+
+fn new_typed_map_entry(ctx: &Phase1Context) &TypedMapEntry {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(TypedMapEntry));
+    if mem == null {
+        return null;
+    }
+    return mem as &TypedMapEntry;
+}
+
+fn new_ir_field(ctx: &Phase1Context) &IRField {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(IRField));
+    if mem == null {
+        return null;
+    }
+    return mem as &IRField;
+}
+
+fn new_ir_config(ctx: &Phase1Context) &IRConfig {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(IRConfig));
+    if mem == null {
+        return null;
+    }
+    return mem as &IRConfig;
+}
+
+fn new_ir_target(ctx: &Phase1Context) &IRTarget {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(IRTarget));
+    if mem == null {
+        return null;
+    }
+    return mem as &IRTarget;
+}
+
+fn new_rule_use(ctx: &Phase1Context) &RuleUse {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(RuleUse));
+    if mem == null {
+        return null;
+    }
+    return mem as &RuleUse;
+}
+
+fn append_typed_list_item(value: &TypedValue, item: &TypedValueItem) void {
+    if value.list_head == null {
+        value.list_head = item;
+        value.list_tail = item;
+    } else {
+        value.list_tail.next = item;
+        value.list_tail = item;
+    }
+}
+
+fn append_typed_call_arg(value: &TypedValue, item: &TypedValueItem) void {
+    if value.arg_head == null {
+        value.arg_head = item;
+        value.arg_tail = item;
+    } else {
+        value.arg_tail.next = item;
+        value.arg_tail = item;
+    }
+}
+
+fn append_typed_map_entry(value: &TypedValue, entry: &TypedMapEntry) void {
+    if value.map_head == null {
+        value.map_head = entry;
+        value.map_tail = entry;
+    } else {
+        value.map_tail.next = entry;
+        value.map_tail = entry;
+    }
+}
+
+fn append_ir_field(head: &IRField, field: &IRField) &IRField {
+    if head == null {
+        return field;
+    }
+    var current: &IRField = head;
+    while current.next != null {
+        current = current.next;
+    }
+    current.next = field;
+    return head;
+}
+
+fn find_ir_field(head: &IRField, name: &byte) &IRField {
+    var current: &IRField = head;
+    while current != null {
+        if string_equals(current.name, name) != 0 {
+            return current;
+        }
+        current = current.next;
+    }
+    return null;
+}
+
+fn parser_init(parser: &BuildParser, ctx: &Phase1Context, file: &SourceFile) void {
+    parser.ctx = ctx;
+    parser.file = file;
+    parser.source = file.content;
+    parser.size = file.size;
+    parser.pos = 0usize;
+    parser.line = 1;
+    parser.column = 1;
+    parser.current = Token {
+        kind: TOKEN_EOF,
+        text: null,
+        span: zero_span(),
+    };
+}
+
+fn parser_current_byte(parser: &BuildParser) byte {
+    if parser.pos >= parser.size {
+        return 0 as byte;
+    }
+    return parser.source[parser.pos];
+}
+
+fn parser_advance_char(parser: &BuildParser) byte {
+    const ch: byte = parser_current_byte(parser);
+    if ch == 0 as byte {
+        return ch;
+    }
+    parser.pos = parser.pos + 1;
+    if ch == 10 as byte {
+        parser.line = parser.line + 1;
+        parser.column = 1;
+    } else {
+        parser.column = parser.column + 1;
+    }
+    return ch;
+}
+
+fn parser_skip_ws_and_comments(parser: &BuildParser) void {
+    while true {
+        const ch: byte = parser_current_byte(parser);
+        if ch == 32 as byte || ch == 9 as byte || ch == 10 as byte || ch == 13 as byte {
+            _ = parser_advance_char(parser);
+            continue;
+        }
+        if ch == 35 as byte {
+            while parser_current_byte(parser) != 0 as byte &&
+                parser_current_byte(parser) != 10 as byte {
+                _ = parser_advance_char(parser);
+            }
+            continue;
+        }
+        break;
+    }
+}
+
+fn parser_make_simple_token(parser: &BuildParser, kind: i32, ch: byte) Token {
+    var buf: [byte: 2] = [];
+    buf[0] = ch;
+    buf[1] = 0 as byte;
+    return Token {
+        kind: kind,
+        text: arena_copy_cstr(&parser.ctx.arena, &buf[0] as &byte),
+        span: new_source_span(parser.line,
+                              parser.column,
+                              usize_to_i32_checked(parser.pos),
+                              parser.line,
+                              parser.column + 1,
+                              usize_to_i32_checked(parser.pos + 1usize)),
+    };
+}
+
+fn parser_next_token(parser: &BuildParser) i32 {
+    parser_skip_ws_and_comments(parser);
+    const start_line: i32 = parser.line;
+    const start_column: i32 = parser.column;
+    const start_offset: i32 = usize_to_i32_checked(parser.pos);
+    const ch: byte = parser_current_byte(parser);
+
+    if ch == 0 as byte {
+        parser.current = Token {
+            kind: TOKEN_EOF,
+            text: "" as &byte,
+            span: new_source_span(start_line, start_column, start_offset, start_line, start_column, start_offset),
+        };
+        return 0;
+    }
+
+    if ch == 123 as byte {
+        parser.current = parser_make_simple_token(parser, TOKEN_LBRACE, ch);
+        _ = parser_advance_char(parser);
+        return 0;
+    }
+    if ch == 125 as byte {
+        parser.current = parser_make_simple_token(parser, TOKEN_RBRACE, ch);
+        _ = parser_advance_char(parser);
+        return 0;
+    }
+    if ch == 91 as byte {
+        parser.current = parser_make_simple_token(parser, TOKEN_LBRACKET, ch);
+        _ = parser_advance_char(parser);
+        return 0;
+    }
+    if ch == 93 as byte {
+        parser.current = parser_make_simple_token(parser, TOKEN_RBRACKET, ch);
+        _ = parser_advance_char(parser);
+        return 0;
+    }
+    if ch == 40 as byte {
+        parser.current = parser_make_simple_token(parser, TOKEN_LPAREN, ch);
+        _ = parser_advance_char(parser);
+        return 0;
+    }
+    if ch == 41 as byte {
+        parser.current = parser_make_simple_token(parser, TOKEN_RPAREN, ch);
+        _ = parser_advance_char(parser);
+        return 0;
+    }
+    if ch == 61 as byte {
+        parser.current = parser_make_simple_token(parser, TOKEN_EQUAL, ch);
+        _ = parser_advance_char(parser);
+        return 0;
+    }
+    if ch == 44 as byte {
+        parser.current = parser_make_simple_token(parser, TOKEN_COMMA, ch);
+        _ = parser_advance_char(parser);
+        return 0;
+    }
+    if ch == 46 as byte {
+        parser.current = parser_make_simple_token(parser, TOKEN_DOT, ch);
+        _ = parser_advance_char(parser);
+        return 0;
+    }
+
+    if ch == 34 as byte {
+        _ = parser_advance_char(parser);
+        var decoded: [byte: MAX_STRING_BUILD] = [];
+        var out_pos: usize = 0usize;
+        while true {
+            const current: byte = parser_current_byte(parser);
+            if current == 0 as byte {
+                return phase1_error(parser.ctx,
+                                    "UYABUILD_E_PARSE_STRING" as &byte,
+                                    "unterminated string literal" as &byte,
+                                    "expected a closing quote before end of file" as &byte,
+                                    source_display_path(parser.ctx, parser.file),
+                                    start_line,
+                                    start_column);
+            }
+            if current == 34 as byte {
+                _ = parser_advance_char(parser);
+                break;
+            }
+            if current == 92 as byte {
+                _ = parser_advance_char(parser);
+                const escaped: byte = parser_current_byte(parser);
+                if escaped == 0 as byte {
+                    return phase1_error(parser.ctx,
+                                        "UYABUILD_E_PARSE_STRING" as &byte,
+                                        "unterminated string escape" as &byte,
+                                        "escape sequence ended unexpectedly" as &byte,
+                                        source_display_path(parser.ctx, parser.file),
+                                        parser.line,
+                                        parser.column);
+                }
+                if out_pos + 1 >= MAX_STRING_BUILD {
+                    return phase1_error(parser.ctx,
+                                        "UYABUILD_E_PARSE_STRING" as &byte,
+                                        "string literal is too long" as &byte,
+                                        "increase the bootstrap literal buffer or shorten the literal" as &byte,
+                                        source_display_path(parser.ctx, parser.file),
+                                        start_line,
+                                        start_column);
+                }
+                if escaped == 110 as byte {
+                    decoded[out_pos] = 10 as byte;
+                } else if escaped == 114 as byte {
+                    decoded[out_pos] = 13 as byte;
+                } else if escaped == 116 as byte {
+                    decoded[out_pos] = 9 as byte;
+                } else {
+                    decoded[out_pos] = escaped;
+                }
+                out_pos = out_pos + 1;
+                _ = parser_advance_char(parser);
+                continue;
+            }
+            if out_pos + 1 >= MAX_STRING_BUILD {
+                return phase1_error(parser.ctx,
+                                    "UYABUILD_E_PARSE_STRING" as &byte,
+                                    "string literal is too long" as &byte,
+                                    "increase the bootstrap literal buffer or shorten the literal" as &byte,
+                                    source_display_path(parser.ctx, parser.file),
+                                    start_line,
+                                    start_column);
+            }
+            decoded[out_pos] = current;
+            out_pos = out_pos + 1;
+            _ = parser_advance_char(parser);
+        }
+        decoded[out_pos] = 0 as byte;
+        parser.current = Token {
+            kind: TOKEN_STRING,
+            text: arena_copy_cstr(&parser.ctx.arena, &decoded[0] as &byte),
+            span: new_source_span(start_line,
+                                  start_column,
+                                  start_offset,
+                                  parser.line,
+                                  parser.column,
+                                  usize_to_i32_checked(parser.pos)),
+        };
+        return 0;
+    }
+
+    if (ch >= 65 as byte && ch <= 90 as byte) ||
+        (ch >= 97 as byte && ch <= 122 as byte) ||
+        ch == 95 as byte {
+        const ident_start: usize = parser.pos;
+        while true {
+            const c: byte = parser_current_byte(parser);
+            if (c >= 65 as byte && c <= 90 as byte) ||
+                (c >= 97 as byte && c <= 122 as byte) ||
+                (c >= 48 as byte && c <= 57 as byte) ||
+                c == 95 as byte {
+                _ = parser_advance_char(parser);
+                continue;
+            }
+            break;
+        }
+        const ident_len: usize = parser.pos - ident_start;
+        const ident_text: &byte = arena_copy_range(&parser.ctx.arena, parser.source, ident_start, ident_len);
+        var kind: i32 = TOKEN_IDENT;
+        if string_equals(ident_text, "true" as &byte) != 0 {
+            kind = TOKEN_TRUE;
+        } else if string_equals(ident_text, "false" as &byte) != 0 {
+            kind = TOKEN_FALSE;
+        }
+        parser.current = Token {
+            kind: kind,
+            text: ident_text,
+            span: new_source_span(start_line,
+                                  start_column,
+                                  start_offset,
+                                  parser.line,
+                                  parser.column,
+                                  parser.pos as i32),
+        };
+        return 0;
+    }
+
+    return phase1_error(parser.ctx,
+                        "UYABUILD_E_PARSE_CHAR" as &byte,
+                        "unexpected character in uya.build" as &byte,
+                        "expected a declaration, field, or expression token" as &byte,
+                        source_display_path(parser.ctx, parser.file),
+                        start_line,
+                        start_column);
+}
+
+fn token_is_ident_text(token: &Token, text: &byte) i32 {
+    if token == null || token.kind != TOKEN_IDENT {
+        return 0;
+    }
+    return string_equals(token.text, text);
+}
+
+fn parser_expect(parser: &BuildParser, kind: i32, code: &byte, message: &byte, detail: &byte) i32 {
+    if parser.current.kind != kind {
+        return phase1_error(parser.ctx,
+                            code,
+                            message,
+                            detail,
+                            source_display_path(parser.ctx, parser.file),
+                            parser.current.span.start.line,
+                            parser.current.span.start.column);
+    }
+    return 0;
+}
+
+fn parser_parse_dotted_name(parser: &BuildParser, out_name: &byte) i32 {
+    if parser_expect(parser,
+                     TOKEN_IDENT,
+                     "UYABUILD_E_PARSE_IDENT" as &byte,
+                     "expected an identifier" as &byte,
+                     "declarations and fields begin with identifiers" as &byte) != 0 {
+        return -1;
+    }
+
+    var buf: [byte: MAX_STRING_BUILD] = [];
+    var out_pos: usize = 0usize;
+    var token: Token = parser.current;
+    while true {
+        const segment_len: usize = strlen(token.text);
+        if out_pos != 0 {
+            if out_pos + 1 >= MAX_STRING_BUILD {
+                return phase1_error(parser.ctx,
+                                    "UYABUILD_E_PARSE_IDENT" as &byte,
+                                    "identifier is too long" as &byte,
+                                    "reduce the dotted identifier length" as &byte,
+                                    source_display_path(parser.ctx, parser.file),
+                                    token.span.start.line,
+                                    token.span.start.column);
+            }
+            buf[out_pos] = 46 as byte;
+            out_pos = out_pos + 1;
+        }
+        if out_pos + segment_len + 1 >= MAX_STRING_BUILD {
+            return phase1_error(parser.ctx,
+                                "UYABUILD_E_PARSE_IDENT" as &byte,
+                                "identifier is too long" as &byte,
+                                "reduce the dotted identifier length" as &byte,
+                                source_display_path(parser.ctx, parser.file),
+                                token.span.start.line,
+                                token.span.start.column);
+        }
+        memcpy(&buf[out_pos] as &byte, token.text, segment_len);
+        out_pos = out_pos + segment_len;
+        buf[out_pos] = 0 as byte;
+        if parser_next_token(parser) != 0 {
+            return -1;
+        }
+        if parser.current.kind != TOKEN_DOT {
+            break;
+        }
+        if parser_next_token(parser) != 0 {
+            return -1;
+        }
+        if parser_expect(parser,
+                         TOKEN_IDENT,
+                         "UYABUILD_E_PARSE_IDENT" as &byte,
+                         "expected an identifier after '.'" as &byte,
+                         "dotted identifiers must use segment.segment syntax" as &byte) != 0 {
+            return -1;
+        }
+        token = parser.current;
+    }
+
+    const result: &byte = arena_copy_cstr(&parser.ctx.arena, &buf[0] as &byte);
+    if result == null {
+        return phase1_error(parser.ctx,
+                            "UYABUILD_E_MEMORY" as &byte,
+                            "phase1 arena is exhausted" as &byte,
+                            "increase PHASE1_ARENA_SIZE to parse larger workspaces" as &byte,
+                            source_display_path(parser.ctx, parser.file),
+                            parser.current.span.start.line,
+                            parser.current.span.start.column);
+    }
+    if copy_string(out_name, MAX_STRING_BUILD, result) != 0 {
+        return -1;
+    }
+    return 0;
+}
+
+fn parser_value_from_literal(ctx: &Phase1Context, kind: i32, span: SourceSpan, text: &byte, bool_value: i32) &AstValue {
+    const value: &AstValue = new_ast_value(ctx);
+    if value == null {
+        return null;
+    }
+    value.kind = kind;
+    value.span = span;
+    value.text = text;
+    value.bool_value = bool_value;
+    return value;
+}
+
+fn parser_parse_expr(parser: &BuildParser) &AstValue {
+    const start_span: SourceSpan = parser.current.span;
+
+    if parser.current.kind == TOKEN_STRING {
+        const value: &AstValue = parser_value_from_literal(parser.ctx,
+                                                           AST_VALUE_STRING,
+                                                           parser.current.span,
+                                                           parser.current.text,
+                                                           0);
+        if parser_next_token(parser) != 0 {
+            return null;
+        }
+        return value;
+    }
+    if parser.current.kind == TOKEN_TRUE || parser.current.kind == TOKEN_FALSE {
+        const bool_value: i32 = parser.current.kind == TOKEN_TRUE;
+        const value: &AstValue = parser_value_from_literal(parser.ctx,
+                                                           AST_VALUE_BOOL,
+                                                           parser.current.span,
+                                                           null,
+                                                           bool_value);
+        if parser_next_token(parser) != 0 {
+            return null;
+        }
+        return value;
+    }
+    if parser.current.kind == TOKEN_LBRACKET {
+        const list_value: &AstValue = new_ast_value(parser.ctx);
+        if list_value == null {
+            return null;
+        }
+        list_value.kind = AST_VALUE_LIST;
+        list_value.span = clone_span(&start_span);
+        if parser_next_token(parser) != 0 {
+            return null;
+        }
+        if parser.current.kind != TOKEN_RBRACKET {
+            while true {
+                const item_value: &AstValue = parser_parse_expr(parser);
+                if item_value == null {
+                    return null;
+                }
+                const item: &AstValueItem = new_ast_value_item(parser.ctx);
+                if item == null {
+                    return null;
+                }
+                item.value = item_value;
+                append_ast_list_item(list_value, item);
+                if parser.current.kind == TOKEN_COMMA {
+                    if parser_next_token(parser) != 0 {
+                        return null;
+                    }
+                    if parser.current.kind == TOKEN_RBRACKET {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        if parser_expect(parser,
+                         TOKEN_RBRACKET,
+                         "UYABUILD_E_PARSE_LIST" as &byte,
+                         "expected ']'" as &byte,
+                         "list literals use [item, item] syntax" as &byte) != 0 {
+            return null;
+        }
+        list_value.span.end = parser.current.span.end;
+        if parser_next_token(parser) != 0 {
+            return null;
+        }
+        return list_value;
+    }
+    if parser.current.kind == TOKEN_LBRACE {
+        const map_value: &AstValue = new_ast_value(parser.ctx);
+        if map_value == null {
+            return null;
+        }
+        map_value.kind = AST_VALUE_MAP;
+        map_value.span = clone_span(&start_span);
+        if parser_next_token(parser) != 0 {
+            return null;
+        }
+        if parser.current.kind != TOKEN_RBRACE {
+            while true {
+                if parser.current.kind != TOKEN_IDENT && parser.current.kind != TOKEN_STRING {
+                    phase1_error(parser.ctx,
+                                 "UYABUILD_E_PARSE_MAP" as &byte,
+                                 "expected a key inside map literal" as &byte,
+                                 "map keys must be identifiers or strings" as &byte,
+                                 source_display_path(parser.ctx, parser.file),
+                                 parser.current.span.start.line,
+                                 parser.current.span.start.column);
+                    return null;
+                }
+                const key_text: &byte = parser.current.text;
+                const key_span: SourceSpan = clone_span(&parser.current.span);
+                if parser_next_token(parser) != 0 {
+                    return null;
+                }
+                if parser_expect(parser,
+                                 TOKEN_EQUAL,
+                                 "UYABUILD_E_PARSE_MAP" as &byte,
+                                 "expected '=' after map key" as &byte,
+                                 "map literals use { key = value } syntax" as &byte) != 0 {
+                    return null;
+                }
+                if parser_next_token(parser) != 0 {
+                    return null;
+                }
+                const entry_value: &AstValue = parser_parse_expr(parser);
+                if entry_value == null {
+                    return null;
+                }
+                const entry: &AstMapEntry = new_ast_map_entry(parser.ctx);
+                if entry == null {
+                    return null;
+                }
+                entry.key = key_text;
+                entry.value = entry_value;
+                entry.span = clone_span(&key_span);
+                append_ast_map_entry(map_value, entry);
+                if parser.current.kind == TOKEN_COMMA {
+                    if parser_next_token(parser) != 0 {
+                        return null;
+                    }
+                    if parser.current.kind == TOKEN_RBRACE {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        if parser_expect(parser,
+                         TOKEN_RBRACE,
+                         "UYABUILD_E_PARSE_MAP" as &byte,
+                         "expected '}'" as &byte,
+                         "map literals must close with '}'" as &byte) != 0 {
+            return null;
+        }
+        map_value.span.end = parser.current.span.end;
+        if parser_next_token(parser) != 0 {
+            return null;
+        }
+        return map_value;
+    }
+    if parser.current.kind == TOKEN_IDENT {
+        var name_buf: [byte: MAX_STRING_BUILD] = [];
+        const span_start: SourceSpan = parser.current.span;
+        if parser_parse_dotted_name(parser, &name_buf[0] as &byte) != 0 {
+            return null;
+        }
+        const name_text: &byte = arena_copy_cstr(&parser.ctx.arena, &name_buf[0] as &byte);
+        if parser.current.kind != TOKEN_LPAREN {
+            return parser_value_from_literal(parser.ctx,
+                                             AST_VALUE_IDENT,
+                                             span_start,
+                                             name_text,
+                                             0);
+        }
+        const call_value: &AstValue = new_ast_value(parser.ctx);
+        if call_value == null {
+            return null;
+        }
+        call_value.kind = AST_VALUE_CALL;
+        call_value.text = name_text;
+        call_value.span = span_start;
+        if parser_next_token(parser) != 0 {
+            return null;
+        }
+        if parser.current.kind != TOKEN_RPAREN {
+            while true {
+                const arg_value: &AstValue = parser_parse_expr(parser);
+                if arg_value == null {
+                    return null;
+                }
+                const arg: &AstValueItem = new_ast_value_item(parser.ctx);
+                if arg == null {
+                    return null;
+                }
+                arg.value = arg_value;
+                append_ast_call_arg(call_value, arg);
+                if parser.current.kind == TOKEN_COMMA {
+                    if parser_next_token(parser) != 0 {
+                        return null;
+                    }
+                    if parser.current.kind == TOKEN_RPAREN {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        if parser_expect(parser,
+                         TOKEN_RPAREN,
+                         "UYABUILD_E_PARSE_CALL" as &byte,
+                         "expected ')'" as &byte,
+                         "function calls must close with ')'" as &byte) != 0 {
+            return null;
+        }
+        call_value.span.end = parser.current.span.end;
+        if parser_next_token(parser) != 0 {
+            return null;
+        }
+        return call_value;
+    }
+
+    phase1_error(parser.ctx,
+                 "UYABUILD_E_PARSE_EXPR" as &byte,
+                 "expected an expression" as &byte,
+                 "supported literals are strings, booleans, lists, maps, identifiers, and calls" as &byte,
+                 source_display_path(parser.ctx, parser.file),
+                 parser.current.span.start.line,
+                 parser.current.span.start.column);
+    return null;
+}
+
+fn parser_parse_field_block(parser: &BuildParser, decl: &AstDecl) i32 {
+    if parser_expect(parser,
+                     TOKEN_LBRACE,
+                     "UYABUILD_E_PARSE_BLOCK" as &byte,
+                     "expected '{'" as &byte,
+                     "declarations use block syntax with curly braces" as &byte) != 0 {
+        return -1;
+    }
+    if parser_next_token(parser) != 0 {
+        return -1;
+    }
+
+    while parser.current.kind != TOKEN_RBRACE {
+        if parser.current.kind == TOKEN_EOF {
+            return phase1_error(parser.ctx,
+                                "UYABUILD_E_PARSE_BLOCK" as &byte,
+                                "unterminated block" as &byte,
+                                "expected '}' before end of file" as &byte,
+                                source_display_path(parser.ctx, parser.file),
+                                decl.span.start.line,
+                                decl.span.start.column);
+        }
+        if parser.current.kind != TOKEN_IDENT {
+            return phase1_error(parser.ctx,
+                                "UYABUILD_E_PARSE_FIELD" as &byte,
+                                "expected a field name" as &byte,
+                                "blocks may only contain field assignments" as &byte,
+                                source_display_path(parser.ctx, parser.file),
+                                parser.current.span.start.line,
+                                parser.current.span.start.column);
+        }
+        const field_name: &byte = parser.current.text;
+        const field_span: SourceSpan = parser.current.span;
+        if parser_next_token(parser) != 0 {
+            return -1;
+        }
+        if parser_expect(parser,
+                         TOKEN_EQUAL,
+                         "UYABUILD_E_PARSE_FIELD" as &byte,
+                         "expected '=' after field name" as &byte,
+                         "fields use name = value syntax" as &byte) != 0 {
+            return -1;
+        }
+        if parser_next_token(parser) != 0 {
+            return -1;
+        }
+        const field_value: &AstValue = parser_parse_expr(parser);
+        if field_value == null {
+            return -1;
+        }
+        const field: &AstField = new_ast_field(parser.ctx);
+        if field == null {
+            return phase1_error(parser.ctx,
+                                "UYABUILD_E_MEMORY" as &byte,
+                                "phase1 arena is exhausted" as &byte,
+                                "increase PHASE1_ARENA_SIZE to parse larger workspaces" as &byte,
+                                source_display_path(parser.ctx, parser.file),
+                                field_span.start.line,
+                                field_span.start.column);
+        }
+        field.name = field_name;
+        field.value = field_value;
+        field.span = clone_span(&field_span);
+        append_ast_field(decl, field);
+    }
+
+    decl.span.end = parser.current.span.end;
+    return parser_next_token(parser);
+}
+
+fn parser_parse_file(ctx: &Phase1Context, file: &SourceFile) i32 {
+    var parser: BuildParser = BuildParser {
+        ctx: null,
+        file: null,
+        source: null,
+        size: 0usize,
+        pos: 0usize,
+        line: 1,
+        column: 1,
+        current: Token { kind: TOKEN_EOF, text: null, span: zero_span() },
+    };
+    parser_init(&parser, ctx, file);
+    if parser_next_token(&parser) != 0 {
+        return -1;
+    }
+
+    while parser.current.kind != TOKEN_EOF {
+        if parser.current.kind != TOKEN_IDENT {
+            return phase1_error(ctx,
+                                "UYABUILD_E_PARSE_DECL" as &byte,
+                                "expected a top-level declaration" as &byte,
+                                "top-level statements must start with workspace, config, use, include, or a rule kind" as &byte,
+                                source_display_path(ctx, file),
+                                parser.current.span.start.line,
+                                parser.current.span.start.column);
+        }
+
+        var dotted_name: [byte: MAX_STRING_BUILD] = [];
+        const decl_span_start: SourceSpan = clone_span(&parser.current.span);
+        if parser_parse_dotted_name(&parser, &dotted_name[0] as &byte) != 0 {
+            return -1;
+        }
+        const decl_name: &byte = arena_copy_cstr(&ctx.arena, &dotted_name[0] as &byte);
+        const decl: &AstDecl = new_ast_decl(ctx);
+        if decl == null {
+            return phase1_error(ctx,
+                                "UYABUILD_E_MEMORY" as &byte,
+                                "phase1 arena is exhausted" as &byte,
+                                "increase PHASE1_ARENA_SIZE to parse larger workspaces" as &byte,
+                                source_display_path(ctx, file),
+                                decl_span_start.start.line,
+                                decl_span_start.start.column);
+        }
+        decl.file = file;
+        decl.span = clone_span(&decl_span_start);
+        decl.name = decl_name;
+        decl.label_text = null;
+
+        if string_equals(decl_name, "workspace" as &byte) != 0 {
+            decl.kind = AST_DECL_WORKSPACE;
+            if parser_parse_field_block(&parser, decl) != 0 {
+                return -1;
+            }
+            append_ast_decl(file, decl);
+            continue;
+        }
+        if string_equals(decl_name, "config" as &byte) != 0 {
+            decl.kind = AST_DECL_CONFIG;
+            if parser_expect(&parser,
+                             TOKEN_STRING,
+                             "UYABUILD_E_PARSE_CONFIG" as &byte,
+                             "expected config name string" as &byte,
+                             "config declarations use config \"name\" { ... } syntax" as &byte) != 0 {
+                return -1;
+            }
+            decl.label_text = parser.current.text;
+            if parser_next_token(&parser) != 0 {
+                return -1;
+            }
+            if parser_parse_field_block(&parser, decl) != 0 {
+                return -1;
+            }
+            append_ast_decl(file, decl);
+            continue;
+        }
+        if string_equals(decl_name, "use" as &byte) != 0 {
+            decl.kind = AST_DECL_USE;
+            if parser_expect(&parser,
+                             TOKEN_IDENT,
+                             "UYABUILD_E_PARSE_USE" as &byte,
+                             "expected rule pack name after use" as &byte,
+                             "use declarations name a rule pack such as cxx or node" as &byte) != 0 {
+                return -1;
+            }
+            var use_name_buf: [byte: MAX_STRING_BUILD] = [];
+            if parser_parse_dotted_name(&parser, &use_name_buf[0] as &byte) != 0 {
+                return -1;
+            }
+            decl.label_text = arena_copy_cstr(&ctx.arena, &use_name_buf[0] as &byte);
+            decl.span.end = decl_span_start.end;
+            append_ast_decl(file, decl);
+            continue;
+        }
+        if string_equals(decl_name, "include" as &byte) != 0 {
+            decl.kind = AST_DECL_INCLUDE;
+            if parser_expect(&parser,
+                             TOKEN_STRING,
+                             "UYABUILD_E_PARSE_INCLUDE" as &byte,
+                             "expected include pattern string" as &byte,
+                             "include declarations use include \"path/uya.build\" syntax" as &byte) != 0 {
+                return -1;
+            }
+            decl.label_text = parser.current.text;
+            decl.span.end = parser.current.span.end;
+            if parser_next_token(&parser) != 0 {
+                return -1;
+            }
+            append_ast_decl(file, decl);
+            continue;
+        }
+
+        decl.kind = AST_DECL_TARGET;
+        if parser_expect(&parser,
+                         TOKEN_STRING,
+                         "UYABUILD_E_PARSE_TARGET" as &byte,
+                         "expected target label string" as &byte,
+                         "target declarations use rule.kind \"//pkg:name\" { ... } syntax" as &byte) != 0 {
+            return -1;
+        }
+        decl.label_text = parser.current.text;
+        if parser_next_token(&parser) != 0 {
+            return -1;
+        }
+        if parser_parse_field_block(&parser, decl) != 0 {
+            return -1;
+        }
+        append_ast_decl(file, decl);
+    }
+
+    return 0;
+}
+
+fn new_pattern_segment(ctx: &Phase1Context) &PatternSegment {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(PatternSegment));
+    if mem == null {
+        return null;
+    }
+    return mem as &PatternSegment;
+}
+
+fn wildcard_match(name: &byte, pattern: &byte) i32 {
+    if name == null || pattern == null {
+        return 0;
+    }
+    var ni: usize = 0usize;
+    var pi: usize = 0usize;
+    var star_pi: i32 = -1;
+    var star_ni: usize = 0usize;
+
+    while name[ni] != 0 as byte {
+        if pattern[pi] == name[ni] || pattern[pi] == 63 as byte {
+            ni = ni + 1;
+            pi = pi + 1;
+            continue;
+        }
+        if pattern[pi] == 42 as byte {
+            star_pi = usize_to_i32_checked(pi);
+            pi = pi + 1;
+            star_ni = ni;
+            continue;
+        }
+        if star_pi >= 0 {
+            pi = (star_pi as usize) + 1usize;
+            star_ni = star_ni + 1usize;
+            ni = star_ni;
+            continue;
+        }
+        return 0;
+    }
+
+    while pattern[pi] == 42 as byte {
+        pi = pi + 1usize;
+    }
+    if pattern[pi] == 0 as byte {
+        return 1;
+    }
+    return 0;
+}
+
+fn parse_pattern_segments(ctx: &Phase1Context, pattern: &byte) &PatternSegment {
+    if pattern == null {
+        return null;
+    }
+    var start: usize = 0usize;
+    var head: &PatternSegment = null;
+    var tail: &PatternSegment = null;
+
+    while true {
+        while pattern[start] == 47 as byte {
+            start = start + 1usize;
+        }
+        if pattern[start] == 0 as byte {
+            break;
+        }
+        var end: usize = start;
+        while pattern[end] != 0 as byte && pattern[end] != 47 as byte {
+            end = end + 1usize;
+        }
+        const segment: &PatternSegment = new_pattern_segment(ctx);
+        if segment == null {
+            return head;
+        }
+        segment.text = arena_copy_range(&ctx.arena, pattern, start, end - start);
+        if head == null {
+            head = segment;
+            tail = segment;
+        } else {
+            tail.next = segment;
+            tail = segment;
+        }
+        start = end;
+    }
+
+    return head;
+}
+
+fn glob_collect_recursive(ctx: &Phase1Context,
+                          base_abs: &byte,
+                          current_rel: &byte,
+                          segment: &PatternSegment,
+                          results: &StringNode,
+                          matched_count: &i32) &StringNode {
+    var current_abs: [byte: PATH_MAX] = [];
+    var results_mut: &StringNode = results;
+    if current_rel == null || string_equals(current_rel, "" as &byte) != 0 {
+        if copy_string(&current_abs[0] as &byte, PATH_MAX, base_abs) != 0 {
+            return results_mut;
+        }
+    } else if join_and_normalize_path(base_abs, current_rel, &current_abs[0] as &byte, PATH_MAX) != 0 {
+        return results_mut;
+    }
+
+    if segment == null {
+        if path_is_file(&current_abs[0] as &byte) != 0 {
+            var inserted: i32 = 0;
+            results_mut = sorted_string_insert(ctx, results_mut, current_rel, &inserted);
+            if inserted != 0 {
+                matched_count[0] = matched_count[0] + 1;
+            }
+        }
+        return results_mut;
+    }
+
+    if string_equals(segment.text, "**" as &byte) != 0 {
+        results_mut = glob_collect_recursive(ctx, base_abs, current_rel, segment.next, results_mut, matched_count);
+        const dir_zero: &DIR = opendir(&current_abs[0] as &const byte);
+        if dir_zero == null {
+            return results_mut;
+        }
+        var entry_zero: &Dirent = readdir(dir_zero);
+        while entry_zero != null {
+            if is_dirent_dot(&entry_zero.d_name[0] as &byte) == 0 {
+                var next_rel: [byte: PATH_MAX] = [];
+                var next_abs: [byte: PATH_MAX] = [];
+                if string_equals(current_rel, "" as &byte) != 0 {
+                    if copy_string(&next_rel[0] as &byte, PATH_MAX, &entry_zero.d_name[0] as &byte) == 0 &&
+                        join_and_normalize_path(base_abs,
+                                                &next_rel[0] as &byte,
+                                                &next_abs[0] as &byte,
+                                                PATH_MAX) == 0 &&
+                        dirent_is_directory(entry_zero, &next_abs[0] as &byte) != 0 {
+                        results_mut = glob_collect_recursive(ctx,
+                                                             base_abs,
+                                                             &next_rel[0] as &byte,
+                                                             segment,
+                                                             results_mut,
+                                                             matched_count);
+                    }
+                } else if join_path(current_rel,
+                                    &entry_zero.d_name[0] as &byte,
+                                    &next_rel[0] as &byte,
+                                    PATH_MAX) == 0 &&
+                    join_and_normalize_path(base_abs,
+                                            &next_rel[0] as &byte,
+                                            &next_abs[0] as &byte,
+                                            PATH_MAX) == 0 &&
+                    dirent_is_directory(entry_zero, &next_abs[0] as &byte) != 0 {
+                    results_mut = glob_collect_recursive(ctx,
+                                                         base_abs,
+                                                         &next_rel[0] as &byte,
+                                                         segment,
+                                                         results_mut,
+                                                         matched_count);
+                }
+            }
+            entry_zero = readdir(dir_zero);
+        }
+        _ = closedir(dir_zero);
+        return results_mut;
+    }
+
+    const dir: &DIR = opendir(&current_abs[0] as &const byte);
+    if dir == null {
+        return results_mut;
+    }
+
+    var entry: &Dirent = readdir(dir);
+    while entry != null {
+        const entry_name: &byte = &entry.d_name[0] as &byte;
+        if is_dirent_dot(entry_name) == 0 && wildcard_match(entry_name, segment.text) != 0 {
+            var next_rel: [byte: PATH_MAX] = [];
+            var next_abs: [byte: PATH_MAX] = [];
+            if string_equals(current_rel, "" as &byte) != 0 {
+                if copy_string(&next_rel[0] as &byte, PATH_MAX, entry_name) != 0 {
+                    entry = readdir(dir);
+                    continue;
+                }
+            } else if join_path(current_rel, entry_name, &next_rel[0] as &byte, PATH_MAX) != 0 {
+                entry = readdir(dir);
+                continue;
+            }
+            if join_and_normalize_path(base_abs, &next_rel[0] as &byte, &next_abs[0] as &byte, PATH_MAX) != 0 {
+                entry = readdir(dir);
+                continue;
+            }
+
+            if segment.next == null {
+                if dirent_is_regular_file(entry, &next_abs[0] as &byte) != 0 {
+                    var inserted: i32 = 0;
+                    results_mut = sorted_string_insert(ctx, results_mut, &next_rel[0] as &byte, &inserted);
+                    if inserted != 0 {
+                        matched_count[0] = matched_count[0] + 1;
+                    }
+                }
+            } else if dirent_is_directory(entry, &next_abs[0] as &byte) != 0 {
+                results_mut = glob_collect_recursive(ctx,
+                                                     base_abs,
+                                                     &next_rel[0] as &byte,
+                                                     segment.next,
+                                                     results_mut,
+                                                     matched_count);
+            }
+        }
+        entry = readdir(dir);
+    }
+
+    _ = closedir(dir);
+    return results_mut;
+}
+
+fn collect_glob_matches(ctx: &Phase1Context,
+                        base_abs: &byte,
+                        pattern: &byte,
+                        matched_count: &i32) &StringNode {
+    const segments: &PatternSegment = parse_pattern_segments(ctx, pattern);
+    matched_count[0] = 0;
+    return glob_collect_recursive(ctx, base_abs, "" as &byte, segments, null, matched_count);
+}
+
+fn load_build_file(ctx: &Phase1Context, abs_path: &byte, is_root: i32) i32 {
+    var normalized: [byte: PATH_MAX] = [];
+    if normalize_path_text(abs_path, &normalized[0] as &byte, PATH_MAX) != 0 {
+        return phase1_error(ctx,
+                            "UYABUILD_E_PATH" as &byte,
+                            "failed to normalize build file path" as &byte,
+                            abs_path,
+                            source_display_path(ctx, null),
+                            0,
+                            0);
+    }
+    if find_source_file(ctx, &normalized[0] as &byte) != null {
+        return 0;
+    }
+    if path_is_file(&normalized[0] as &byte) == 0 {
+        return phase1_error(ctx,
+                            "UYABUILD_E_LOAD_FILE" as &byte,
+                            "uya.build include target does not exist" as &byte,
+                            &normalized[0] as &byte,
+                            "" as &byte,
+                            0,
+                            0);
+    }
+
+    const file: &SourceFile = new_source_file(ctx);
+    if file == null {
+        return phase1_error(ctx,
+                            "UYABUILD_E_MEMORY" as &byte,
+                            "phase1 arena is exhausted" as &byte,
+                            "increase PHASE1_ARENA_SIZE to parse larger workspaces" as &byte,
+                            "" as &byte,
+                            0,
+                            0);
+    }
+    file.abs_path = arena_copy_cstr(&ctx.arena, &normalized[0] as &byte);
+    file.is_root = is_root;
+
+    var rel_buf: [byte: PATH_MAX] = [];
+    if path_relative_to_root(ctx.workspace_root,
+                             &normalized[0] as &byte,
+                             &rel_buf[0] as &byte,
+                             PATH_MAX) != 0 {
+        return phase1_error(ctx,
+                            "UYABUILD_E_PATH" as &byte,
+                            "failed to derive relative build file path" as &byte,
+                            &normalized[0] as &byte,
+                            "" as &byte,
+                            0,
+                            0);
+    }
+    file.rel_path = arena_copy_cstr(&ctx.arena, &rel_buf[0] as &byte);
+
+    var dir_buf: [byte: PATH_MAX] = [];
+    if path_dirname_text(&normalized[0] as &byte, &dir_buf[0] as &byte, PATH_MAX) != 0 {
+        return phase1_error(ctx,
+                            "UYABUILD_E_PATH" as &byte,
+                            "failed to compute build file directory" as &byte,
+                            &normalized[0] as &byte,
+                            "" as &byte,
+                            0,
+                            0);
+    }
+    file.dir_abs = arena_copy_cstr(&ctx.arena, &dir_buf[0] as &byte);
+
+    var package_buf: [byte: PATH_MAX] = [];
+    if package_from_rel_path(&rel_buf[0] as &byte, &package_buf[0] as &byte, PATH_MAX) != 0 {
+        return phase1_error(ctx,
+                            "UYABUILD_E_PATH" as &byte,
+                            "failed to derive package path from uya.build" as &byte,
+                            &rel_buf[0] as &byte,
+                            "" as &byte,
+                            0,
+                            0);
+    }
+    file.package_path = arena_copy_cstr(&ctx.arena, &package_buf[0] as &byte);
+
+    var file_size: usize = 0usize;
+    file.content = read_file_into_arena(ctx, &normalized[0] as &byte, &file_size);
+    if file.content == null {
+        return phase1_error(ctx,
+                            "UYABUILD_E_LOAD_FILE" as &byte,
+                            "failed to read uya.build file" as &byte,
+                            &normalized[0] as &byte,
+                            file.rel_path,
+                            0,
+                            0);
+    }
+    file.size = file_size;
+
+    append_source_file(ctx, file);
+    if parser_parse_file(ctx, file) != 0 {
+        return -1;
+    }
+
+    var decl: &AstDecl = file.decl_head;
+    while decl != null {
+        if decl.kind == AST_DECL_INCLUDE {
+            var matched_count: i32 = 0;
+            var matches: &StringNode = collect_glob_matches(ctx, file.dir_abs, decl.label_text, &matched_count);
+            if matched_count == 0 {
+                return phase1_error(ctx,
+                                    "UYABUILD_E_INCLUDE_EMPTY" as &byte,
+                                    "include pattern did not match any uya.build files" as &byte,
+                                    decl.label_text,
+                                    file.rel_path,
+                                    decl.span.start.line,
+                                    decl.span.start.column);
+            }
+            var node: &StringNode = matches;
+            while node != null {
+                var include_abs: [byte: PATH_MAX] = [];
+                if join_and_normalize_path(file.dir_abs,
+                                           node.text,
+                                           &include_abs[0] as &byte,
+                                           PATH_MAX) != 0 {
+                    return phase1_error(ctx,
+                                        "UYABUILD_E_INCLUDE_PATH" as &byte,
+                                        "failed to resolve include path" as &byte,
+                                        node.text,
+                                        file.rel_path,
+                                        decl.span.start.line,
+                                        decl.span.start.column);
+                }
+                if load_build_file(ctx, &include_abs[0] as &byte, 0) != 0 {
+                    return -1;
+                }
+                node = node.next;
+            }
+        }
+        decl = decl.next;
+    }
+
+    return 0;
+}
+
+fn load_workspace_files(ctx: &Phase1Context) i32 {
+    var root_build: [byte: PATH_MAX] = [];
+    if join_path(ctx.workspace_root,
+                 "uya.build" as &byte,
+                 &root_build[0] as &byte,
+                 PATH_MAX) != 0 {
+        return phase1_error(ctx,
+                            "UYABUILD_E_PATH" as &byte,
+                            "failed to construct root uya.build path" as &byte,
+                            ctx.workspace_root,
+                            "" as &byte,
+                            0,
+                            0);
+    }
+    if path_is_file(&root_build[0] as &byte) == 0 {
+        return phase1_error(ctx,
+                            "UYABUILD_E_ROOT_BUILD" as &byte,
+                            "root workspace is missing uya.build" as &byte,
+                            "Phase 1 requires uya.build as the authoritative build graph entrypoint" as &byte,
+                            "" as &byte,
+                            0,
+                            0);
+    }
+    ctx.root_build_path = arena_copy_cstr(&ctx.arena, &root_build[0] as &byte);
+
+    var root_toml: [byte: PATH_MAX] = [];
+    if join_path(ctx.workspace_root,
+                 "uya.toml" as &byte,
+                 &root_toml[0] as &byte,
+                 PATH_MAX) == 0 &&
+        path_is_file(&root_toml[0] as &byte) != 0 {
+        ctx.root_toml_path = arena_copy_cstr(&ctx.arena, &root_toml[0] as &byte);
+    }
+
+    return load_build_file(ctx, ctx.root_build_path, 1);
+}
+
+fn typed_make_string(ctx: &Phase1Context, span: SourceSpan, text: &byte) &TypedValue {
+    const value: &TypedValue = new_typed_value(ctx);
+    if value == null {
+        return null;
+    }
+    value.kind = TYPED_VALUE_STRING;
+    value.span = span;
+    value.text = arena_copy_cstr(&ctx.arena, text);
+    return value;
+}
+
+fn typed_make_label(ctx: &Phase1Context, span: SourceSpan, text: &byte) &TypedValue {
+    const value: &TypedValue = new_typed_value(ctx);
+    if value == null {
+        return null;
+    }
+    value.kind = TYPED_VALUE_LABEL;
+    value.span = span;
+    value.text = arena_copy_cstr(&ctx.arena, text);
+    return value;
+}
+
+fn typed_make_bool(ctx: &Phase1Context, span: SourceSpan, bool_value: i32) &TypedValue {
+    const value: &TypedValue = new_typed_value(ctx);
+    if value == null {
+        return null;
+    }
+    value.kind = TYPED_VALUE_BOOL;
+    value.span = span;
+    value.bool_value = bool_value;
+    return value;
+}
+
+fn typed_make_ident(ctx: &Phase1Context, span: SourceSpan, text: &byte) &TypedValue {
+    const value: &TypedValue = new_typed_value(ctx);
+    if value == null {
+        return null;
+    }
+    value.kind = TYPED_VALUE_IDENT;
+    value.span = span;
+    value.text = arena_copy_cstr(&ctx.arena, text);
+    return value;
+}
+
+fn typed_make_list(ctx: &Phase1Context, span: SourceSpan) &TypedValue {
+    const value: &TypedValue = new_typed_value(ctx);
+    if value == null {
+        return null;
+    }
+    value.kind = TYPED_VALUE_LIST;
+    value.span = span;
+    return value;
+}
+
+fn typed_make_map(ctx: &Phase1Context, span: SourceSpan) &TypedValue {
+    const value: &TypedValue = new_typed_value(ctx);
+    if value == null {
+        return null;
+    }
+    value.kind = TYPED_VALUE_MAP;
+    value.span = span;
+    return value;
+}
+
+fn typed_make_call(ctx: &Phase1Context, span: SourceSpan, name: &byte) &TypedValue {
+    const value: &TypedValue = new_typed_value(ctx);
+    if value == null {
+        return null;
+    }
+    value.kind = TYPED_VALUE_CALL;
+    value.span = span;
+    value.call_name = arena_copy_cstr(&ctx.arena, name);
+    return value;
+}
+
+fn typed_list_append_value(ctx: &Phase1Context, list_value: &TypedValue, child: &TypedValue) i32 {
+    const item: &TypedValueItem = new_typed_value_item(ctx);
+    if item == null {
+        return -1;
+    }
+    item.value = child;
+    append_typed_list_item(list_value, item);
+    return 0;
+}
+
+fn typed_call_append_arg(ctx: &Phase1Context, call_value: &TypedValue, child: &TypedValue) i32 {
+    const item: &TypedValueItem = new_typed_value_item(ctx);
+    if item == null {
+        return -1;
+    }
+    item.value = child;
+    append_typed_call_arg(call_value, item);
+    return 0;
+}
+
+fn typed_map_append_entry(ctx: &Phase1Context, map_value: &TypedValue, key: &byte, child: &TypedValue) i32 {
+    const entry: &TypedMapEntry = new_typed_map_entry(ctx);
+    if entry == null {
+        return -1;
+    }
+    entry.key = arena_copy_cstr(&ctx.arena, key);
+    entry.value = child;
+    append_typed_map_entry(map_value, entry);
+    return 0;
+}
+
+fn build_label_text(ctx: &Phase1Context, package_path: &byte, name: &byte) &byte {
+    var buf: [byte: PATH_MAX] = [];
+    if package_path == null || package_path[0] == 0 as byte {
+        _ = snprintf(&buf[0] as *byte, PATH_MAX, "//:%s" as *byte, name as *byte);
+    } else {
+        _ = snprintf(&buf[0] as *byte, PATH_MAX, "//%s:%s" as *byte, package_path as *byte, name as *byte);
+    }
+    return arena_copy_cstr(&ctx.arena, &buf[0] as &byte);
+}
+
+fn rule_pack_for_kind(kind: &byte) &byte {
+    if string_has_prefix(kind, "cxx." as &byte) != 0 {
+        return "cxx" as &byte;
+    }
+    if string_has_prefix(kind, "node." as &byte) != 0 {
+        return "node" as &byte;
+    }
+    if string_has_prefix(kind, "oci." as &byte) != 0 {
+        return "oci" as &byte;
+    }
+    if string_has_prefix(kind, "legacy." as &byte) != 0 {
+        return "legacy" as &byte;
+    }
+    if string_equals(kind, "task" as &byte) != 0 {
+        return "" as &byte;
+    }
+    return null;
+}
+
+fn provider_mask_for_kind(kind: &byte) u32 {
+    if string_equals(kind, "cxx.library" as &byte) != 0 {
+        return PROVIDER_CXX_LINKABLE;
+    }
+    if string_equals(kind, "node.workspace" as &byte) != 0 {
+        return PROVIDER_NODE_WORKSPACE;
+    }
+    if string_equals(kind, "node.app" as &byte) != 0 {
+        return PROVIDER_NODE_APP;
+    }
+    if string_equals(kind, "oci.image" as &byte) != 0 {
+        return PROVIDER_OCI_IMAGE;
+    }
+    if string_equals(kind, "legacy.shell" as &byte) != 0 {
+        return PROVIDER_LEGACY_ACTION;
+    }
+    if string_equals(kind, "task" as &byte) != 0 {
+        return PROVIDER_TASK;
+    }
+    return 0u32;
+}
+
+fn field_expected_type(kind: &byte, field_name: &byte) i32 {
+    if string_equals(field_name, "deps" as &byte) != 0 {
+        return EXPECT_LABEL_LIST;
+    }
+    if string_equals(field_name, "tags" as &byte) != 0 ||
+        string_equals(field_name, "visibility" as &byte) != 0 {
+        return EXPECT_STRING_LIST;
+    }
+
+    if string_equals(kind, "cxx.library" as &byte) != 0 {
+        if string_equals(field_name, "srcs" as &byte) != 0 ||
+            string_equals(field_name, "hdrs" as &byte) != 0 ||
+            string_equals(field_name, "include_dirs" as &byte) != 0 {
+            return EXPECT_STRING_LIST;
+        }
+        if string_equals(field_name, "discover" as &byte) != 0 {
+            return EXPECT_CALL;
+        }
+        return -1;
+    }
+    if string_equals(kind, "cxx.binary" as &byte) != 0 {
+        if string_equals(field_name, "srcs" as &byte) != 0 {
+            return EXPECT_STRING_LIST;
+        }
+        if string_equals(field_name, "out" as &byte) != 0 ||
+            string_equals(field_name, "toolchain" as &byte) != 0 {
+            return EXPECT_STRING;
+        }
+        return -1;
+    }
+    if string_equals(kind, "node.workspace" as &byte) != 0 {
+        if string_equals(field_name, "root" as &byte) != 0 ||
+            string_equals(field_name, "lockfile" as &byte) != 0 {
+            return EXPECT_STRING;
+        }
+        if string_equals(field_name, "workspaces" as &byte) != 0 {
+            return EXPECT_BOOL;
+        }
+        return -1;
+    }
+    if string_equals(kind, "node.app" as &byte) != 0 {
+        if string_equals(field_name, "workspace" as &byte) != 0 {
+            return EXPECT_LABEL;
+        }
+        if string_equals(field_name, "package" as &byte) != 0 ||
+            string_equals(field_name, "out" as &byte) != 0 {
+            return EXPECT_STRING;
+        }
+        return -1;
+    }
+    if string_equals(kind, "oci.image" as &byte) != 0 {
+        if string_equals(field_name, "dockerfile" as &byte) != 0 ||
+            string_equals(field_name, "context" as &byte) != 0 {
+            return EXPECT_STRING;
+        }
+        if string_equals(field_name, "tags" as &byte) != 0 {
+            return EXPECT_STRING_LIST;
+        }
+        return -1;
+    }
+    if string_equals(kind, "legacy.shell" as &byte) != 0 {
+        if string_equals(field_name, "script" as &byte) != 0 ||
+            string_equals(field_name, "run" as &byte) != 0 ||
+            string_equals(field_name, "inputs" as &byte) != 0 ||
+            string_equals(field_name, "outputs" as &byte) != 0 ||
+            string_equals(field_name, "env_allowlist" as &byte) != 0 {
+            return EXPECT_STRING_LIST;
+        }
+        if string_equals(field_name, "mode" as &byte) != 0 {
+            return EXPECT_STRING;
+        }
+        if string_equals(field_name, "always" as &byte) != 0 {
+            return EXPECT_BOOL;
+        }
+        return -1;
+    }
+    if string_equals(kind, "task" as &byte) != 0 {
+        if string_equals(field_name, "run" as &byte) != 0 {
+            return EXPECT_STRING_LIST;
+        }
+        if string_equals(field_name, "always" as &byte) != 0 {
+            return EXPECT_BOOL;
+        }
+        return -1;
+    }
+    return -1;
+}
+
+fn workspace_field_expected_type(field_name: &byte) i32 {
+    if string_equals(field_name, "name" as &byte) != 0 {
+        return EXPECT_STRING;
+    }
+    if string_equals(field_name, "default" as &byte) != 0 {
+        return EXPECT_LABEL_LIST;
+    }
+    if string_equals(field_name, "strict" as &byte) != 0 {
+        return EXPECT_BOOL;
+    }
+    return -1;
+}
+
+fn normalize_label(ctx: &Phase1Context,
+                   base_package: &byte,
+                   raw: &byte,
+                   display_file: &byte,
+                   line: i32,
+                   column: i32) &byte {
+    if raw == null || raw[0] == 0 as byte {
+        phase1_error(ctx,
+                     "UYABUILD_E_LABEL_SYNTAX" as &byte,
+                     "empty label is not allowed" as &byte,
+                     "labels must resolve to //pkg:name or :name" as &byte,
+                     display_file,
+                     line,
+                     column);
+        return null;
+    }
+
+    if string_has_prefix(raw, "//" as &byte) != 0 {
+        var colon_index: i32 = -1;
+        var i: usize = 2usize;
+        while raw[i] != 0 as byte {
+            if raw[i] == 58 as byte {
+                colon_index = usize_to_i32_checked(i);
+                break;
+            }
+            i = i + 1usize;
+        }
+        if colon_index < 2 {
+            phase1_error(ctx,
+                         "UYABUILD_E_LABEL_SYNTAX" as &byte,
+                         "absolute label is missing ':'" as &byte,
+                         raw,
+                         display_file,
+                         line,
+                         column);
+            return null;
+        }
+        const package_text: &byte = arena_copy_range(&ctx.arena, raw, 2usize, (colon_index as usize) - 2usize);
+        const name_text: &byte = arena_copy_range(&ctx.arena,
+                                                  raw,
+                                                  (colon_index as usize) + 1usize,
+                                                  strlen(raw) - ((colon_index as usize) + 1usize));
+        if name_text == null || name_text[0] == 0 as byte {
+            phase1_error(ctx,
+                         "UYABUILD_E_LABEL_SYNTAX" as &byte,
+                         "absolute label is missing target name" as &byte,
+                         raw,
+                         display_file,
+                         line,
+                         column);
+            return null;
+        }
+        return build_label_text(ctx, package_text, name_text);
+    }
+
+    if raw[0] == 58 as byte {
+        const name_text: &byte = arena_copy_range(&ctx.arena, raw, 1usize, strlen(raw) - 1usize);
+        if name_text == null || name_text[0] == 0 as byte {
+            phase1_error(ctx,
+                         "UYABUILD_E_LABEL_SYNTAX" as &byte,
+                         "relative label is missing target name" as &byte,
+                         raw,
+                         display_file,
+                         line,
+                         column);
+            return null;
+        }
+        return build_label_text(ctx, base_package, name_text);
+    }
+
+    var colon_index_local: i32 = -1;
+    var j: usize = 0usize;
+    while raw[j] != 0 as byte {
+        if raw[j] == 58 as byte {
+                colon_index_local = usize_to_i32_checked(j);
+            break;
+        }
+        j = j + 1usize;
+    }
+
+    if colon_index_local >= 0 {
+        const rel_pkg: &byte = arena_copy_range(&ctx.arena, raw, 0usize, colon_index_local as usize);
+        const rel_name: &byte = arena_copy_range(&ctx.arena,
+                                                 raw,
+                                                 (colon_index_local as usize) + 1usize,
+                                                 strlen(raw) - ((colon_index_local as usize) + 1usize));
+        if rel_name == null || rel_name[0] == 0 as byte {
+            phase1_error(ctx,
+                         "UYABUILD_E_LABEL_SYNTAX" as &byte,
+                         "relative label is missing target name" as &byte,
+                         raw,
+                         display_file,
+                         line,
+                         column);
+            return null;
+        }
+        if base_package == null || base_package[0] == 0 as byte {
+            return build_label_text(ctx, rel_pkg, rel_name);
+        }
+        var package_buf: [byte: PATH_MAX] = [];
+        if join_and_normalize_path(base_package, rel_pkg, &package_buf[0] as &byte, PATH_MAX) != 0 {
+            phase1_error(ctx,
+                         "UYABUILD_E_LABEL_SYNTAX" as &byte,
+                         "failed to normalize relative package label" as &byte,
+                         raw,
+                         display_file,
+                         line,
+                         column);
+            return null;
+        }
+        if string_equals(&package_buf[0] as &byte, "." as &byte) != 0 {
+            return build_label_text(ctx, "" as &byte, rel_name);
+        }
+        return build_label_text(ctx, &package_buf[0] as &byte, rel_name);
+    }
+
+    return build_label_text(ctx, base_package, raw);
+}
+
+fn typed_value_equals(left: &TypedValue, right: &TypedValue) i32 {
+    if left == null && right == null {
+        return 1;
+    }
+    if left == null || right == null {
+        return 0;
+    }
+    if left.kind != right.kind {
+        return 0;
+    }
+    if left.kind == TYPED_VALUE_STRING ||
+        left.kind == TYPED_VALUE_LABEL ||
+        left.kind == TYPED_VALUE_IDENT {
+        return string_equals(left.text, right.text);
+    }
+    if left.kind == TYPED_VALUE_BOOL {
+        if left.bool_value == right.bool_value {
+            return 1;
+        }
+        return 0;
+    }
+    if left.kind == TYPED_VALUE_LIST {
+        var li: &TypedValueItem = left.list_head;
+        var ri: &TypedValueItem = right.list_head;
+        while li != null && ri != null {
+            if typed_value_equals(li.value, ri.value) == 0 {
+                return 0;
+            }
+            li = li.next;
+            ri = ri.next;
+        }
+        if li != null || ri != null {
+            return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+fn typed_merge_list(ctx: &Phase1Context, dst: &TypedValue, src: &TypedValue) i32 {
+    if dst == null || src == null || dst.kind != TYPED_VALUE_LIST || src.kind != TYPED_VALUE_LIST {
+        return -1;
+    }
+    var item: &TypedValueItem = src.list_head;
+    while item != null {
+        if typed_list_append_value(ctx, dst, item.value) != 0 {
+            return -1;
+        }
+        item = item.next;
+    }
+    return 0;
+}
+
+fn analyze_select_call(ctx: &Phase1Context,
+                       file: &SourceFile,
+                       base_package: &byte,
+                       base_dir: &byte,
+                       ast: &AstValue,
+                       expected: i32) &TypedValue {
+    const call_value: &TypedValue = typed_make_call(ctx, ast.span, "select" as &byte);
+    if call_value == null {
+        return null;
+    }
+    var arg: &AstValueItem = ast.arg_head;
+    while arg != null {
+        var typed_arg: &TypedValue = null;
+        if arg.value.kind == AST_VALUE_MAP {
+            typed_arg = typed_make_map(ctx, arg.value.span);
+            if typed_arg == null {
+                return null;
+            }
+            var entry: &AstMapEntry = arg.value.map_head;
+            while entry != null {
+                const child: &TypedValue = analyze_value(ctx,
+                                                         file,
+                                                         base_package,
+                                                         base_dir,
+                                                         entry.value,
+                                                         expected);
+                if child == null {
+                    return null;
+                }
+                if typed_map_append_entry(ctx, typed_arg, entry.key, child) != 0 {
+                    return null;
+                }
+                entry = entry.next;
+            }
+        } else {
+            typed_arg = analyze_value(ctx, file, base_package, base_dir, arg.value, EXPECT_ANY);
+            if typed_arg == null {
+                return null;
+            }
+        }
+        if typed_call_append_arg(ctx, call_value, typed_arg) != 0 {
+            return null;
+        }
+        arg = arg.next;
+    }
+    return call_value;
+}
+
+fn evaluate_glob_call(ctx: &Phase1Context,
+                      file: &SourceFile,
+                      base_dir: &byte,
+                      ast: &AstValue) &TypedValue {
+    const collected: &TypedValue = typed_make_list(ctx, ast.span);
+    if collected == null {
+        return null;
+    }
+    var seen: &StringNode = null;
+
+    var arg: &AstValueItem = ast.arg_head;
+    while arg != null {
+        if arg.value.kind == AST_VALUE_STRING {
+            var matched_count: i32 = 0;
+            var matches: &StringNode = collect_glob_matches(ctx, base_dir, arg.value.text, &matched_count);
+            var node: &StringNode = matches;
+            while node != null {
+                var inserted: i32 = 0;
+                seen = sorted_string_insert(ctx, seen, node.text, &inserted);
+                node = node.next;
+            }
+        } else if arg.value.kind == AST_VALUE_LIST {
+            var item: &AstValueItem = arg.value.list_head;
+            while item != null {
+                if item.value.kind != AST_VALUE_STRING {
+                    phase1_error(ctx,
+                                 "UYABUILD_E_GLOB_ARG" as &byte,
+                                 "glob() only accepts string patterns" as &byte,
+                                 "use glob(\"path/**/*.cc\") or glob([\"a\", \"b\"])" as &byte,
+                                 file.rel_path,
+                                 item.value.span.start.line,
+                                 item.value.span.start.column);
+                    return null;
+                }
+                var matched_count_list: i32 = 0;
+                var matches_list: &StringNode = collect_glob_matches(ctx, base_dir, item.value.text, &matched_count_list);
+                var node_list: &StringNode = matches_list;
+                while node_list != null {
+                    var inserted_list: i32 = 0;
+                    seen = sorted_string_insert(ctx, seen, node_list.text, &inserted_list);
+                    node_list = node_list.next;
+                }
+                item = item.next;
+            }
+        } else {
+            phase1_error(ctx,
+                         "UYABUILD_E_GLOB_ARG" as &byte,
+                         "glob() only accepts string patterns" as &byte,
+                         "use glob(\"path/**/*.cc\") or glob([\"a\", \"b\"])" as &byte,
+                         file.rel_path,
+                         arg.value.span.start.line,
+                         arg.value.span.start.column);
+            return null;
+        }
+        arg = arg.next;
+    }
+
+    var node_out: &StringNode = seen;
+    while node_out != null {
+        const string_value: &TypedValue = typed_make_string(ctx, ast.span, node_out.text);
+        if string_value == null {
+            return null;
+        }
+        if typed_list_append_value(ctx, collected, string_value) != 0 {
+            return null;
+        }
+        node_out = node_out.next;
+    }
+
+    return collected;
+}
+
+fn analyze_generic_call(ctx: &Phase1Context,
+                        file: &SourceFile,
+                        base_package: &byte,
+                        base_dir: &byte,
+                        ast: &AstValue) &TypedValue {
+    if string_equals(ast.text, "glob" as &byte) != 0 {
+        return evaluate_glob_call(ctx, file, base_dir, ast);
+    }
+    if string_equals(ast.text, "select" as &byte) != 0 {
+        return analyze_select_call(ctx, file, base_package, base_dir, ast, EXPECT_ANY);
+    }
+
+    const call_value: &TypedValue = typed_make_call(ctx, ast.span, ast.text);
+    if call_value == null {
+        return null;
+    }
+    var arg: &AstValueItem = ast.arg_head;
+    while arg != null {
+        const child: &TypedValue = analyze_value(ctx, file, base_package, base_dir, arg.value, EXPECT_ANY);
+        if child == null {
+            return null;
+        }
+        if typed_call_append_arg(ctx, call_value, child) != 0 {
+            return null;
+        }
+        arg = arg.next;
+    }
+    return call_value;
+}
+
+fn analyze_value(ctx: &Phase1Context,
+                 file: &SourceFile,
+                 base_package: &byte,
+                 base_dir: &byte,
+                 ast: &AstValue,
+                 expected: i32) &TypedValue {
+    if ast == null {
+        return null;
+    }
+
+    if ast.kind == AST_VALUE_CALL && string_equals(ast.text, "select" as &byte) != 0 {
+        return analyze_select_call(ctx, file, base_package, base_dir, ast, expected);
+    }
+
+    if expected == EXPECT_ANY {
+        if ast.kind == AST_VALUE_STRING {
+            return typed_make_string(ctx, ast.span, ast.text);
+        }
+        if ast.kind == AST_VALUE_BOOL {
+            return typed_make_bool(ctx, ast.span, ast.bool_value);
+        }
+        if ast.kind == AST_VALUE_IDENT {
+            return typed_make_ident(ctx, ast.span, ast.text);
+        }
+        if ast.kind == AST_VALUE_LIST {
+            const list_value: &TypedValue = typed_make_list(ctx, ast.span);
+            if list_value == null {
+                return null;
+            }
+            var item: &AstValueItem = ast.list_head;
+            while item != null {
+                const child: &TypedValue = analyze_value(ctx, file, base_package, base_dir, item.value, EXPECT_ANY);
+                if child == null {
+                    return null;
+                }
+                if typed_list_append_value(ctx, list_value, child) != 0 {
+                    return null;
+                }
+                item = item.next;
+            }
+            return list_value;
+        }
+        if ast.kind == AST_VALUE_MAP {
+            const map_value: &TypedValue = typed_make_map(ctx, ast.span);
+            if map_value == null {
+                return null;
+            }
+            var entry: &AstMapEntry = ast.map_head;
+            while entry != null {
+                const child_map: &TypedValue = analyze_value(ctx, file, base_package, base_dir, entry.value, EXPECT_ANY);
+                if child_map == null {
+                    return null;
+                }
+                if typed_map_append_entry(ctx, map_value, entry.key, child_map) != 0 {
+                    return null;
+                }
+                entry = entry.next;
+            }
+            return map_value;
+        }
+        if ast.kind == AST_VALUE_CALL {
+            return analyze_generic_call(ctx, file, base_package, base_dir, ast);
+        }
+    }
+
+    if expected == EXPECT_STRING {
+        if ast.kind == AST_VALUE_STRING {
+            return typed_make_string(ctx, ast.span, ast.text);
+        }
+        phase1_error(ctx,
+                     "UYABUILD_E_SCHEMA_TYPE" as &byte,
+                     "expected a string value" as &byte,
+                     "this field only accepts string literals or select(...)" as &byte,
+                     file.rel_path,
+                     ast.span.start.line,
+                     ast.span.start.column);
+        return null;
+    }
+    if expected == EXPECT_BOOL {
+        if ast.kind == AST_VALUE_BOOL {
+            return typed_make_bool(ctx, ast.span, ast.bool_value);
+        }
+        phase1_error(ctx,
+                     "UYABUILD_E_SCHEMA_TYPE" as &byte,
+                     "expected a boolean value" as &byte,
+                     "use true or false for this field" as &byte,
+                     file.rel_path,
+                     ast.span.start.line,
+                     ast.span.start.column);
+        return null;
+    }
+    if expected == EXPECT_CALL {
+        if ast.kind == AST_VALUE_CALL {
+            return analyze_generic_call(ctx, file, base_package, base_dir, ast);
+        }
+        phase1_error(ctx,
+                     "UYABUILD_E_SCHEMA_TYPE" as &byte,
+                     "expected a call expression" as &byte,
+                     "this field expects a scanner-style call such as cpp.headers()" as &byte,
+                     file.rel_path,
+                     ast.span.start.line,
+                     ast.span.start.column);
+        return null;
+    }
+    if expected == EXPECT_LABEL {
+        if ast.kind == AST_VALUE_STRING {
+            const normalized: &byte = normalize_label(ctx,
+                                                      base_package,
+                                                      ast.text,
+                                                      file.rel_path,
+                                                      ast.span.start.line,
+                                                      ast.span.start.column);
+            if normalized == null {
+                return null;
+            }
+            return typed_make_label(ctx, ast.span, normalized);
+        }
+        phase1_error(ctx,
+                     "UYABUILD_E_SCHEMA_TYPE" as &byte,
+                     "expected a label string" as &byte,
+                     "labels use //pkg:name or :name syntax" as &byte,
+                     file.rel_path,
+                     ast.span.start.line,
+                     ast.span.start.column);
+        return null;
+    }
+    if expected == EXPECT_STRING_LIST || expected == EXPECT_LABEL_LIST {
+        if ast.kind == AST_VALUE_CALL &&
+            expected == EXPECT_STRING_LIST &&
+            string_equals(ast.text, "glob" as &byte) != 0 {
+            return evaluate_glob_call(ctx, file, base_dir, ast);
+        }
+
+        const list_value: &TypedValue = typed_make_list(ctx, ast.span);
+        if list_value == null {
+            return null;
+        }
+
+        if ast.kind == AST_VALUE_STRING || ast.kind == AST_VALUE_CALL {
+            var single_expected: i32 = EXPECT_LABEL;
+            if expected == EXPECT_STRING_LIST {
+                single_expected = EXPECT_STRING;
+            }
+            const child_single: &TypedValue = analyze_value(ctx,
+                                                            file,
+                                                            base_package,
+                                                            base_dir,
+                                                            ast,
+                                                            single_expected);
+            if child_single == null {
+                if ast.kind == AST_VALUE_CALL &&
+                    expected == EXPECT_STRING_LIST &&
+                    string_equals(ast.text, "glob" as &byte) != 0 {
+                    return evaluate_glob_call(ctx, file, base_dir, ast);
+                }
+                return null;
+            }
+            if child_single.kind == TYPED_VALUE_LIST {
+                if typed_merge_list(ctx, list_value, child_single) != 0 {
+                    return null;
+                }
+            } else if typed_list_append_value(ctx, list_value, child_single) != 0 {
+                return null;
+            }
+            return list_value;
+        }
+
+        if ast.kind != AST_VALUE_LIST {
+            phase1_error(ctx,
+                         "UYABUILD_E_SCHEMA_TYPE" as &byte,
+                         "expected a list value" as &byte,
+                         "use [item, item] syntax for list fields" as &byte,
+                         file.rel_path,
+                         ast.span.start.line,
+                         ast.span.start.column);
+            return null;
+        }
+
+        var item_list: &AstValueItem = ast.list_head;
+        while item_list != null {
+            var child_value: &TypedValue = null;
+            var item_expected: i32 = EXPECT_LABEL;
+            if expected == EXPECT_STRING_LIST {
+                item_expected = EXPECT_STRING;
+            }
+            if expected == EXPECT_STRING_LIST &&
+                item_list.value.kind == AST_VALUE_CALL &&
+                string_equals(item_list.value.text, "glob" as &byte) != 0 {
+                child_value = evaluate_glob_call(ctx, file, base_dir, item_list.value);
+            } else {
+                child_value = analyze_value(ctx,
+                                            file,
+                                            base_package,
+                                            base_dir,
+                                            item_list.value,
+                                            item_expected);
+            }
+            if child_value == null {
+                return null;
+            }
+            if child_value.kind == TYPED_VALUE_LIST {
+                if typed_merge_list(ctx, list_value, child_value) != 0 {
+                    return null;
+                }
+            } else if typed_list_append_value(ctx, list_value, child_value) != 0 {
+                return null;
+            }
+            item_list = item_list.next;
+        }
+        return list_value;
+    }
+
+    phase1_error(ctx,
+                 "UYABUILD_E_SCHEMA_TYPE" as &byte,
+                 "unsupported schema expectation" as &byte,
+                 "internal analyzer expectation mismatch" as &byte,
+                 file.rel_path,
+                 ast.span.start.line,
+                 ast.span.start.column);
+    return null;
+}
+
+fn record_rule_use(ctx: &Phase1Context, name: &byte) i32 {
+    var current: &RuleUse = ctx.uses_head;
+    while current != null {
+        if string_equals(current.name, name) != 0 {
+            return 0;
+        }
+        current = current.next;
+    }
+    const use_item: &RuleUse = new_rule_use(ctx);
+    if use_item == null {
+        return -1;
+    }
+    use_item.name = arena_copy_cstr(&ctx.arena, name);
+    if ctx.uses_head == null {
+        ctx.uses_head = use_item;
+        ctx.uses_tail = use_item;
+    } else {
+        ctx.uses_tail.next = use_item;
+        ctx.uses_tail = use_item;
+    }
+    ctx.use_count = ctx.use_count + 1;
+    return 0;
+}
+
+fn has_rule_use(ctx: &Phase1Context, name: &byte) i32 {
+    var current: &RuleUse = ctx.uses_head;
+    while current != null {
+        if string_equals(current.name, name) != 0 {
+            return 1;
+        }
+        current = current.next;
+    }
+    return 0;
+}
+
+fn find_target_by_label(ctx: &Phase1Context, label: &byte) &IRTarget {
+    var current: &IRTarget = ctx.targets_head;
+    while current != null {
+        if string_equals(current.label, label) != 0 {
+            return current;
+        }
+        current = current.next;
+    }
+    return null;
+}
+
+fn insert_target_sorted(ctx: &Phase1Context, target: &IRTarget) void {
+    if ctx.targets_head == null || cstr_compare(target.label, ctx.targets_head.label) < 0 {
+        target.next = ctx.targets_head;
+        ctx.targets_head = target;
+        ctx.target_count = ctx.target_count + 1;
+        return;
+    }
+    var current: &IRTarget = ctx.targets_head;
+    while current.next != null && cstr_compare(current.next.label, target.label) < 0 {
+        current = current.next;
+    }
+    target.next = current.next;
+    current.next = target;
+    ctx.target_count = ctx.target_count + 1;
+}
+
+fn parse_toml_workspace(ctx: &Phase1Context) i32 {
+    if ctx.root_toml_path == null {
+        return 0;
+    }
+
+    var size_out: usize = 0usize;
+    const content: &byte = read_file_into_arena(ctx, ctx.root_toml_path, &size_out);
+    if content == null {
+        return phase1_error(ctx,
+                            "UYABUILD_E_TOML_READ" as &byte,
+                            "failed to read uya.toml" as &byte,
+                            ctx.root_toml_path,
+                            "uya.toml" as &byte,
+                            0,
+                            0);
+    }
+
+    var in_workspace: i32 = 0;
+    var line_no: i32 = 1;
+    var pos: usize = 0usize;
+
+    while pos < size_out {
+        var line_buf: [byte: MAX_STRING_BUILD] = [];
+        var line_len: usize = 0usize;
+        while pos < size_out && content[pos] != 10 as byte && line_len + 1 < MAX_STRING_BUILD {
+            line_buf[line_len] = content[pos];
+            line_len = line_len + 1usize;
+            pos = pos + 1usize;
+        }
+        if pos < size_out && content[pos] == 10 as byte {
+            pos = pos + 1usize;
+        }
+        line_buf[line_len] = 0 as byte;
+
+        var start: usize = 0usize;
+        while line_buf[start] == 32 as byte || line_buf[start] == 9 as byte {
+            start = start + 1usize;
+        }
+        if line_buf[start] == 0 as byte || line_buf[start] == 35 as byte {
+            line_no = line_no + 1;
+            continue;
+        }
+        if line_buf[start] == 91 as byte {
+            in_workspace = 0;
+            if string_equals(&line_buf[start] as &byte, "[workspace]" as &byte) != 0 {
+                in_workspace = 1;
+            }
+            line_no = line_no + 1;
+            continue;
+        }
+        if in_workspace == 0 {
+            line_no = line_no + 1;
+            continue;
+        }
+
+        var eq_index: i32 = -1;
+        var i: usize = start;
+        while line_buf[i] != 0 as byte {
+            if line_buf[i] == 61 as byte {
+                eq_index = usize_to_i32_checked(i);
+                break;
+            }
+            i = i + 1usize;
+        }
+        if eq_index < 0 {
+            line_no = line_no + 1;
+            continue;
+        }
+
+        const key_raw: &byte = arena_copy_range(&ctx.arena, &line_buf[0] as &byte, start, eq_index as usize - start);
+        var key_trim_start: usize = 0usize;
+        while key_raw[key_trim_start] == 32 as byte || key_raw[key_trim_start] == 9 as byte {
+            key_trim_start = key_trim_start + 1usize;
+        }
+        var key_trim_end: usize = strlen(key_raw);
+        while key_trim_end > key_trim_start &&
+            (key_raw[key_trim_end - 1usize] == 32 as byte || key_raw[key_trim_end - 1usize] == 9 as byte) {
+            key_trim_end = key_trim_end - 1usize;
+        }
+        const key: &byte = arena_copy_range(&ctx.arena,
+                                            key_raw,
+                                            key_trim_start,
+                                            key_trim_end - key_trim_start);
+
+        var value_start: usize = (eq_index as usize) + 1usize;
+        while line_buf[value_start] == 32 as byte || line_buf[value_start] == 9 as byte {
+            value_start = value_start + 1usize;
+        }
+
+        if string_equals(key, "name" as &byte) != 0 {
+            if line_buf[value_start] == 34 as byte {
+                var end_quote: usize = value_start + 1usize;
+                while end_quote < MAX_STRING_BUILD &&
+                    line_buf[end_quote] != 0 as byte &&
+                    line_buf[end_quote] != 34 as byte {
+                    end_quote = end_quote + 1usize;
+                }
+                ctx.toml_meta.name = arena_copy_range(&ctx.arena,
+                                                      &line_buf[0] as &byte,
+                                                      value_start + 1usize,
+                                                      end_quote - (value_start + 1usize));
+                ctx.toml_meta.has_name = 1;
+            }
+        } else if string_equals(key, "strict" as &byte) != 0 {
+            if string_equals(&line_buf[value_start] as &byte, "true" as &byte) != 0 {
+                ctx.toml_meta.strict = 1;
+                ctx.toml_meta.has_strict = 1;
+            } else if string_equals(&line_buf[value_start] as &byte, "false" as &byte) != 0 {
+                ctx.toml_meta.strict = 0;
+                ctx.toml_meta.has_strict = 1;
+            }
+        } else if string_equals(key, "default" as &byte) != 0 && line_buf[value_start] == 91 as byte {
+            const list_value: &TypedValue = typed_make_list(ctx, zero_span());
+            if list_value == null {
+                return -1;
+            }
+            var idx: usize = value_start + 1usize;
+            while idx < MAX_STRING_BUILD &&
+                line_buf[idx] != 0 as byte &&
+                line_buf[idx] != 93 as byte {
+                while idx < MAX_STRING_BUILD &&
+                    (line_buf[idx] == 32 as byte || line_buf[idx] == 9 as byte || line_buf[idx] == 44 as byte) {
+                    idx = idx + 1usize;
+                }
+                if idx < MAX_STRING_BUILD && line_buf[idx] == 34 as byte {
+                    var q_end: usize = idx + 1usize;
+                    while q_end < MAX_STRING_BUILD &&
+                        line_buf[q_end] != 0 as byte &&
+                        line_buf[q_end] != 34 as byte {
+                        q_end = q_end + 1usize;
+                    }
+                    const raw_label: &byte = arena_copy_range(&ctx.arena,
+                                                              &line_buf[0] as &byte,
+                                                              idx + 1usize,
+                                                              q_end - (idx + 1usize));
+                    const normalized: &byte = normalize_label(ctx,
+                                                              "" as &byte,
+                                                              raw_label,
+                                                              "uya.toml" as &byte,
+                                                              line_no,
+                                                              1);
+                    if normalized == null {
+                        return -1;
+                    }
+                    const label_value: &TypedValue = typed_make_label(ctx, zero_span(), normalized);
+                    if label_value == null || typed_list_append_value(ctx, list_value, label_value) != 0 {
+                        return -1;
+                    }
+                    idx = q_end + 1usize;
+                    continue;
+                }
+                idx = idx + 1usize;
+            }
+            ctx.toml_meta.defaults = list_value;
+            ctx.toml_meta.has_default = 1;
+        }
+
+        line_no = line_no + 1;
+    }
+
+    return 0;
+}
+
+fn analyze_workspace_decl(ctx: &Phase1Context, decl: &AstDecl) i32 {
+    if decl.file == null || decl.file.is_root == 0 {
+        return phase1_error(ctx,
+                            "UYABUILD_E_WORKSPACE_SCOPE" as &byte,
+                            "workspace {} can only appear in the root uya.build" as &byte,
+                            "move the workspace declaration back to the root build file" as &byte,
+                            decl.file.rel_path,
+                            decl.span.start.line,
+                            decl.span.start.column);
+    }
+    if ctx.workspace_ir.source_file != null {
+        return phase1_error(ctx,
+                            "UYABUILD_E_WORKSPACE_DUP" as &byte,
+                            "workspace {} may only be declared once" as &byte,
+                            "remove the duplicate workspace block" as &byte,
+                            decl.file.rel_path,
+                            decl.span.start.line,
+                            decl.span.start.column);
+    }
+
+    ctx.workspace_ir.source_file = decl.file;
+    ctx.workspace_ir.span = decl.span;
+
+    var field: &AstField = decl.field_head;
+    while field != null {
+        const expected: i32 = workspace_field_expected_type(field.name);
+        if expected < 0 {
+            return phase1_error(ctx,
+                                "UYABUILD_E_SCHEMA_FIELD" as &byte,
+                                "unknown workspace field" as &byte,
+                                field.name,
+                                decl.file.rel_path,
+                                field.span.start.line,
+                                field.span.start.column);
+        }
+        if string_equals(field.name, "name" as &byte) != 0 {
+            if ctx.workspace_ir.has_name != 0 {
+                return phase1_error(ctx,
+                                    "UYABUILD_E_SCHEMA_DUP_FIELD" as &byte,
+                                    "duplicate workspace field" as &byte,
+                                    field.name,
+                                    decl.file.rel_path,
+                                    field.span.start.line,
+                                    field.span.start.column);
+            }
+            const typed_name: &TypedValue = analyze_value(ctx,
+                                                          decl.file,
+                                                          decl.file.package_path,
+                                                          decl.file.dir_abs,
+                                                          field.value,
+                                                          expected);
+            if typed_name == null {
+                return -1;
+            }
+            ctx.workspace_ir.name = typed_name.text;
+            ctx.workspace_ir.has_name = 1;
+        } else if string_equals(field.name, "default" as &byte) != 0 {
+            if ctx.workspace_ir.has_defaults != 0 {
+                return phase1_error(ctx,
+                                    "UYABUILD_E_SCHEMA_DUP_FIELD" as &byte,
+                                    "duplicate workspace field" as &byte,
+                                    field.name,
+                                    decl.file.rel_path,
+                                    field.span.start.line,
+                                    field.span.start.column);
+            }
+            ctx.workspace_ir.defaults = analyze_value(ctx,
+                                                      decl.file,
+                                                      decl.file.package_path,
+                                                      decl.file.dir_abs,
+                                                      field.value,
+                                                      expected);
+            if ctx.workspace_ir.defaults == null {
+                return -1;
+            }
+            ctx.workspace_ir.has_defaults = 1;
+        } else if string_equals(field.name, "strict" as &byte) != 0 {
+            if ctx.workspace_ir.has_strict != 0 {
+                return phase1_error(ctx,
+                                    "UYABUILD_E_SCHEMA_DUP_FIELD" as &byte,
+                                    "duplicate workspace field" as &byte,
+                                    field.name,
+                                    decl.file.rel_path,
+                                    field.span.start.line,
+                                    field.span.start.column);
+            }
+            const typed_strict: &TypedValue = analyze_value(ctx,
+                                                            decl.file,
+                                                            decl.file.package_path,
+                                                            decl.file.dir_abs,
+                                                            field.value,
+                                                            expected);
+            if typed_strict == null {
+                return -1;
+            }
+            ctx.workspace_ir.strict = typed_strict.bool_value;
+            ctx.workspace_ir.has_strict = 1;
+        }
+        field = field.next;
+    }
+
+    return 0;
+}
+
+fn analyze_config_decl(ctx: &Phase1Context, decl: &AstDecl) i32 {
+    var current: &IRConfig = ctx.configs_head;
+    while current != null {
+        if string_equals(current.name, decl.label_text) != 0 {
+            return phase1_error(ctx,
+                                "UYABUILD_E_CONFIG_DUP" as &byte,
+                                "config name is declared more than once" as &byte,
+                                decl.label_text,
+                                decl.file.rel_path,
+                                decl.span.start.line,
+                                decl.span.start.column);
+        }
+        current = current.next;
+    }
+
+    const config: &IRConfig = new_ir_config(ctx);
+    if config == null {
+        return -1;
+    }
+    config.name = arena_copy_cstr(&ctx.arena, decl.label_text);
+    config.file = decl.file;
+    config.span = decl.span;
+    config.attrs = null;
+
+    var field: &AstField = decl.field_head;
+    while field != null {
+        if find_ir_field(config.attrs, field.name) != null {
+            return phase1_error(ctx,
+                                "UYABUILD_E_SCHEMA_DUP_FIELD" as &byte,
+                                "duplicate config field" as &byte,
+                                field.name,
+                                decl.file.rel_path,
+                                field.span.start.line,
+                                field.span.start.column);
+        }
+        const typed_value: &TypedValue = analyze_value(ctx,
+                                                       decl.file,
+                                                       decl.file.package_path,
+                                                       decl.file.dir_abs,
+                                                       field.value,
+                                                       EXPECT_ANY);
+        if typed_value == null {
+            return -1;
+        }
+        const ir_field: &IRField = new_ir_field(ctx);
+        if ir_field == null {
+            return -1;
+        }
+        ir_field.name = arena_copy_cstr(&ctx.arena, field.name);
+        ir_field.value = typed_value;
+        config.attrs = append_ir_field(config.attrs, ir_field);
+        field = field.next;
+    }
+
+    if ctx.configs_head == null {
+        ctx.configs_head = config;
+        ctx.configs_tail = config;
+    } else {
+        ctx.configs_tail.next = config;
+        ctx.configs_tail = config;
+    }
+    ctx.config_count = ctx.config_count + 1;
+    return 0;
+}
+
+fn label_package_part(ctx: &Phase1Context, canonical: &byte) &byte {
+    _ = ctx;
+    var i: usize = 2usize;
+    while canonical[i] != 0 as byte && canonical[i] != 58 as byte {
+        i = i + 1usize;
+    }
+    return arena_copy_range(&ctx.arena, canonical, 2usize, i - 2usize);
+}
+
+fn label_name_part(ctx: &Phase1Context, canonical: &byte) &byte {
+    var i: usize = 0usize;
+    while canonical[i] != 0 as byte {
+        if canonical[i] == 58 as byte {
+            return arena_copy_range(&ctx.arena, canonical, i + 1usize, strlen(canonical) - i - 1usize);
+        }
+        i = i + 1usize;
+    }
+    return arena_copy_cstr(&ctx.arena, canonical);
+}
+
+fn analyze_target_decl(ctx: &Phase1Context, decl: &AstDecl) i32 {
+    const pack: &byte = rule_pack_for_kind(decl.name);
+    if pack == null {
+        return phase1_error(ctx,
+                            "UYABUILD_E_RULE_KIND" as &byte,
+                            "unknown rule kind" as &byte,
+                            decl.name,
+                            decl.file.rel_path,
+                            decl.span.start.line,
+                            decl.span.start.column);
+    }
+    if pack[0] != 0 as byte && has_rule_use(ctx, pack) == 0 {
+        return phase1_error(ctx,
+                            "UYABUILD_E_RULE_USE" as &byte,
+                            "rule kind is used before its rule pack is imported" as &byte,
+                            decl.name,
+                            decl.file.rel_path,
+                            decl.span.start.line,
+                            decl.span.start.column);
+    }
+
+    const canonical: &byte = normalize_label(ctx,
+                                             decl.file.package_path,
+                                             decl.label_text,
+                                             decl.file.rel_path,
+                                             decl.span.start.line,
+                                             decl.span.start.column);
+    if canonical == null {
+        return -1;
+    }
+    if find_target_by_label(ctx, canonical) != null {
+        return phase1_error(ctx,
+                            "UYABUILD_E_TARGET_DUP" as &byte,
+                            "target label is declared more than once" as &byte,
+                            canonical,
+                            decl.file.rel_path,
+                            decl.span.start.line,
+                            decl.span.start.column);
+    }
+
+    const target: &IRTarget = new_ir_target(ctx);
+    if target == null {
+        return -1;
+    }
+    target.label = canonical;
+    target.package_path = label_package_part(ctx, canonical);
+    target.name = label_name_part(ctx, canonical);
+    target.kind = arena_copy_cstr(&ctx.arena, decl.name);
+    target.file = decl.file;
+    target.span = decl.span;
+    target.attrs = null;
+    target.provider_mask = provider_mask_for_kind(decl.name);
+
+    var field: &AstField = decl.field_head;
+    while field != null {
+        if find_ir_field(target.attrs, field.name) != null {
+            return phase1_error(ctx,
+                                "UYABUILD_E_SCHEMA_DUP_FIELD" as &byte,
+                                "duplicate target field" as &byte,
+                                field.name,
+                                decl.file.rel_path,
+                                field.span.start.line,
+                                field.span.start.column);
+        }
+        const expected: i32 = field_expected_type(decl.name, field.name);
+        if expected < 0 {
+            return phase1_error(ctx,
+                                "UYABUILD_E_SCHEMA_FIELD" as &byte,
+                                "unknown field for rule kind" as &byte,
+                                field.name,
+                                decl.file.rel_path,
+                                field.span.start.line,
+                                field.span.start.column);
+        }
+        const typed_value: &TypedValue = analyze_value(ctx,
+                                                       decl.file,
+                                                       decl.file.package_path,
+                                                       decl.file.dir_abs,
+                                                       field.value,
+                                                       expected);
+        if typed_value == null {
+            return -1;
+        }
+        const ir_field: &IRField = new_ir_field(ctx);
+        if ir_field == null {
+            return -1;
+        }
+        ir_field.name = arena_copy_cstr(&ctx.arena, field.name);
+        ir_field.value = typed_value;
+        target.attrs = append_ir_field(target.attrs, ir_field);
+        field = field.next;
+    }
+
+    insert_target_sorted(ctx, target);
+    return 0;
+}
+
+fn typed_value_has_labels(ctx: &Phase1Context,
+                          owner_file: &byte,
+                          span: SourceSpan,
+                          value: &TypedValue,
+                          required_mask: u32,
+                          relation: &byte) i32 {
+    if value == null {
+        return 0;
+    }
+    if value.kind == TYPED_VALUE_LABEL {
+        const dep: &IRTarget = find_target_by_label(ctx, value.text);
+        if dep == null {
+            return phase1_error(ctx,
+                                "UYABUILD_E_TARGET_NOT_FOUND" as &byte,
+                                "referenced target does not exist" as &byte,
+                                value.text,
+                                owner_file,
+                                span.start.line,
+                                span.start.column);
+        }
+        if required_mask != 0u32 && (dep.provider_mask & required_mask) == 0u32 {
+            return phase1_error(ctx,
+                                "UYABUILD_E_PROVIDER_MISMATCH" as &byte,
+                                "referenced target does not provide the required provider" as &byte,
+                                relation,
+                                owner_file,
+                                span.start.line,
+                                span.start.column);
+        }
+        return 0;
+    }
+    if value.kind == TYPED_VALUE_LIST {
+        var item: &TypedValueItem = value.list_head;
+        while item != null {
+            if typed_value_has_labels(ctx, owner_file, span, item.value, required_mask, relation) != 0 {
+                return -1;
+            }
+            item = item.next;
+        }
+        return 0;
+    }
+    if value.kind == TYPED_VALUE_CALL && string_equals(value.call_name, "select" as &byte) != 0 {
+        var arg: &TypedValueItem = value.arg_head;
+        while arg != null {
+            if arg.value.kind == TYPED_VALUE_MAP {
+                var entry: &TypedMapEntry = arg.value.map_head;
+                while entry != null {
+                    if typed_value_has_labels(ctx, owner_file, span, entry.value, required_mask, relation) != 0 {
+                        return -1;
+                    }
+                    entry = entry.next;
+                }
+            } else if typed_value_has_labels(ctx, owner_file, span, arg.value, required_mask, relation) != 0 {
+                return -1;
+            }
+            arg = arg.next;
+        }
+    }
+    return 0;
+}
+
+fn target_field_exists(target: &IRTarget, name: &byte) i32 {
+    if find_ir_field(target.attrs, name) != null {
+        return 1;
+    }
+    return 0;
+}
+
+fn validate_targets(ctx: &Phase1Context) i32 {
+    var target: &IRTarget = ctx.targets_head;
+    while target != null {
+        if string_equals(target.kind, "legacy.shell" as &byte) != 0 {
+            if target_field_exists(target, "script" as &byte) == 0 &&
+                target_field_exists(target, "run" as &byte) == 0 {
+                return phase1_error(ctx,
+                                    "UYABUILD_E_SCHEMA_REQUIRED" as &byte,
+                                    "legacy.shell requires script or run" as &byte,
+                                    target.label,
+                                    target.file.rel_path,
+                                    target.span.start.line,
+                                    target.span.start.column);
+            }
+            if target_field_exists(target, "outputs" as &byte) == 0 {
+                return phase1_error(ctx,
+                                    "UYABUILD_E_SCHEMA_REQUIRED" as &byte,
+                                    "legacy.shell requires outputs" as &byte,
+                                    target.label,
+                                    target.file.rel_path,
+                                    target.span.start.line,
+                                    target.span.start.column);
+            }
+        }
+        if string_equals(target.kind, "node.workspace" as &byte) != 0 {
+            if target_field_exists(target, "root" as &byte) == 0 ||
+                target_field_exists(target, "lockfile" as &byte) == 0 {
+                return phase1_error(ctx,
+                                    "UYABUILD_E_SCHEMA_REQUIRED" as &byte,
+                                    "node.workspace requires root and lockfile" as &byte,
+                                    target.label,
+                                    target.file.rel_path,
+                                    target.span.start.line,
+                                    target.span.start.column);
+            }
+        }
+        if string_equals(target.kind, "node.app" as &byte) != 0 {
+            const workspace_field: &IRField = find_ir_field(target.attrs, "workspace" as &byte);
+            if workspace_field == null || target_field_exists(target, "package" as &byte) == 0 {
+                return phase1_error(ctx,
+                                    "UYABUILD_E_SCHEMA_REQUIRED" as &byte,
+                                    "node.app requires workspace and package" as &byte,
+                                    target.label,
+                                    target.file.rel_path,
+                                    target.span.start.line,
+                                    target.span.start.column);
+            }
+            if typed_value_has_labels(ctx,
+                                      target.file.rel_path,
+                                      target.span,
+                                      workspace_field.value,
+                                      PROVIDER_NODE_WORKSPACE,
+                                      "workspace provider mismatch" as &byte) != 0 {
+                return -1;
+            }
+        }
+        if string_equals(target.kind, "oci.image" as &byte) != 0 {
+            if target_field_exists(target, "dockerfile" as &byte) == 0 ||
+                target_field_exists(target, "context" as &byte) == 0 {
+                return phase1_error(ctx,
+                                    "UYABUILD_E_SCHEMA_REQUIRED" as &byte,
+                                    "oci.image requires dockerfile and context" as &byte,
+                                    target.label,
+                                    target.file.rel_path,
+                                    target.span.start.line,
+                                    target.span.start.column);
+            }
+        }
+        if string_equals(target.kind, "task" as &byte) != 0 &&
+            target_field_exists(target, "run" as &byte) == 0 {
+            return phase1_error(ctx,
+                                "UYABUILD_E_SCHEMA_REQUIRED" as &byte,
+                                "task requires run" as &byte,
+                                target.label,
+                                target.file.rel_path,
+                                target.span.start.line,
+                                target.span.start.column);
+        }
+
+        const deps_field: &IRField = find_ir_field(target.attrs, "deps" as &byte);
+        if deps_field != null {
+            var required_mask: u32 = 0u32;
+            if string_equals(target.kind, "cxx.binary" as &byte) != 0 ||
+                string_equals(target.kind, "cxx.library" as &byte) != 0 {
+                required_mask = PROVIDER_CXX_LINKABLE;
+            }
+            if typed_value_has_labels(ctx,
+                                      target.file.rel_path,
+                                      target.span,
+                                      deps_field.value,
+                                      required_mask,
+                                      "dependency provider mismatch" as &byte) != 0 {
+                return -1;
+            }
+        }
+
+        target = target.next;
+    }
+
+    if ctx.workspace_ir.defaults != null &&
+        typed_value_has_labels(ctx,
+                               "uya.build" as &byte,
+                               ctx.workspace_ir.span,
+                               ctx.workspace_ir.defaults,
+                               0u32,
+                               "workspace default target is missing" as &byte) != 0 {
+        return -1;
+    }
+    return 0;
+}
+
+fn analyze_workspace(ctx: &Phase1Context) i32 {
+    if parse_toml_workspace(ctx) != 0 {
+        return -1;
+    }
+
+    var file: &SourceFile = ctx.files_head;
+    while file != null {
+        var decl: &AstDecl = file.decl_head;
+        while decl != null {
+            if decl.kind == AST_DECL_USE {
+                if record_rule_use(ctx, decl.label_text) != 0 {
+                    return -1;
+                }
+            } else if decl.kind == AST_DECL_WORKSPACE {
+                if analyze_workspace_decl(ctx, decl) != 0 {
+                    return -1;
+                }
+            } else if decl.kind == AST_DECL_CONFIG {
+                if analyze_config_decl(ctx, decl) != 0 {
+                    return -1;
+                }
+            } else if decl.kind == AST_DECL_TARGET {
+                if analyze_target_decl(ctx, decl) != 0 {
+                    return -1;
+                }
+            }
+            decl = decl.next;
+        }
+        file = file.next;
+    }
+
+    if ctx.toml_meta.has_name != 0 {
+        if ctx.workspace_ir.has_name == 0 {
+            ctx.workspace_ir.name = ctx.toml_meta.name;
+            ctx.workspace_ir.has_name = 1;
+        } else if string_equals(ctx.workspace_ir.name, ctx.toml_meta.name) == 0 {
+            return phase1_error(ctx,
+                                "UYABUILD_E_TOML_CONFLICT" as &byte,
+                                "workspace.name conflicts with uya.toml" as &byte,
+                                "root uya.build is authoritative; keep both values consistent" as &byte,
+                                "uya.toml" as &byte,
+                                1,
+                                1);
+        }
+    }
+    if ctx.toml_meta.has_default != 0 {
+        if ctx.workspace_ir.has_defaults == 0 {
+            ctx.workspace_ir.defaults = ctx.toml_meta.defaults;
+            ctx.workspace_ir.has_defaults = 1;
+        } else if typed_value_equals(ctx.workspace_ir.defaults, ctx.toml_meta.defaults) == 0 {
+            return phase1_error(ctx,
+                                "UYABUILD_E_TOML_CONFLICT" as &byte,
+                                "workspace.default conflicts with uya.toml" as &byte,
+                                "root uya.build is authoritative; keep both values consistent" as &byte,
+                                "uya.toml" as &byte,
+                                1,
+                                1);
+        }
+    }
+    if ctx.toml_meta.has_strict != 0 {
+        if ctx.workspace_ir.has_strict == 0 {
+            ctx.workspace_ir.strict = ctx.toml_meta.strict;
+            ctx.workspace_ir.has_strict = 1;
+        } else if ctx.workspace_ir.strict != ctx.toml_meta.strict {
+            return phase1_error(ctx,
+                                "UYABUILD_E_TOML_CONFLICT" as &byte,
+                                "workspace.strict conflicts with uya.toml" as &byte,
+                                "root uya.build is authoritative; keep both values consistent" as &byte,
+                                "uya.toml" as &byte,
+                                1,
+                                1);
+        }
+    }
+
+    if ctx.workspace_ir.has_name == 0 {
+        return phase1_error(ctx,
+                            "UYABUILD_E_WORKSPACE_NAME" as &byte,
+                            "workspace.name is required" as &byte,
+                            "set it in root uya.build or uya.toml [workspace]" as &byte,
+                            "uya.build" as &byte,
+                            1,
+                            1);
+    }
+    if ctx.workspace_ir.has_defaults == 0 {
+        ctx.workspace_ir.defaults = typed_make_list(ctx, zero_span());
+        ctx.workspace_ir.has_defaults = 1;
+    }
+    if ctx.workspace_ir.has_strict == 0 {
+        ctx.workspace_ir.strict = 0;
+        ctx.workspace_ir.has_strict = 1;
+    }
+
+    return validate_targets(ctx);
+}
+
+fn emit_typed_value_json(stream: &FILE, value: &TypedValue) void {
+    if value == null {
+        fputs("null" as *byte, stream);
+        return;
+    }
+    if value.kind == TYPED_VALUE_STRING || value.kind == TYPED_VALUE_LABEL {
+        fputc(34, stream);
+        write_json_escape(stream, value.text);
+        fputc(34, stream);
+        return;
+    }
+    if value.kind == TYPED_VALUE_BOOL {
+        if value.bool_value != 0 {
+            fputs("true" as *byte, stream);
+        } else {
+            fputs("false" as *byte, stream);
+        }
+        return;
+    }
+    if value.kind == TYPED_VALUE_IDENT {
+        fputs("{\"$ident\":\"" as *byte, stream);
+        write_json_escape(stream, value.text);
+        fputs("\"}" as *byte, stream);
+        return;
+    }
+    if value.kind == TYPED_VALUE_LIST {
+        fputs("[" as *byte, stream);
+        var first_list: i32 = 1;
+        var item: &TypedValueItem = value.list_head;
+        while item != null {
+            if first_list == 0 {
+                fputs("," as *byte, stream);
+            }
+            emit_typed_value_json(stream, item.value);
+            first_list = 0;
+            item = item.next;
+        }
+        fputs("]" as *byte, stream);
+        return;
+    }
+    if value.kind == TYPED_VALUE_MAP {
+        fputs("{" as *byte, stream);
+        var first_map: i32 = 1;
+        var entry: &TypedMapEntry = value.map_head;
+        while entry != null {
+            if first_map == 0 {
+                fputs("," as *byte, stream);
+            }
+            fputc(34, stream);
+            write_json_escape(stream, entry.key);
+            fputs("\":" as *byte, stream);
+            emit_typed_value_json(stream, entry.value);
+            first_map = 0;
+            entry = entry.next;
+        }
+        fputs("}" as *byte, stream);
+        return;
+    }
+    if value.kind == TYPED_VALUE_CALL {
+        fputs("{\"$call\":\"" as *byte, stream);
+        write_json_escape(stream, value.call_name);
+        fputs("\",\"args\":[" as *byte, stream);
+        var first_arg: i32 = 1;
+        var arg: &TypedValueItem = value.arg_head;
+        while arg != null {
+            if first_arg == 0 {
+                fputs("," as *byte, stream);
+            }
+            emit_typed_value_json(stream, arg.value);
+            first_arg = 0;
+            arg = arg.next;
+        }
+        fputs("]}" as *byte, stream);
+        return;
+    }
+    fputs("null" as *byte, stream);
+}
+
+fn emit_ir_fields_json(stream: &FILE, fields: &IRField) void {
+    fputs("{" as *byte, stream);
+    var first: i32 = 1;
+    var field: &IRField = fields;
+    while field != null {
+        if first == 0 {
+            fputs("," as *byte, stream);
+        }
+        fputc(34, stream);
+        write_json_escape(stream, field.name);
+        fputs("\":" as *byte, stream);
+        emit_typed_value_json(stream, field.value);
+        first = 0;
+        field = field.next;
+    }
+    fputs("}" as *byte, stream);
+}
+
+fn emit_provider_mask_json(stream: &FILE, mask: u32) void {
+    fputs("[" as *byte, stream);
+    var first: i32 = 1;
+    if (mask & PROVIDER_CXX_LINKABLE) != 0u32 {
+        fputs("\"cxx.linkable\"" as *byte, stream);
+        first = 0;
+    }
+    if (mask & PROVIDER_NODE_WORKSPACE) != 0u32 {
+        if first == 0 { fputs("," as *byte, stream); }
+        fputs("\"node.workspace\"" as *byte, stream);
+        first = 0;
+    }
+    if (mask & PROVIDER_NODE_APP) != 0u32 {
+        if first == 0 { fputs("," as *byte, stream); }
+        fputs("\"node.app\"" as *byte, stream);
+        first = 0;
+    }
+    if (mask & PROVIDER_OCI_IMAGE) != 0u32 {
+        if first == 0 { fputs("," as *byte, stream); }
+        fputs("\"oci.image\"" as *byte, stream);
+        first = 0;
+    }
+    if (mask & PROVIDER_LEGACY_ACTION) != 0u32 {
+        if first == 0 { fputs("," as *byte, stream); }
+        fputs("\"legacy.action\"" as *byte, stream);
+        first = 0;
+    }
+    if (mask & PROVIDER_TASK) != 0u32 {
+        if first == 0 { fputs("," as *byte, stream); }
+        fputs("\"task\"" as *byte, stream);
+    }
+    fputs("]" as *byte, stream);
+}
+
+fn query_expression_matches(label: &byte, expression: &byte) i32 {
+    if string_equals(expression, "//..." as &byte) != 0 {
+        return 1;
+    }
+    if string_has_suffix(expression, "/..." as &byte) != 0 {
+        const prefix_len: usize = strlen(expression) - 4usize;
+        if label[0] != 47 as byte || label[1] != 47 as byte {
+            return 0;
+        }
+        var i: usize = 2usize;
+        while i < prefix_len {
+            if expression[i] != label[i] {
+                return 0;
+            }
+            i = i + 1usize;
+        }
+        if label[prefix_len] == 58 as byte || label[prefix_len] == 47 as byte {
+            return 1;
+        }
+        return 0;
+    }
+    return string_equals(label, expression);
+}
+
+fn collect_query_matches(ctx: &Phase1Context, expression: &byte, match_count: &i32) &StringNode {
+    var matches: &StringNode = null;
+    match_count[0] = 0;
+    var target: &IRTarget = ctx.targets_head;
+    while target != null {
+        if query_expression_matches(target.label, expression) != 0 {
+            var inserted: i32 = 0;
+            matches = sorted_string_insert(ctx, matches, target.label, &inserted);
+            if inserted != 0 {
+                match_count[0] = match_count[0] + 1;
+            }
+        }
+        target = target.next;
+    }
+    return matches;
+}
+
+fn collect_default_targets(ctx: &Phase1Context, match_count: &i32) &StringNode {
+    var matches: &StringNode = null;
+    match_count[0] = 0;
+    if ctx.workspace_ir.defaults == null || ctx.workspace_ir.defaults.kind != TYPED_VALUE_LIST {
+        return matches;
+    }
+    var item: &TypedValueItem = ctx.workspace_ir.defaults.list_head;
+    while item != null {
+        if item.value != null && item.value.text != null {
+            var inserted: i32 = 0;
+            matches = sorted_string_insert(ctx, matches, item.value.text, &inserted);
+            if inserted != 0 {
+                match_count[0] = match_count[0] + 1;
+            }
+        }
+        item = item.next;
+    }
+    return matches;
+}
+
+fn resolve_requested_targets(ctx: &Phase1Context,
+                            requested: [&byte: MAX_ARGS],
+                            requested_count: i32,
+                            match_count: &i32) &StringNode {
+    if requested_count == 0 {
+        return collect_default_targets(ctx, match_count);
+    }
+
+    var matches: &StringNode = null;
+    match_count[0] = 0;
+    var i: i32 = 0;
+    while i < requested_count {
+        var local_count: i32 = 0;
+        var local_matches: &StringNode = collect_query_matches(ctx, requested[i as usize], &local_count);
+        if local_count == 0 {
+            phase1_error(ctx,
+                         "UYABUILD_E_TARGET_NOT_FOUND" as &byte,
+                         "requested target expression matched nothing" as &byte,
+                         requested[i as usize],
+                         "uya.build" as &byte,
+                         1,
+                         1);
+            return null;
+        }
+        var node: &StringNode = local_matches;
+        while node != null {
+            var inserted: i32 = 0;
+            matches = sorted_string_insert(ctx, matches, node.text, &inserted);
+            if inserted != 0 {
+                match_count[0] = match_count[0] + 1;
+            }
+            node = node.next;
+        }
+        i = i + 1;
+    }
+    return matches;
+}
+
+fn emit_string_node_array_json(stream: &FILE, head: &StringNode) void {
+    fputs("[" as *byte, stream);
+    var first: i32 = 1;
+    var node: &StringNode = head;
+    while node != null {
+        if first == 0 {
+            fputs("," as *byte, stream);
+        }
+        fputc(34, stream);
+        write_json_escape(stream, node.text);
+        fputc(34, stream);
+        first = 0;
+        node = node.next;
+    }
+    fputs("]" as *byte, stream);
+}
+
+fn emit_plan_json(ctx: &Phase1Context, requested: [&byte: MAX_ARGS], requested_count: i32, matched: &StringNode) void {
+    fputs("{\"ok\":true,\"phase\":1," as *byte, libc.stdout);
+    fputs("\"workspace\":{" as *byte, libc.stdout);
+    fputs("\"name\":\"" as *byte, libc.stdout);
+    write_json_escape(libc.stdout, ctx.workspace_ir.name);
+    fputs("\",\"root\":\"" as *byte, libc.stdout);
+    write_json_escape(libc.stdout, "." as &byte);
+    fputs("\",\"entrypoint\":\"" as *byte, libc.stdout);
+    if ctx.workspace_ir.source_file != null {
+        write_json_escape(libc.stdout, ctx.workspace_ir.source_file.rel_path);
+    } else {
+        write_json_escape(libc.stdout, "uya.build" as &byte);
+    }
+    fputs("\",\"strict\":" as *byte, libc.stdout);
+    if ctx.workspace_ir.strict != 0 {
+        fputs("true" as *byte, libc.stdout);
+    } else {
+        fputs("false" as *byte, libc.stdout);
+    }
+    fputs(",\"default\":" as *byte, libc.stdout);
+    emit_typed_value_json(libc.stdout, ctx.workspace_ir.defaults);
+    fputs("}," as *byte, libc.stdout);
+
+    fputs("\"files\":[" as *byte, libc.stdout);
+    var first_file: i32 = 1;
+    var file: &SourceFile = ctx.files_head;
+    while file != null {
+        if first_file == 0 {
+            fputs("," as *byte, libc.stdout);
+        }
+        fputc(34, libc.stdout);
+        write_json_escape(libc.stdout, file.rel_path);
+        fputc(34, libc.stdout);
+        first_file = 0;
+        file = file.next;
+    }
+    fputs("]," as *byte, libc.stdout);
+
+    fputs("\"uses\":[" as *byte, libc.stdout);
+    var first_use: i32 = 1;
+    var use_item: &RuleUse = ctx.uses_head;
+    while use_item != null {
+        if first_use == 0 {
+            fputs("," as *byte, libc.stdout);
+        }
+        fputc(34, libc.stdout);
+        write_json_escape(libc.stdout, use_item.name);
+        fputc(34, libc.stdout);
+        first_use = 0;
+        use_item = use_item.next;
+    }
+    fputs("]," as *byte, libc.stdout);
+
+    fputs("\"configs\":[" as *byte, libc.stdout);
+    var first_config: i32 = 1;
+    var config: &IRConfig = ctx.configs_head;
+    while config != null {
+        if first_config == 0 {
+            fputs("," as *byte, libc.stdout);
+        }
+        fputs("{\"name\":\"" as *byte, libc.stdout);
+        write_json_escape(libc.stdout, config.name);
+        fputs("\",\"file\":\"" as *byte, libc.stdout);
+        write_json_escape(libc.stdout, config.file.rel_path);
+        fputs("\",\"line\":" as *byte, libc.stdout);
+        fprintf(libc.stdout, "%d" as *byte, config.span.start.line);
+        fputs(",\"attrs\":" as *byte, libc.stdout);
+        emit_ir_fields_json(libc.stdout, config.attrs);
+        fputs("}" as *byte, libc.stdout);
+        first_config = 0;
+        config = config.next;
+    }
+    fputs("]," as *byte, libc.stdout);
+
+    fputs("\"targets\":[" as *byte, libc.stdout);
+    var first_target: i32 = 1;
+    var target: &IRTarget = ctx.targets_head;
+    while target != null {
+        if first_target == 0 {
+            fputs("," as *byte, libc.stdout);
+        }
+        fputs("{\"label\":\"" as *byte, libc.stdout);
+        write_json_escape(libc.stdout, target.label);
+        fputs("\",\"kind\":\"" as *byte, libc.stdout);
+        write_json_escape(libc.stdout, target.kind);
+        fputs("\",\"package\":\"" as *byte, libc.stdout);
+        write_json_escape(libc.stdout, target.package_path);
+        fputs("\",\"file\":\"" as *byte, libc.stdout);
+        write_json_escape(libc.stdout, target.file.rel_path);
+        fputs("\",\"line\":" as *byte, libc.stdout);
+        fprintf(libc.stdout, "%d" as *byte, target.span.start.line);
+        fputs(",\"providers\":" as *byte, libc.stdout);
+        emit_provider_mask_json(libc.stdout, target.provider_mask);
+        fputs(",\"attrs\":" as *byte, libc.stdout);
+        emit_ir_fields_json(libc.stdout, target.attrs);
+        fputs("}" as *byte, libc.stdout);
+        first_target = 0;
+        target = target.next;
+    }
+    fputs("]," as *byte, libc.stdout);
+
+    fputs("\"requested\":[" as *byte, libc.stdout);
+    var first_req: i32 = 1;
+    var i: i32 = 0;
+    while i < requested_count {
+        if first_req == 0 {
+            fputs("," as *byte, libc.stdout);
+        }
+        fputc(34, libc.stdout);
+        write_json_escape(libc.stdout, requested[i as usize]);
+        fputc(34, libc.stdout);
+        first_req = 0;
+        i = i + 1;
+    }
+    fputs("],\"matched\":" as *byte, libc.stdout);
+    emit_string_node_array_json(libc.stdout, matched);
+    fputs("}\n" as *byte, libc.stdout);
+    _ = fflush(libc.stdout);
+}
+
+fn emit_query_json(ctx: &Phase1Context, expression: &byte, matches: &StringNode) void {
+    fputs("{\"ok\":true,\"phase\":1,\"workspace\":\"" as *byte, libc.stdout);
+    write_json_escape(libc.stdout, ctx.workspace_ir.name);
+    fputs("\",\"expression\":\"" as *byte, libc.stdout);
+    write_json_escape(libc.stdout, expression);
+    fputs("\",\"targets\":" as *byte, libc.stdout);
+    emit_string_node_array_json(libc.stdout, matches);
+    fputs("}\n" as *byte, libc.stdout);
+    _ = fflush(libc.stdout);
+}
+
+fn emit_query_text(matches: &StringNode) void {
+    var node: &StringNode = matches;
+    while node != null {
+        fprintf(libc.stdout, "%s\n" as *byte, node.text as *byte);
+        node = node.next;
+    }
+    _ = fflush(libc.stdout);
+}
+
+fn emit_plan_text(ctx: &Phase1Context, matched: &StringNode) void {
+    fprintf(libc.stdout, "workspace: %s\n" as *byte, ctx.workspace_ir.name as *byte);
+    fprintf(libc.stdout, "files: %d\n" as *byte, ctx.file_count);
+    fprintf(libc.stdout, "rule_packs: %d\n" as *byte, ctx.use_count);
+    fprintf(libc.stdout, "configs: %d\n" as *byte, ctx.config_count);
+    fprintf(libc.stdout, "targets: %d\n" as *byte, ctx.target_count);
+    fputs("matched:\n" as *byte, libc.stdout);
+    var node: &StringNode = matched;
+    while node != null {
+        fprintf(libc.stdout, "  %s\n" as *byte, node.text as *byte);
+        node = node.next;
+    }
+    _ = fflush(libc.stdout);
+}
+
+fn load_phase1_model(options: &Options, workspace: &Workspace, ctx: &Phase1Context) i32 {
+    phase1_ctx_init(ctx, &workspace.root[0] as &byte, &workspace.entrypoint[0] as &byte);
+    if load_workspace_files(ctx) != 0 {
+        return emit_diagnostic(options.output_mode, &ctx.diagnostic);
+    }
+    if analyze_workspace(ctx) != 0 {
+        return emit_diagnostic(options.output_mode, &ctx.diagnostic);
+    }
+    return 0;
+}
+
 fn print_root_help() void {
-    fputs("uyabuild 0.1.0-phase0\n" as *byte, libc.stdout);
+    fputs("uyabuild 0.2.0-phase1\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
     fputs("Usage:\n" as *byte, libc.stdout);
     fputs("  uyabuild [global-options] <command> [command-options]\n" as *byte, libc.stdout);
@@ -328,8 +4587,9 @@ fn print_root_help() void {
     fputs("  make bootstrap        build the pure Uya bootstrap binary into bin/uyabuild\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
     fputs("Commands:\n" as *byte, libc.stdout);
-    fputs("  build                 plan and execute targets (Phase 0 placeholder)\n" as *byte, libc.stdout);
-    fputs("  query                 inspect the target graph (Phase 0 placeholder)\n" as *byte, libc.stdout);
+    fputs("  build                 analyze and validate targets (planner/executor begin in later phases)\n" as *byte, libc.stdout);
+    fputs("  query                 inspect the typed target graph\n" as *byte, libc.stdout);
+    fputs("  plan                  emit the typed IR snapshot\n" as *byte, libc.stdout);
     fputs("  version               print the bootstrap version\n" as *byte, libc.stdout);
     fputs("  help                  show command help\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
@@ -343,6 +4603,7 @@ fn print_root_help() void {
     fputs("Examples:\n" as *byte, libc.stdout);
     fputs("  uyabuild build //bootstrap:uyabuild\n" as *byte, libc.stdout);
     fputs("  uyabuild query //...\n" as *byte, libc.stdout);
+    fputs("  uyabuild plan //app:hello --json\n" as *byte, libc.stdout);
     _ = fflush(libc.stdout);
 }
 
@@ -357,8 +4618,8 @@ fn print_build_help() void {
     fputs("  -h, --help            show build help\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
     fputs("Notes:\n" as *byte, libc.stdout);
-    fputs("  Phase 0 only boots the command surface, workspace discovery,\n" as *byte, libc.stdout);
-    fputs("  run manifest creation, and .uya-build layout.\n" as *byte, libc.stdout);
+    fputs("  Phase 1 validates uya.build, loads includes, resolves labels,\n" as *byte, libc.stdout);
+    fputs("  and produces typed IR before planner/executor phases.\n" as *byte, libc.stdout);
     _ = fflush(libc.stdout);
 }
 
@@ -373,7 +4634,22 @@ fn print_query_help() void {
     fputs("  -h, --help            show query help\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
     fputs("Notes:\n" as *byte, libc.stdout);
-    fputs("  Phase 0 only reserves the query entrypoint and metadata layout.\n" as *byte, libc.stdout);
+    fputs("  Phase 1 query supports exact labels and //pkg/... patterns.\n" as *byte, libc.stdout);
+    _ = fflush(libc.stdout);
+}
+
+fn print_plan_help() void {
+    fputs("Usage:\n" as *byte, libc.stdout);
+    fputs("  uyabuild plan [options] [<target> ...]\n" as *byte, libc.stdout);
+    fputs("\n" as *byte, libc.stdout);
+    fputs("Options:\n" as *byte, libc.stdout);
+    fputs("  --workspace <path>    override workspace root discovery\n" as *byte, libc.stdout);
+    fputs("  --state-dir <path>    override state directory\n" as *byte, libc.stdout);
+    fputs("  --json                emit the typed IR snapshot as JSON\n" as *byte, libc.stdout);
+    fputs("  -h, --help            show plan help\n" as *byte, libc.stdout);
+    fputs("\n" as *byte, libc.stdout);
+    fputs("Notes:\n" as *byte, libc.stdout);
+    fputs("  When no target is provided, workspace.default is used.\n" as *byte, libc.stdout);
     _ = fflush(libc.stdout);
 }
 
@@ -562,8 +4838,8 @@ fn create_run_manifest(layout: &StateLayout,
 
     fputs("{\n" as *byte, file);
     fprintf(file, "  \"version\": \"%s\",\n" as *byte, VERSION as *byte);
-    fputs("  \"phase\": 0,\n" as *byte, file);
-    fputs("  \"status\": \"placeholder\",\n" as *byte, file);
+    fprintf(file, "  \"phase\": %d,\n" as *byte, PHASE_NUMBER);
+    fputs("  \"status\": \"analysis-ready\",\n" as *byte, file);
     fprintf(file, "  \"run_id\": \"%s\",\n" as *byte, &manifest.run_id[0] as *byte);
     fprintf(file, "  \"subcommand\": \"%s\",\n" as *byte, subcommand as *byte);
     fprintf(file, "  \"cwd\": \"%s\",\n" as *byte, cwd as *byte);
@@ -771,14 +5047,6 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
         index = index + 1;
     }
 
-    if target_count == 0 {
-        return emit_error(options.output_mode,
-                          EXIT_USAGE,
-                          "UYABUILD_E_USAGE" as &byte,
-                          "uyabuild build requires at least one target" as &byte,
-                          "example: uyabuild build //bootstrap:uyabuild" as &byte);
-    }
-
     var workspace: Workspace = Workspace { root: [], entrypoint: [] };
     var state_layout: StateLayout = StateLayout { root: [], cas: [], meta: [], runs: [], tmp: [], locks: [], gc: [] };
     var manifest: RunManifest = RunManifest { run_id: [], run_dir: [], manifest_path: [] };
@@ -794,11 +5062,57 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
         return status;
     }
 
+    var phase1: Phase1Context = Phase1Context {
+        arena: Arena { buffer: null, size: 0usize, used: 0usize, has_last: false, last_start: 0usize, last_aligned: 0usize },
+        workspace_root: null,
+        root_build_path: null,
+        root_toml_path: null,
+        entrypoint_path: null,
+        files_head: null,
+        files_tail: null,
+        uses_head: null,
+        uses_tail: null,
+        configs_head: null,
+        configs_tail: null,
+        targets_head: null,
+        workspace_ir: IRWorkspace { source_file: null, span: zero_span(), name: null, defaults: null, strict: 0, has_name: 0, has_defaults: 0, has_strict: 0 },
+        toml_meta: TomlWorkspaceMeta { has_name: 0, has_default: 0, has_strict: 0, name: null, defaults: null, strict: 0 },
+        file_count: 0,
+        use_count: 0,
+        config_count: 0,
+        target_count: 0,
+        diagnostic: Diagnostic { exit_code: EXIT_CONFIG, code: null, message: null, detail: null, file: null, line: 0, column: 0 },
+    };
+    const load_status: i32 = load_phase1_model(&options, &workspace, &phase1);
+    if load_status != 0 {
+        return load_status;
+    }
+
+    var matched_count: i32 = 0;
+    const matched: &StringNode = resolve_requested_targets(&phase1, targets, target_count, &matched_count);
+    if matched == null && phase1.diagnostic.code != null {
+        return emit_diagnostic(options.output_mode, &phase1.diagnostic);
+    }
+    if matched_count == 0 {
+        return emit_error(options.output_mode,
+                          EXIT_CONFIG,
+                          "UYABUILD_E_TARGET_NOT_FOUND" as &byte,
+                          "no default targets are configured" as &byte,
+                          "declare workspace.default or pass at least one target" as &byte);
+    }
+
+    var detail: [byte: PATH_MAX] = [];
+    _ = snprintf(&detail[0] as *byte,
+                 PATH_MAX,
+                 "Phase 1 analyzed %d files, %d targets, and matched %d requested targets; planner/executor begin in Phase 2/3" as *byte,
+                 phase1.file_count,
+                 phase1.target_count,
+                 matched_count);
     return emit_error(options.output_mode,
                       EXIT_NOT_IMPLEMENTED,
                       "UYABUILD_E_PHASE_NOT_READY" as &byte,
-                      "build planning and execution are not implemented in Phase 0" as &byte,
-                      "bootstrap, workspace discovery, command parsing, run manifests, and .uya-build layout are ready" as &byte);
+                      "build planning and execution are not implemented yet" as &byte,
+                      &detail[0] as &byte);
 }
 
 fn run_query(start_index: i32, base_options: &Options) i32 {
@@ -871,6 +5185,13 @@ fn run_query(start_index: i32, base_options: &Options) i32 {
                           "uyabuild query requires an expression" as &byte,
                           "example: uyabuild query //..." as &byte);
     }
+    if is_target_pattern(expression) == 0 {
+        return emit_error(options.output_mode,
+                          EXIT_USAGE,
+                          "UYABUILD_E_TARGET_SYNTAX" as &byte,
+                          "query expressions must use //pkg:name or //pkg/... syntax" as &byte,
+                          expression);
+    }
 
     args[0] = expression;
 
@@ -889,11 +5210,164 @@ fn run_query(start_index: i32, base_options: &Options) i32 {
         return status;
     }
 
-    return emit_error(options.output_mode,
-                      EXIT_NOT_IMPLEMENTED,
-                      "UYABUILD_E_PHASE_NOT_READY" as &byte,
-                      "query evaluation is not implemented in Phase 0" as &byte,
-                      "bootstrap, workspace discovery, command parsing, run manifests, and .uya-build layout are ready" as &byte);
+    var phase1: Phase1Context = Phase1Context {
+        arena: Arena { buffer: null, size: 0usize, used: 0usize, has_last: false, last_start: 0usize, last_aligned: 0usize },
+        workspace_root: null,
+        root_build_path: null,
+        root_toml_path: null,
+        entrypoint_path: null,
+        files_head: null,
+        files_tail: null,
+        uses_head: null,
+        uses_tail: null,
+        configs_head: null,
+        configs_tail: null,
+        targets_head: null,
+        workspace_ir: IRWorkspace { source_file: null, span: zero_span(), name: null, defaults: null, strict: 0, has_name: 0, has_defaults: 0, has_strict: 0 },
+        toml_meta: TomlWorkspaceMeta { has_name: 0, has_default: 0, has_strict: 0, name: null, defaults: null, strict: 0 },
+        file_count: 0,
+        use_count: 0,
+        config_count: 0,
+        target_count: 0,
+        diagnostic: Diagnostic { exit_code: EXIT_CONFIG, code: null, message: null, detail: null, file: null, line: 0, column: 0 },
+    };
+    const load_status: i32 = load_phase1_model(&options, &workspace, &phase1);
+    if load_status != 0 {
+        return load_status;
+    }
+
+    var match_count: i32 = 0;
+    const matches: &StringNode = collect_query_matches(&phase1, expression, &match_count);
+    if match_count == 0 {
+        return emit_error(options.output_mode,
+                          EXIT_CONFIG,
+                          "UYABUILD_E_TARGET_NOT_FOUND" as &byte,
+                          "query expression matched no targets" as &byte,
+                          expression);
+    }
+    if options.output_mode == OUTPUT_JSON {
+        emit_query_json(&phase1, expression, matches);
+    } else {
+        emit_query_text(matches);
+    }
+    return EXIT_OK;
+}
+
+fn run_plan(start_index: i32, base_options: &Options) i32 {
+    var options: Options = Options {
+        workspace_override: base_options.workspace_override,
+        state_dir_override: base_options.state_dir_override,
+        output_mode: base_options.output_mode,
+    };
+    var targets: [&byte: MAX_ARGS] = [];
+    var target_count: i32 = 0;
+    const argc: i32 = get_argc();
+
+    var index: i32 = start_index;
+    while index < argc {
+        const argument: &byte = get_argv(index);
+        if argument == null {
+            index = index + 1;
+            continue;
+        }
+        if string_equals(argument, "-h" as &byte) != 0 || string_equals(argument, "--help" as &byte) != 0 {
+            print_plan_help();
+            return EXIT_OK;
+        }
+        if argument[0] == 45 as byte {
+            if string_equals(argument, "--json" as &byte) != 0 {
+                options.output_mode = OUTPUT_JSON;
+                index = index + 1;
+                continue;
+            }
+            if index + 1 >= argc {
+                return emit_error(options.output_mode,
+                                  EXIT_USAGE,
+                                  "UYABUILD_E_USAGE" as &byte,
+                                  "option requires a value" as &byte,
+                                  argument);
+            }
+            const next_argument: &byte = get_argv(index + 1);
+            if apply_shared_option(argument, next_argument, &options) != 0 {
+                index = index + 2;
+                continue;
+            }
+            return emit_error(options.output_mode,
+                              EXIT_USAGE,
+                              "UYABUILD_E_USAGE" as &byte,
+                              "unknown plan option" as &byte,
+                              argument);
+        }
+        if is_target_pattern(argument) == 0 {
+            return emit_error(options.output_mode,
+                              EXIT_USAGE,
+                              "UYABUILD_E_TARGET_SYNTAX" as &byte,
+                              "plan targets must use //pkg:name or //pkg/... syntax" as &byte,
+                              argument);
+        }
+        targets[target_count as usize] = argument;
+        target_count = target_count + 1;
+        index = index + 1;
+    }
+
+    var workspace: Workspace = Workspace { root: [], entrypoint: [] };
+    var state_layout: StateLayout = StateLayout { root: [], cas: [], meta: [], runs: [], tmp: [], locks: [], gc: [] };
+    var manifest: RunManifest = RunManifest { run_id: [], run_dir: [], manifest_path: [] };
+    const status: i32 = resolve_runtime_context(&options,
+                                                &workspace,
+                                                &state_layout,
+                                                &manifest,
+                                                "plan" as &byte,
+                                                targets,
+                                                target_count);
+    if status != 0 {
+        return status;
+    }
+
+    var phase1: Phase1Context = Phase1Context {
+        arena: Arena { buffer: null, size: 0usize, used: 0usize, has_last: false, last_start: 0usize, last_aligned: 0usize },
+        workspace_root: null,
+        root_build_path: null,
+        root_toml_path: null,
+        entrypoint_path: null,
+        files_head: null,
+        files_tail: null,
+        uses_head: null,
+        uses_tail: null,
+        configs_head: null,
+        configs_tail: null,
+        targets_head: null,
+        workspace_ir: IRWorkspace { source_file: null, span: zero_span(), name: null, defaults: null, strict: 0, has_name: 0, has_defaults: 0, has_strict: 0 },
+        toml_meta: TomlWorkspaceMeta { has_name: 0, has_default: 0, has_strict: 0, name: null, defaults: null, strict: 0 },
+        file_count: 0,
+        use_count: 0,
+        config_count: 0,
+        target_count: 0,
+        diagnostic: Diagnostic { exit_code: EXIT_CONFIG, code: null, message: null, detail: null, file: null, line: 0, column: 0 },
+    };
+    const load_status: i32 = load_phase1_model(&options, &workspace, &phase1);
+    if load_status != 0 {
+        return load_status;
+    }
+
+    var matched_count: i32 = 0;
+    const matched: &StringNode = resolve_requested_targets(&phase1, targets, target_count, &matched_count);
+    if matched == null && phase1.diagnostic.code != null {
+        return emit_diagnostic(options.output_mode, &phase1.diagnostic);
+    }
+    if matched_count == 0 {
+        return emit_error(options.output_mode,
+                          EXIT_CONFIG,
+                          "UYABUILD_E_TARGET_NOT_FOUND" as &byte,
+                          "plan matched no targets" as &byte,
+                          "declare workspace.default or pass explicit targets" as &byte);
+    }
+    if options.output_mode == OUTPUT_JSON {
+        emit_plan_json(&phase1, targets, target_count, matched);
+    } else {
+        emit_plan_text(&phase1, matched);
+    }
+    return EXIT_OK;
 }
 
 export fn main() i32 {
@@ -974,6 +5448,10 @@ export fn main() i32 {
                 print_query_help();
                 return EXIT_OK;
             }
+            if topic != null && string_equals(topic, "plan" as &byte) != 0 {
+                print_plan_help();
+                return EXIT_OK;
+            }
         }
         print_root_help();
         return EXIT_OK;
@@ -988,6 +5466,9 @@ export fn main() i32 {
     }
     if string_equals(command, "query" as &byte) != 0 {
         return run_query(command_index + 1, &options);
+    }
+    if string_equals(command, "plan" as &byte) != 0 {
+        return run_plan(command_index + 1, &options);
     }
 
     return emit_error(options.output_mode,

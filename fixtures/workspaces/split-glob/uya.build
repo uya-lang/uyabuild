@@ -1,0 +1,8 @@
+workspace {
+  name = "split-glob"
+  default = ["//lib:core"]
+  strict = true
+}
+
+use cxx
+include "lib/uya.build"

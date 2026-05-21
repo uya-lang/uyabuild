@@ -1,0 +1,10 @@
+workspace {
+  name = "toml-compat"
+}
+
+use legacy
+
+legacy.shell "//:noop" {
+  script = ["sh", "-c", "true"]
+  outputs = ["out/ok"]
+}

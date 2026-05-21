@@ -1,0 +1,12 @@
+workspace {
+  name = "invalid-field"
+  default = ["//:bad"]
+  strict = true
+}
+
+use cxx
+
+cxx.binary "//:bad" {
+  srcs = ["main.cc"]
+  bogus = true
+}

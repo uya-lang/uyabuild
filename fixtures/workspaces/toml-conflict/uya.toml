@@ -1,0 +1,4 @@
+[workspace]
+name = "toml-conflict"
+default = ["//:noop"]
+strict = true

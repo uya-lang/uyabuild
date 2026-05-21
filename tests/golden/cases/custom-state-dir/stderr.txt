@@ -1,2 +1,2 @@
-UYABUILD_E_PHASE_NOT_READY: build planning and execution are not implemented in Phase 0
-detail: bootstrap, workspace discovery, command parsing, run manifests, and .uya-build layout are ready
+UYABUILD_E_PHASE_NOT_READY: build planning and execution are not implemented yet
+detail: Phase 1 analyzed 1 files, 2 targets, and matched 1 requested targets; planner/executor begin in Phase 2/3
