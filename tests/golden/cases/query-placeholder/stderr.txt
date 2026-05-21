@@ -1,0 +1,2 @@
+UYABUILD_E_PHASE_NOT_READY: query evaluation is not implemented in Phase 0
+detail: bootstrap, workspace discovery, command parsing, run manifests, and .uya-build layout are ready

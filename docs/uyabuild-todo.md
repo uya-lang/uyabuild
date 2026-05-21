@@ -36,14 +36,14 @@
 
 ## 4. 全局前置项
 
-- [ ] `P0` 明确 `UyaBuild` 在 `uya` 主仓中的模块目录布局。
-- [ ] `P0` 定义文档、代码、测试、基准的统一命名规范。
-- [ ] `P0` 建立样例仓集合：
+- [x] `P0` 明确 `UyaBuild` 在 `uya` 主仓中的模块目录布局。
+- [x] `P0` 定义文档、代码、测试、基准的统一命名规范。
+- [x] `P0` 建立样例仓集合：
   - 单文件最小 C/C++ 项目
   - Node workspace 项目
   - Docker 多阶段镜像项目
   - `legacy.shell` 兼容样例
-- [ ] `P0` 建立基准指标采集脚本，用于比较 `null build`、单文件修改、缓存命中率。
+- [x] `P0` 建立基准指标采集脚本，用于比较 `null build`、单文件修改、缓存命中率。
 
 ## 5. Phase 0：bootstrap 与工程基线
 
@@ -53,11 +53,13 @@
 
 ### 5.2 TODO
 
+当前仓库已完成一套可运行的 Phase 0 基线实现，见 [phase0-engineering-baseline.md](./phase0-engineering-baseline.md)。
+
 | ID | 优先级 | 任务 | 依赖 | 验收标准 |
 |---|---|---|---|---|
-| `P0-1` | `P0` | 定义 `make bootstrap` 或 `bootstrap.sh` 最小职责边界 | 无 | 仅负责从 C seed 生成首个 `bin/uya` |
-| `P0-2` | `P0` | 约定 bootstrap 之后所有开发入口统一为 `uya ...` | `P0-1` | 文档与命令帮助文本一致 |
-| `P0-3` | `P0` | 搭建 `UyaBuild` 最小 CLI 骨架，支持 `uya build`、`uya query` 命令占位 | `P0-2` | CLI 可解析参数并输出稳定错误 |
+| `P0-1` | `P0` | 定义 `make bootstrap` 或 `bootstrap.sh` 最小职责边界 | 无 | 仅负责从纯 `uya` 源码生成首个 `bin/uyabuild` |
+| `P0-2` | `P0` | 约定 bootstrap 之后所有开发入口统一为 `uyabuild ...` | `P0-1` | 文档与命令帮助文本一致 |
+| `P0-3` | `P0` | 搭建 `UyaBuild` 最小 CLI 骨架，支持 `uyabuild build`、`uyabuild query` 命令占位 | `P0-2` | CLI 可解析参数并输出稳定错误 |
 | `P0-4` | `P0` | 选定状态目录布局 `.uya-build/` | `P0-3` | 目录结构在设计与实现中一致 |
 | `P0-5` | `P1` | 建立 benchmark 样本仓与基线记录 | `P0-3` | 能保存第一次性能基线 |
 | `P0-6` | `P1` | 建立 golden test 约定和 fixtures 目录 | `P0-3` | 可运行最小 golden 测试 |
@@ -241,11 +243,11 @@
 |---|---|---|---|---|
 | `P7-1` | `P0` | 盘点现有 `Makefile` 目标、环境变量、脚本依赖 | `P6-1` | 输出完整迁移清单 |
 | `P7-2` | `P0` | 建立 `//bootstrap`、`//compiler`、`//tests`、`//dist` 初始目标图 | `P1-6`, `P2-5` | 主链路目标全部可表达 |
-| `P7-3` | `P0` | 先以 `legacy.shell` 包装现有核心流程 | `P4-2`, `P7-1` | `uya build/test/check/release` 可转发跑通 |
+| `P7-3` | `P0` | 先以 `legacy.shell` 包装现有核心流程 | `P4-2`, `P7-1` | `uyabuild build/test/check/release` 可转发跑通 |
 | `P7-4` | `P0` | 将 `uya` 编译主链逐步替换为 `cxx.*` 结构化规则 | `P4-3`, `P4-4` | 编译链路不再依赖大段 shell |
-| `P7-5` | `P1` | 将测试链替换为 `cxx.test` 或结构化 `task` | `P4-5` | `uya test //tests/...` 成为主入口 |
+| `P7-5` | `P1` | 将测试链替换为 `cxx.test` 或结构化 `task` | `P4-5` | `uyabuild test //tests/...` 成为主入口 |
 | `P7-6` | `P1` | 将 release/install 流程建模为 `artifact/service/bundle` | `P4-10` | 发布流程可被 query/why 分析 |
-| `P7-7` | `P0` | 更新 `uya` 开发文档和 CI 入口 | `P7-3` | 文档默认命令为 `uya ...` |
+| `P7-7` | `P0` | 更新 `uya` 开发文档和 CI 入口 | `P7-3` | 文档默认命令为 `uyabuild ...` |
 | `P7-8` | `P0` | 将顶层 `Makefile` 收缩为 bootstrap 和兼容转发层 | `P7-7` | 日常开发无需直接使用 `make` |
 | `P7-9` | `P1` | 建立对比基准：旧 Make 与新 UyaBuild 的 null build/增量表现 | `P7-4` | 有明确性能和正确性对比报告 |
 

@@ -1,0 +1,998 @@
+use libc;
+use libc.FILE;
+use libc.PATH_MAX;
+use libc.Stat;
+use libc.fclose;
+use libc.fflush;
+use libc.fopen;
+use libc.fprintf;
+use libc.fputc;
+use libc.fputs;
+use libc.getcwd;
+use libc.getpid;
+use libc.mkdir;
+use libc.snprintf;
+use libc.stat;
+use libc.strcmp;
+use libc.strlen;
+use libc.time;
+use libc.time_t;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+
+const VERSION: &byte = "0.1.0-phase0" as &byte;
+
+const EXIT_OK: i32 = 0;
+const EXIT_USAGE: i32 = 2;
+const EXIT_CONFIG: i32 = 3;
+const EXIT_IO: i32 = 4;
+const EXIT_NOT_IMPLEMENTED: i32 = 6;
+
+const OUTPUT_TEXT: i32 = 0;
+const OUTPUT_JSON: i32 = 1;
+
+const S_IFMT: u32 = 61440u32;
+const S_IFDIR: u32 = 16384u32;
+const S_IFREG: u32 = 32768u32;
+
+const MAX_ARGS: i32 = 256;
+
+struct Options {
+    workspace_override: &byte,
+    state_dir_override: &byte,
+    output_mode: i32,
+}
+
+struct Workspace {
+    root: [byte: PATH_MAX],
+    entrypoint: [byte: PATH_MAX],
+}
+
+struct StateLayout {
+    root: [byte: PATH_MAX],
+    cas: [byte: PATH_MAX],
+    meta: [byte: PATH_MAX],
+    runs: [byte: PATH_MAX],
+    tmp: [byte: PATH_MAX],
+    locks: [byte: PATH_MAX],
+    gc: [byte: PATH_MAX],
+}
+
+struct RunManifest {
+    run_id: [byte: 128],
+    run_dir: [byte: PATH_MAX],
+    manifest_path: [byte: PATH_MAX],
+}
+
+fn zero_stat() Stat {
+    return Stat {
+        st_dev: 0,
+        st_ino: 0,
+        st_nlink: 0,
+        st_mode: 0,
+        st_uid: 0,
+        st_gid: 0,
+        _pad0: 0,
+        st_rdev: 0,
+        st_size: 0,
+        st_blksize: 0,
+        st_blocks: 0,
+        st_atime: 0,
+        st_atime_nsec: 0,
+        st_mtime: 0,
+        st_mtime_nsec: 0,
+        st_ctime: 0,
+        st_ctime_nsec: 0,
+        _unused0: 0,
+        _unused1: 0,
+        _unused2: 0,
+    };
+}
+
+fn string_equals(left: &byte, right: &byte) i32 {
+    if left == null || right == null {
+        return 0;
+    }
+    if strcmp(left as *byte, right as *byte) == 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn copy_string(out: &byte, out_cap: usize, text: &byte) i32 {
+    if out == null || out_cap == 0 || text == null {
+        return -1;
+    }
+    const written: i32 = snprintf(out as *byte, out_cap, "%s" as *byte, text as *byte);
+    if written < 0 || written >= out_cap as i32 {
+        return -1;
+    }
+    return 0;
+}
+
+fn path_is_absolute(path: &byte) i32 {
+    if path == null || path[0] == 0 as byte {
+        return 0;
+    }
+    if path[0] == 47 as byte || path[0] == 92 as byte {
+        return 1;
+    }
+    const len: usize = strlen(path);
+    if len < 3 {
+        return 0;
+    }
+    const c0: i32 = path[0] as i32;
+    if ((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122)) &&
+        path[1] == 58 as byte &&
+        (path[2] == 47 as byte || path[2] == 92 as byte) {
+        return 1;
+    }
+    return 0;
+}
+
+fn join_path(left: &byte, right: &byte, out: &byte, out_cap: usize) i32 {
+    if left == null || right == null || out == null || out_cap == 0 {
+        return -1;
+    }
+    if left[0] == 0 as byte {
+        return copy_string(out, out_cap, right);
+    }
+    if right[0] == 0 as byte {
+        return copy_string(out, out_cap, left);
+    }
+
+    const left_len: usize = strlen(left);
+    var needs_separator: i32 = 1;
+    if left_len > 0 && left[left_len - 1] == 47 as byte {
+        needs_separator = 0;
+    }
+
+    var written: i32 = 0;
+    if needs_separator != 0 {
+        written = snprintf(out as *byte, out_cap, "%s/%s" as *byte, left as *byte, right as *byte);
+    } else {
+        written = snprintf(out as *byte, out_cap, "%s%s" as *byte, left as *byte, right as *byte);
+    }
+
+    if written < 0 || written >= out_cap as i32 {
+        return -1;
+    }
+    return 0;
+}
+
+fn abspath_from_base(base: &byte, path: &byte, out: &byte, out_cap: usize) i32 {
+    if base == null || path == null {
+        return -1;
+    }
+    if path_is_absolute(path) != 0 {
+        return copy_string(out, out_cap, path);
+    }
+    return join_path(base, path, out, out_cap);
+}
+
+fn path_is_dir(path: &byte) i32 {
+    if path == null {
+        return 0;
+    }
+    var st: Stat = zero_stat();
+    if stat(path as &const byte, &st) != 0 {
+        return 0;
+    }
+    if ((st.st_mode as u32) & S_IFMT) == S_IFDIR {
+        return 1;
+    }
+    return 0;
+}
+
+fn path_is_file(path: &byte) i32 {
+    if path == null {
+        return 0;
+    }
+    var st: Stat = zero_stat();
+    if stat(path as &const byte, &st) != 0 {
+        return 0;
+    }
+    if ((st.st_mode as u32) & S_IFMT) == S_IFREG {
+        return 1;
+    }
+    return 0;
+}
+
+fn ensure_dir_recursive(path: &byte) i32 {
+    if path == null || path[0] == 0 as byte {
+        return -1;
+    }
+    if path_is_dir(path) != 0 {
+        return 0;
+    }
+
+    var buf: [byte: PATH_MAX] = [];
+    if copy_string(&buf[0] as &byte, PATH_MAX, path) != 0 {
+        return -1;
+    }
+
+    const len: usize = strlen(&buf[0] as &byte);
+    var i: usize = 1;
+    while i < len {
+        if buf[i] == 47 as byte {
+            buf[i] = 0 as byte;
+            if buf[0] != 0 as byte {
+                _ = mkdir(&buf[0] as &const byte, 493);
+            }
+            buf[i] = 47 as byte;
+        }
+        i = i + 1;
+    }
+
+    _ = mkdir(&buf[0] as &const byte, 493);
+    if path_is_dir(path) == 0 {
+        return -1;
+    }
+    return 0;
+}
+
+fn trim_to_parent(path: &byte) i32 {
+    if path == null {
+        return -1;
+    }
+
+    const len_usize: usize = strlen(path);
+    if len_usize > 2147483647usize {
+        return -1;
+    }
+    const len_result: !i32 = len_usize as! i32;
+    var len: i32 = len_result catch {
+        return -1;
+    };
+    if len <= 0 {
+        return -1;
+    }
+    if len == 1 && path[0] == 47 as byte {
+        return 1;
+    }
+
+    var idx: i32 = len - 1;
+    while idx > 0 && path[idx as usize] == 47 as byte {
+        path[idx as usize] = 0 as byte;
+        idx = idx - 1;
+    }
+    while idx > 0 && path[idx as usize] != 47 as byte {
+        idx = idx - 1;
+    }
+    if idx <= 0 {
+        path[1] = 0 as byte;
+    } else {
+        path[idx as usize] = 0 as byte;
+    }
+    return 0;
+}
+
+fn find_workspace_root(start_dir: &byte, out: &byte, out_cap: usize) i32 {
+    var current: [byte: PATH_MAX] = [];
+    var uya_build_path: [byte: PATH_MAX] = [];
+    var uya_toml_path: [byte: PATH_MAX] = [];
+
+    if copy_string(&current[0] as &byte, PATH_MAX, start_dir) != 0 {
+        return -1;
+    }
+
+    while true {
+        if join_path(&current[0] as &byte, "uya.build" as &byte, &uya_build_path[0] as &byte, PATH_MAX) == 0 &&
+            path_is_file(&uya_build_path[0] as &byte) != 0 {
+            return copy_string(out, out_cap, &current[0] as &byte);
+        }
+
+        if join_path(&current[0] as &byte, "uya.toml" as &byte, &uya_toml_path[0] as &byte, PATH_MAX) == 0 &&
+            path_is_file(&uya_toml_path[0] as &byte) != 0 {
+            return copy_string(out, out_cap, &current[0] as &byte);
+        }
+
+        if string_equals(&current[0] as &byte, "/" as &byte) != 0 {
+            break;
+        }
+        if trim_to_parent(&current[0] as &byte) != 0 {
+            break;
+        }
+    }
+
+    return -1;
+}
+
+fn workspace_has_entrypoint(root: &byte, entrypoint: &byte, entrypoint_cap: usize) i32 {
+    var uya_build_path: [byte: PATH_MAX] = [];
+    var uya_toml_path: [byte: PATH_MAX] = [];
+
+    if join_path(root, "uya.build" as &byte, &uya_build_path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    if join_path(root, "uya.toml" as &byte, &uya_toml_path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+
+    if path_is_file(&uya_build_path[0] as &byte) != 0 {
+        return copy_string(entrypoint, entrypoint_cap, &uya_build_path[0] as &byte);
+    }
+    if path_is_file(&uya_toml_path[0] as &byte) != 0 {
+        return copy_string(entrypoint, entrypoint_cap, &uya_toml_path[0] as &byte);
+    }
+    return 1;
+}
+
+fn print_root_help() void {
+    fputs("uyabuild 0.1.0-phase0\n" as *byte, libc.stdout);
+    fputs("\n" as *byte, libc.stdout);
+    fputs("Usage:\n" as *byte, libc.stdout);
+    fputs("  uyabuild [global-options] <command> [command-options]\n" as *byte, libc.stdout);
+    fputs("\n" as *byte, libc.stdout);
+    fputs("Bootstrap:\n" as *byte, libc.stdout);
+    fputs("  make bootstrap        build the pure Uya bootstrap binary into bin/uyabuild\n" as *byte, libc.stdout);
+    fputs("\n" as *byte, libc.stdout);
+    fputs("Commands:\n" as *byte, libc.stdout);
+    fputs("  build                 plan and execute targets (Phase 0 placeholder)\n" as *byte, libc.stdout);
+    fputs("  query                 inspect the target graph (Phase 0 placeholder)\n" as *byte, libc.stdout);
+    fputs("  version               print the bootstrap version\n" as *byte, libc.stdout);
+    fputs("  help                  show command help\n" as *byte, libc.stdout);
+    fputs("\n" as *byte, libc.stdout);
+    fputs("Global options:\n" as *byte, libc.stdout);
+    fputs("  --workspace <path>    override workspace root discovery\n" as *byte, libc.stdout);
+    fputs("  --state-dir <path>    override state directory (default: <workspace>/.uya-build)\n" as *byte, libc.stdout);
+    fputs("  --json                emit diagnostics as JSON\n" as *byte, libc.stdout);
+    fputs("  -h, --help            show help\n" as *byte, libc.stdout);
+    fputs("  --version             print version\n" as *byte, libc.stdout);
+    fputs("\n" as *byte, libc.stdout);
+    fputs("Examples:\n" as *byte, libc.stdout);
+    fputs("  uyabuild build //bootstrap:uyabuild\n" as *byte, libc.stdout);
+    fputs("  uyabuild query //...\n" as *byte, libc.stdout);
+    _ = fflush(libc.stdout);
+}
+
+fn print_build_help() void {
+    fputs("Usage:\n" as *byte, libc.stdout);
+    fputs("  uyabuild build [options] <target> [<target> ...]\n" as *byte, libc.stdout);
+    fputs("\n" as *byte, libc.stdout);
+    fputs("Options:\n" as *byte, libc.stdout);
+    fputs("  --workspace <path>    override workspace root discovery\n" as *byte, libc.stdout);
+    fputs("  --state-dir <path>    override state directory\n" as *byte, libc.stdout);
+    fputs("  --json                emit diagnostics as JSON\n" as *byte, libc.stdout);
+    fputs("  -h, --help            show build help\n" as *byte, libc.stdout);
+    fputs("\n" as *byte, libc.stdout);
+    fputs("Notes:\n" as *byte, libc.stdout);
+    fputs("  Phase 0 only boots the command surface, workspace discovery,\n" as *byte, libc.stdout);
+    fputs("  run manifest creation, and .uya-build layout.\n" as *byte, libc.stdout);
+    _ = fflush(libc.stdout);
+}
+
+fn print_query_help() void {
+    fputs("Usage:\n" as *byte, libc.stdout);
+    fputs("  uyabuild query [options] <expression>\n" as *byte, libc.stdout);
+    fputs("\n" as *byte, libc.stdout);
+    fputs("Options:\n" as *byte, libc.stdout);
+    fputs("  --workspace <path>    override workspace root discovery\n" as *byte, libc.stdout);
+    fputs("  --state-dir <path>    override state directory\n" as *byte, libc.stdout);
+    fputs("  --json                emit diagnostics as JSON\n" as *byte, libc.stdout);
+    fputs("  -h, --help            show query help\n" as *byte, libc.stdout);
+    fputs("\n" as *byte, libc.stdout);
+    fputs("Notes:\n" as *byte, libc.stdout);
+    fputs("  Phase 0 only reserves the query entrypoint and metadata layout.\n" as *byte, libc.stdout);
+    _ = fflush(libc.stdout);
+}
+
+fn print_version() void {
+    fprintf(libc.stdout, "%s\n" as *byte, VERSION as *byte);
+    _ = fflush(libc.stdout);
+}
+
+fn write_json_escape(stream: &FILE, value: &byte) void {
+    if stream == null || value == null {
+        return;
+    }
+    var i: usize = 0;
+    while value[i] != 0 as byte {
+        const ch: byte = value[i];
+        if ch == 92 as byte {
+            fputs("\\\\" as *byte, stream);
+        } else if ch == 34 as byte {
+            fputs("\\\"" as *byte, stream);
+        } else if ch == 10 as byte {
+            fputs("\\n" as *byte, stream);
+        } else if ch == 13 as byte {
+            fputs("\\r" as *byte, stream);
+        } else if ch == 9 as byte {
+            fputs("\\t" as *byte, stream);
+        } else {
+            _ = fputc(ch as i32, stream);
+        }
+        i = i + 1;
+    }
+}
+
+fn emit_error(mode: i32, exit_code: i32, code: &byte, message: &byte, detail: &byte) i32 {
+    var detail_text: &byte = detail;
+    if detail_text == null {
+        detail_text = "" as &byte;
+    }
+
+    if mode == OUTPUT_JSON {
+        fputs("{\"ok\":false,\"exit_code\":" as *byte, libc.stderr);
+        fprintf(libc.stderr, "%d" as *byte, exit_code);
+        fputs(",\"code\":\"" as *byte, libc.stderr);
+        write_json_escape(libc.stderr, code);
+        fputs("\",\"message\":\"" as *byte, libc.stderr);
+        write_json_escape(libc.stderr, message);
+        fputs("\",\"detail\":\"" as *byte, libc.stderr);
+        write_json_escape(libc.stderr, detail_text);
+        fputs("\"}\n" as *byte, libc.stderr);
+    } else {
+        fprintf(libc.stderr, "%s: %s\n" as *byte, code as *byte, message as *byte);
+        if detail_text[0] != 0 as byte {
+            fprintf(libc.stderr, "detail: %s\n" as *byte, detail_text as *byte);
+        }
+    }
+
+    _ = fflush(libc.stderr);
+    return exit_code;
+}
+
+fn discover_workspace(cwd: &byte,
+                      options: &Options,
+                      workspace: &Workspace,
+                      error_message: &byte,
+                      error_cap: usize) i32 {
+    var root: [byte: PATH_MAX] = [];
+
+    if options.workspace_override != null {
+        if abspath_from_base(cwd, options.workspace_override, &root[0] as &byte, PATH_MAX) != 0 {
+            _ = copy_string(error_message, error_cap, "workspace override path is longer than supported buffer size" as &byte);
+            return -1;
+        }
+        if path_is_dir(&root[0] as &byte) == 0 {
+            _ = snprintf(error_message as *byte, error_cap, "workspace override does not exist: %s" as *byte, options.workspace_override as *byte);
+            return -1;
+        }
+    } else {
+        if find_workspace_root(cwd, &root[0] as &byte, PATH_MAX) != 0 {
+            _ = copy_string(error_message, error_cap, "no uya.build or uya.toml was found from the current directory upward" as &byte);
+            return -1;
+        }
+    }
+
+    if workspace_has_entrypoint(&root[0] as &byte, &workspace.entrypoint[0] as &byte, PATH_MAX) != 0 {
+        _ = snprintf(error_message as *byte,
+                     error_cap,
+                     "workspace root is missing uya.build and uya.toml: %s" as *byte,
+                     &root[0] as *byte);
+        return -1;
+    }
+
+    if copy_string(&workspace.root[0] as &byte, PATH_MAX, &root[0] as &byte) != 0 {
+        _ = copy_string(error_message, error_cap, "workspace path is longer than supported buffer size" as &byte);
+        return -1;
+    }
+
+    return 0;
+}
+
+fn prepare_state_subdir(root: &byte, name: &byte, out: &byte, out_cap: usize) i32 {
+    if join_path(root, name, out, out_cap) != 0 {
+        return -1;
+    }
+    return ensure_dir_recursive(out);
+}
+
+fn prepare_state_layout(workspace: &Workspace,
+                        cwd: &byte,
+                        options: &Options,
+                        layout: &StateLayout,
+                        error_message: &byte,
+                        error_cap: usize) i32 {
+    if options.state_dir_override != null {
+        if abspath_from_base(cwd, options.state_dir_override, &layout.root[0] as &byte, PATH_MAX) != 0 {
+            _ = copy_string(error_message, error_cap, "state directory path is longer than supported buffer size" as &byte);
+            return -1;
+        }
+    } else {
+        if join_path(&workspace.root[0] as &byte, ".uya-build" as &byte, &layout.root[0] as &byte, PATH_MAX) != 0 {
+            _ = copy_string(error_message, error_cap, "default state directory path is longer than supported buffer size" as &byte);
+            return -1;
+        }
+    }
+
+    if ensure_dir_recursive(&layout.root[0] as &byte) != 0 {
+        _ = snprintf(error_message as *byte,
+                     error_cap,
+                     "failed to create state directory root: %s" as *byte,
+                     &layout.root[0] as *byte);
+        return -1;
+    }
+
+    if prepare_state_subdir(&layout.root[0] as &byte, "cas" as &byte, &layout.cas[0] as &byte, PATH_MAX) != 0 ||
+        prepare_state_subdir(&layout.root[0] as &byte, "meta" as &byte, &layout.meta[0] as &byte, PATH_MAX) != 0 ||
+        prepare_state_subdir(&layout.root[0] as &byte, "runs" as &byte, &layout.runs[0] as &byte, PATH_MAX) != 0 ||
+        prepare_state_subdir(&layout.root[0] as &byte, "tmp" as &byte, &layout.tmp[0] as &byte, PATH_MAX) != 0 ||
+        prepare_state_subdir(&layout.root[0] as &byte, "locks" as &byte, &layout.locks[0] as &byte, PATH_MAX) != 0 ||
+        prepare_state_subdir(&layout.root[0] as &byte, "gc" as &byte, &layout.gc[0] as &byte, PATH_MAX) != 0 {
+        _ = copy_string(error_message, error_cap, "failed to initialize .uya-build directory layout" as &byte);
+        return -1;
+    }
+
+    return 0;
+}
+
+fn create_run_manifest(layout: &StateLayout,
+                       cwd: &byte,
+                       workspace: &Workspace,
+                       subcommand: &byte,
+                       args: [&byte: MAX_ARGS],
+                       arg_count: i32,
+                       manifest: &RunManifest,
+                       error_message: &byte,
+                       error_cap: usize) i32 {
+    var now_buf: time_t = 0;
+    const now: time_t = time(&now_buf);
+    const run_id_written: i32 = snprintf(&manifest.run_id[0] as *byte, 128, "%ld-%d" as *byte, now, getpid());
+    if run_id_written < 0 || run_id_written >= 128 {
+        _ = copy_string(error_message, error_cap, "failed to generate run id" as &byte);
+        return -1;
+    }
+
+    if join_path(&layout.runs[0] as &byte, &manifest.run_id[0] as &byte, &manifest.run_dir[0] as &byte, PATH_MAX) != 0 {
+        _ = copy_string(error_message, error_cap, "run directory path is too long" as &byte);
+        return -1;
+    }
+    if ensure_dir_recursive(&manifest.run_dir[0] as &byte) != 0 {
+        _ = snprintf(error_message as *byte,
+                     error_cap,
+                     "failed to create run directory: %s" as *byte,
+                     &manifest.run_dir[0] as *byte);
+        return -1;
+    }
+    if join_path(&manifest.run_dir[0] as &byte, "invocation.json" as &byte, &manifest.manifest_path[0] as &byte, PATH_MAX) != 0 {
+        _ = copy_string(error_message, error_cap, "run manifest path is too long" as &byte);
+        return -1;
+    }
+
+    const file: &FILE = fopen(&manifest.manifest_path[0] as &const byte, "w" as &const byte);
+    if file == null {
+        _ = snprintf(error_message as *byte,
+                     error_cap,
+                     "failed to open run manifest: %s" as *byte,
+                     &manifest.manifest_path[0] as *byte);
+        return -1;
+    }
+
+    fputs("{\n" as *byte, file);
+    fprintf(file, "  \"version\": \"%s\",\n" as *byte, VERSION as *byte);
+    fputs("  \"phase\": 0,\n" as *byte, file);
+    fputs("  \"status\": \"placeholder\",\n" as *byte, file);
+    fprintf(file, "  \"run_id\": \"%s\",\n" as *byte, &manifest.run_id[0] as *byte);
+    fprintf(file, "  \"subcommand\": \"%s\",\n" as *byte, subcommand as *byte);
+    fprintf(file, "  \"cwd\": \"%s\",\n" as *byte, cwd as *byte);
+    fprintf(file, "  \"workspace_root\": \"%s\",\n" as *byte, &workspace.root[0] as *byte);
+    fprintf(file, "  \"workspace_entrypoint\": \"%s\",\n" as *byte, &workspace.entrypoint[0] as *byte);
+    fprintf(file, "  \"state_dir\": \"%s\",\n" as *byte, &layout.root[0] as *byte);
+    fputs("  \"argv\": [" as *byte, file);
+
+    var index: i32 = 0;
+    while index < arg_count {
+        if index > 0 {
+            fputs(", " as *byte, file);
+        }
+        fputc(34, file);
+        write_json_escape(file, args[index as usize]);
+        fputc(34, file);
+        index = index + 1;
+    }
+
+    fputs("]\n}\n" as *byte, file);
+    _ = fflush(file);
+    if fclose(file) != 0 {
+        _ = snprintf(error_message as *byte,
+                     error_cap,
+                     "failed to flush run manifest: %s" as *byte,
+                     &manifest.manifest_path[0] as *byte);
+        return -1;
+    }
+
+    return 0;
+}
+
+fn resolve_runtime_context(options: &Options,
+                           workspace: &Workspace,
+                           state_layout: &StateLayout,
+                           manifest: &RunManifest,
+                           subcommand: &byte,
+                           args: [&byte: MAX_ARGS],
+                           arg_count: i32) i32 {
+    var cwd: [byte: PATH_MAX] = [];
+    var error_message: [byte: PATH_MAX] = [];
+
+    if getcwd(&cwd[0] as &byte, PATH_MAX) == null {
+        return emit_error(options.output_mode,
+                          EXIT_IO,
+                          "UYABUILD_E_CWD" as &byte,
+                          "failed to read the current working directory" as &byte,
+                          "getcwd() returned an error" as &byte);
+    }
+
+    if discover_workspace(&cwd[0] as &byte,
+                          options,
+                          workspace,
+                          &error_message[0] as &byte,
+                          PATH_MAX) != 0 {
+        return emit_error(options.output_mode,
+                          EXIT_CONFIG,
+                          "UYABUILD_E_WORKSPACE_NOT_FOUND" as &byte,
+                          "workspace discovery failed" as &byte,
+                          &error_message[0] as &byte);
+    }
+
+    if prepare_state_layout(workspace,
+                            &cwd[0] as &byte,
+                            options,
+                            state_layout,
+                            &error_message[0] as &byte,
+                            PATH_MAX) != 0 {
+        return emit_error(options.output_mode,
+                          EXIT_IO,
+                          "UYABUILD_E_STATE_INIT" as &byte,
+                          "failed to initialize .uya-build state directories" as &byte,
+                          &error_message[0] as &byte);
+    }
+
+    if create_run_manifest(state_layout,
+                           &cwd[0] as &byte,
+                           workspace,
+                           subcommand,
+                           args,
+                           arg_count,
+                           manifest,
+                           &error_message[0] as &byte,
+                           PATH_MAX) != 0 {
+        return emit_error(options.output_mode,
+                          EXIT_IO,
+                          "UYABUILD_E_RUN_MANIFEST" as &byte,
+                          "failed to persist the run manifest" as &byte,
+                          &error_message[0] as &byte);
+    }
+
+    return 0;
+}
+
+fn is_target_pattern(value: &byte) i32 {
+    if value == null {
+        return 0;
+    }
+    const len: usize = strlen(value);
+    if len < 3 {
+        return 0;
+    }
+    if value[0] != 47 as byte || value[1] != 47 as byte {
+        return 0;
+    }
+    if value[len - 1] == 46 as byte &&
+        value[len - 2] == 46 as byte &&
+        value[len - 3] == 46 as byte &&
+        value[len - 4] == 47 as byte {
+        return 1;
+    }
+
+    var idx: usize = 2;
+    while idx < len {
+        if value[idx] == 58 as byte {
+            return 1;
+        }
+        idx = idx + 1;
+    }
+
+    return 0;
+}
+
+fn apply_shared_option(argument: &byte, next_argument: &byte, options: &Options) i32 {
+    if string_equals(argument, "--workspace" as &byte) != 0 {
+        options.workspace_override = next_argument;
+        return 1;
+    }
+    if string_equals(argument, "--state-dir" as &byte) != 0 {
+        options.state_dir_override = next_argument;
+        return 1;
+    }
+    return 0;
+}
+
+fn run_build(start_index: i32, base_options: &Options) i32 {
+    var options: Options = Options {
+        workspace_override: base_options.workspace_override,
+        state_dir_override: base_options.state_dir_override,
+        output_mode: base_options.output_mode,
+    };
+    var targets: [&byte: MAX_ARGS] = [];
+    var target_count: i32 = 0;
+    const argc: i32 = get_argc();
+
+    var index: i32 = start_index;
+    while index < argc {
+        const argument: &byte = get_argv(index);
+        if argument == null {
+            index = index + 1;
+            continue;
+        }
+
+        if string_equals(argument, "-h" as &byte) != 0 || string_equals(argument, "--help" as &byte) != 0 {
+            print_build_help();
+            return EXIT_OK;
+        }
+
+        if argument[0] == 45 as byte {
+            if string_equals(argument, "--json" as &byte) != 0 {
+                options.output_mode = OUTPUT_JSON;
+                index = index + 1;
+                continue;
+            }
+
+            if index + 1 >= argc {
+                return emit_error(options.output_mode,
+                                  EXIT_USAGE,
+                                  "UYABUILD_E_USAGE" as &byte,
+                                  "option requires a value" as &byte,
+                                  argument);
+            }
+
+            const next_argument: &byte = get_argv(index + 1);
+            if apply_shared_option(argument, next_argument, &options) != 0 {
+                index = index + 2;
+                continue;
+            }
+
+            return emit_error(options.output_mode,
+                              EXIT_USAGE,
+                              "UYABUILD_E_USAGE" as &byte,
+                              "unknown build option" as &byte,
+                              argument);
+        }
+
+        if is_target_pattern(argument) == 0 {
+            return emit_error(options.output_mode,
+                              EXIT_USAGE,
+                              "UYABUILD_E_TARGET_SYNTAX" as &byte,
+                              "build targets must use //pkg:name or //pkg/... syntax" as &byte,
+                              argument);
+        }
+
+        if target_count >= MAX_ARGS {
+            return emit_error(options.output_mode,
+                              EXIT_USAGE,
+                              "UYABUILD_E_USAGE" as &byte,
+                              "too many build targets were provided" as &byte,
+                              "Phase 0 bootstrap limits a single invocation to 256 targets" as &byte);
+        }
+
+        targets[target_count as usize] = argument;
+        target_count = target_count + 1;
+        index = index + 1;
+    }
+
+    if target_count == 0 {
+        return emit_error(options.output_mode,
+                          EXIT_USAGE,
+                          "UYABUILD_E_USAGE" as &byte,
+                          "uyabuild build requires at least one target" as &byte,
+                          "example: uyabuild build //bootstrap:uyabuild" as &byte);
+    }
+
+    var workspace: Workspace = Workspace { root: [], entrypoint: [] };
+    var state_layout: StateLayout = StateLayout { root: [], cas: [], meta: [], runs: [], tmp: [], locks: [], gc: [] };
+    var manifest: RunManifest = RunManifest { run_id: [], run_dir: [], manifest_path: [] };
+
+    const status: i32 = resolve_runtime_context(&options,
+                                                &workspace,
+                                                &state_layout,
+                                                &manifest,
+                                                "build" as &byte,
+                                                targets,
+                                                target_count);
+    if status != 0 {
+        return status;
+    }
+
+    return emit_error(options.output_mode,
+                      EXIT_NOT_IMPLEMENTED,
+                      "UYABUILD_E_PHASE_NOT_READY" as &byte,
+                      "build planning and execution are not implemented in Phase 0" as &byte,
+                      "bootstrap, workspace discovery, command parsing, run manifests, and .uya-build layout are ready" as &byte);
+}
+
+fn run_query(start_index: i32, base_options: &Options) i32 {
+    var options: Options = Options {
+        workspace_override: base_options.workspace_override,
+        state_dir_override: base_options.state_dir_override,
+        output_mode: base_options.output_mode,
+    };
+    var args: [&byte: MAX_ARGS] = [];
+    const argc: i32 = get_argc();
+    var expression: &byte = null;
+
+    var index: i32 = start_index;
+    while index < argc {
+        const argument: &byte = get_argv(index);
+        if argument == null {
+            index = index + 1;
+            continue;
+        }
+
+        if string_equals(argument, "-h" as &byte) != 0 || string_equals(argument, "--help" as &byte) != 0 {
+            print_query_help();
+            return EXIT_OK;
+        }
+
+        if argument[0] == 45 as byte {
+            if string_equals(argument, "--json" as &byte) != 0 {
+                options.output_mode = OUTPUT_JSON;
+                index = index + 1;
+                continue;
+            }
+
+            if index + 1 >= argc {
+                return emit_error(options.output_mode,
+                                  EXIT_USAGE,
+                                  "UYABUILD_E_USAGE" as &byte,
+                                  "option requires a value" as &byte,
+                                  argument);
+            }
+
+            const next_argument: &byte = get_argv(index + 1);
+            if apply_shared_option(argument, next_argument, &options) != 0 {
+                index = index + 2;
+                continue;
+            }
+
+            return emit_error(options.output_mode,
+                              EXIT_USAGE,
+                              "UYABUILD_E_USAGE" as &byte,
+                              "unknown query option" as &byte,
+                              argument);
+        }
+
+        if expression != null {
+            return emit_error(options.output_mode,
+                              EXIT_USAGE,
+                              "UYABUILD_E_USAGE" as &byte,
+                              "uyabuild query currently accepts exactly one expression" as &byte,
+                              "example: uyabuild query //..." as &byte);
+        }
+
+        expression = argument;
+        index = index + 1;
+    }
+
+    if expression == null {
+        return emit_error(options.output_mode,
+                          EXIT_USAGE,
+                          "UYABUILD_E_USAGE" as &byte,
+                          "uyabuild query requires an expression" as &byte,
+                          "example: uyabuild query //..." as &byte);
+    }
+
+    args[0] = expression;
+
+    var workspace: Workspace = Workspace { root: [], entrypoint: [] };
+    var state_layout: StateLayout = StateLayout { root: [], cas: [], meta: [], runs: [], tmp: [], locks: [], gc: [] };
+    var manifest: RunManifest = RunManifest { run_id: [], run_dir: [], manifest_path: [] };
+
+    const status: i32 = resolve_runtime_context(&options,
+                                                &workspace,
+                                                &state_layout,
+                                                &manifest,
+                                                "query" as &byte,
+                                                args,
+                                                1);
+    if status != 0 {
+        return status;
+    }
+
+    return emit_error(options.output_mode,
+                      EXIT_NOT_IMPLEMENTED,
+                      "UYABUILD_E_PHASE_NOT_READY" as &byte,
+                      "query evaluation is not implemented in Phase 0" as &byte,
+                      "bootstrap, workspace discovery, command parsing, run manifests, and .uya-build layout are ready" as &byte);
+}
+
+export fn main() i32 {
+    const argc: i32 = get_argc();
+    var options: Options = Options { workspace_override: null, state_dir_override: null, output_mode: OUTPUT_TEXT };
+    var command_index: i32 = 1;
+
+    if argc <= 1 {
+        print_root_help();
+        return EXIT_OK;
+    }
+
+    while command_index < argc {
+        const argument: &byte = get_argv(command_index);
+        if argument == null {
+            command_index = command_index + 1;
+            continue;
+        }
+
+        if string_equals(argument, "-h" as &byte) != 0 || string_equals(argument, "--help" as &byte) != 0 {
+            print_root_help();
+            return EXIT_OK;
+        }
+        if string_equals(argument, "--version" as &byte) != 0 {
+            print_version();
+            return EXIT_OK;
+        }
+        if string_equals(argument, "--json" as &byte) != 0 {
+            options.output_mode = OUTPUT_JSON;
+            command_index = command_index + 1;
+            continue;
+        }
+
+        if argument[0] == 45 as byte {
+            if command_index + 1 >= argc {
+                return emit_error(options.output_mode,
+                                  EXIT_USAGE,
+                                  "UYABUILD_E_USAGE" as &byte,
+                                  "option requires a value" as &byte,
+                                  argument);
+            }
+
+            const next_argument: &byte = get_argv(command_index + 1);
+            if apply_shared_option(argument, next_argument, &options) != 0 {
+                command_index = command_index + 2;
+                continue;
+            }
+
+            return emit_error(options.output_mode,
+                              EXIT_USAGE,
+                              "UYABUILD_E_USAGE" as &byte,
+                              "unknown global option" as &byte,
+                              argument);
+        }
+
+        break;
+    }
+
+    if command_index >= argc {
+        print_root_help();
+        return EXIT_OK;
+    }
+
+    const command: &byte = get_argv(command_index);
+    if command == null {
+        print_root_help();
+        return EXIT_OK;
+    }
+
+    if string_equals(command, "help" as &byte) != 0 {
+        if command_index + 1 < argc {
+            const topic: &byte = get_argv(command_index + 1);
+            if topic != null && string_equals(topic, "build" as &byte) != 0 {
+                print_build_help();
+                return EXIT_OK;
+            }
+            if topic != null && string_equals(topic, "query" as &byte) != 0 {
+                print_query_help();
+                return EXIT_OK;
+            }
+        }
+        print_root_help();
+        return EXIT_OK;
+    }
+
+    if string_equals(command, "version" as &byte) != 0 {
+        print_version();
+        return EXIT_OK;
+    }
+    if string_equals(command, "build" as &byte) != 0 {
+        return run_build(command_index + 1, &options);
+    }
+    if string_equals(command, "query" as &byte) != 0 {
+        return run_query(command_index + 1, &options);
+    }
+
+    return emit_error(options.output_mode,
+                      EXIT_USAGE,
+                      "UYABUILD_E_USAGE" as &byte,
+                      "unknown command" as &byte,
+                      command);
+}

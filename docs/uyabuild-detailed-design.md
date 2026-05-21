@@ -66,7 +66,7 @@
 ### 3.5 自举安全优于纯洁性
 
 - `UyaBuild` 主体使用 `Uya` 编写。
-- 保留一个极小 `bootstrap` 边界用于从 seed 构建首个可运行 `uya`。
+- 保留一个极小 `bootstrap` 边界用于从现有 `uya` 编译器构建首个可运行 `uyabuild`。
 - 不允许设计形成“必须先有 UyaBuild 才能构建 UyaBuild”的循环依赖。
 
 ## 4. 术语
@@ -107,21 +107,21 @@
 
 ### 5.3 主命令
 
-第一阶段 CLI 统一到 `uya` 主命令：
+第一阶段 CLI 统一到 `uyabuild` 主命令：
 
 ```text
-uya build //pkg:target
-uya test //tests/...
-uya check //...
-uya query //pkg/...
-uya aquery //app:cli
-uya why //app:cli
-uya explain file path/to/header.h
-uya plan //pkg:target --json
-uya replay <action-digest>
-uya diff-run <run-a> <run-b>
-uya release //dist:compiler
-uya install //dist:compiler
+uyabuild build //pkg:target
+uyabuild test //tests/...
+uyabuild check //...
+uyabuild query //pkg/...
+uyabuild aquery //app:cli
+uyabuild why //app:cli
+uyabuild explain file path/to/header.h
+uyabuild plan //pkg:target --json
+uyabuild replay <action-digest>
+uyabuild diff-run <run-a> <run-b>
+uyabuild release //dist:compiler
+uyabuild install //dist:compiler
 ```
 
 ### 5.4 目标类型
@@ -199,7 +199,7 @@ cxx.library "//runtime:core" {
 cxx.binary "//compiler:uya" {
   srcs = ["compiler/main.cc"]
   deps = ["//runtime:core"]
-  out = "out/bin/uya"
+  out = "out/bin/uyabuild"
   toolchain = "clang17"
 }
 
@@ -772,8 +772,8 @@ Node 规则需要理解：
 
 ```text
 make bootstrap
-  -> 从 C seed 构建首个 bin/uya
-  -> 之后所有开发者入口转向 uya build/test/check/release/install
+  -> 从纯 `uya` 源码构建首个 bin/uyabuild
+  -> 之后所有开发者入口转向 uyabuild build/test/check/release/install
 ```
 
 ### 18.2 `uya` 现有入口映射
@@ -781,11 +781,11 @@ make bootstrap
 | 现有入口 | 新入口 |
 |---|---|
 | `make from-c` / `make from-c-native` | `make bootstrap` |
-| `make uya` / `make uya-hosted` | `uya build //compiler:uya` |
-| `make tests` | `uya test //tests/...` |
-| `make check` | `uya check //...` |
-| `make release` | `uya release //dist:compiler` |
-| `make install` | `uya install //dist:compiler` |
+| `make uya` / `make uya-hosted` | `uyabuild build //compiler:uya` |
+| `make tests` | `uyabuild test //tests/...` |
+| `make check` | `uyabuild check //...` |
+| `make release` | `uyabuild release //dist:compiler` |
+| `make install` | `uyabuild install //dist:compiler` |
 
 ### 18.3 `uya` 仓内目标建议
 

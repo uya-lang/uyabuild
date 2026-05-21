@@ -1,0 +1,13 @@
+workspace {
+  name = "oci-multistage"
+  default = ["//image:demo"]
+  strict = true
+}
+
+use oci
+
+oci.image "//image:demo" {
+  dockerfile = "Dockerfile"
+  context = "."
+  tags = ["registry.example.com/demo:latest"]
+}

@@ -1,0 +1,2 @@
+UYABUILD_E_WORKSPACE_NOT_FOUND: workspace discovery failed
+detail: no uya.build or uya.toml was found from the current directory upward

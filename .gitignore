@@ -1,0 +1,14 @@
+# Build outputs
+/bin/
+/out/
+/.uyacache/
+/.uya-build/
+/**/.uya-build/
+/**/.uya-build-custom/
+
+# Benchmark captures
+/benchmarks/baseline/*.json
+!/benchmarks/baseline/.gitkeep
+
+# Test harness scratch
+/tests/.tmp/

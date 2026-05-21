@@ -1,0 +1,24 @@
+uyabuild 0.1.0-phase0
+
+Usage:
+  uyabuild [global-options] <command> [command-options]
+
+Bootstrap:
+  make bootstrap        build the pure Uya bootstrap binary into bin/uyabuild
+
+Commands:
+  build                 plan and execute targets (Phase 0 placeholder)
+  query                 inspect the target graph (Phase 0 placeholder)
+  version               print the bootstrap version
+  help                  show command help
+
+Global options:
+  --workspace <path>    override workspace root discovery
+  --state-dir <path>    override state directory (default: <workspace>/.uya-build)
+  --json                emit diagnostics as JSON
+  -h, --help            show help
+  --version             print version
+
+Examples:
+  uyabuild build //bootstrap:uyabuild
+  uyabuild query //...

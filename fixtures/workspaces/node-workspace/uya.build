@@ -1,0 +1,18 @@
+workspace {
+  name = "node-workspace"
+  default = ["//web:app"]
+  strict = true
+}
+
+use node
+
+node.workspace "//web:workspace" {
+  root = "."
+  lockfile = "package-lock.json"
+}
+
+node.app "//web:app" {
+  workspace = "//web:workspace"
+  package = "packages/app"
+  out = "dist/app"
+}

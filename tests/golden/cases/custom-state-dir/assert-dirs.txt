@@ -1,0 +1,6 @@
+.uya-build-custom/cas
+.uya-build-custom/meta
+.uya-build-custom/runs
+.uya-build-custom/tmp
+.uya-build-custom/locks
+.uya-build-custom/gc

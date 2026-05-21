@@ -1,0 +1,13 @@
+workspace {
+  name = "legacy-shell"
+  default = ["//legacy:echo"]
+  strict = false
+}
+
+use legacy
+
+legacy.shell "//legacy:echo" {
+  script = ["sh", "build.sh"]
+  inputs = ["build.sh", "input.txt"]
+  outputs = ["out/result.txt"]
+}

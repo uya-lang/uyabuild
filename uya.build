@@ -1,0 +1,17 @@
+workspace {
+  name = "uyabuild"
+  default = ["//bootstrap:uyabuild"]
+  strict = true
+}
+
+use legacy
+
+legacy.shell "//bootstrap:uyabuild" {
+  script = ["make", "bootstrap"]
+  inputs = [
+    "Makefile",
+    "bootstrap.sh",
+    "build/bootstrap/seed/**/*.uya",
+  ]
+  outputs = ["bin/uyabuild"]
+}

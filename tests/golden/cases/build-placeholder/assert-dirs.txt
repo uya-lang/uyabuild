@@ -1,0 +1,6 @@
+.uya-build/cas
+.uya-build/meta
+.uya-build/runs
+.uya-build/tmp
+.uya-build/locks
+.uya-build/gc

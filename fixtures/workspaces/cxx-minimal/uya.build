@@ -1,0 +1,18 @@
+workspace {
+  name = "cxx-minimal"
+  default = ["//app:hello"]
+  strict = true
+}
+
+use cxx
+
+cxx.library "//lib:hello" {
+  srcs = ["src/lib.cc"]
+  hdrs = ["src/lib.h"]
+}
+
+cxx.binary "//app:hello" {
+  srcs = ["src/main.cc"]
+  deps = ["//lib:hello"]
+  out = "out/bin/hello"
+}

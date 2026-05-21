@@ -1,0 +1,4 @@
+build
+//app:hello
+--state-dir
+.uya-build-custom

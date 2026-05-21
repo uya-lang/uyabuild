@@ -1,0 +1,2 @@
+UYABUILD_E_USAGE: uyabuild build requires at least one target
+detail: example: uyabuild build //bootstrap:uyabuild

@@ -1,0 +1,11 @@
+{
+  "name": "node-workspace",
+  "private": true,
+  "workspaces": [
+    "packages/app",
+    "packages/lib"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @sample/app"
+  }
+}
