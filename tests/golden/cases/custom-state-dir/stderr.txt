@@ -1,2 +1,2 @@
-UYABUILD_E_PHASE_NOT_READY: build planning and execution are not implemented yet
-detail: Phase 1 analyzed 1 files, 2 targets, and matched 1 requested targets; planner/executor begin in Phase 2/3
+UYABUILD_E_EXECUTOR_REQUIRED: build planning completed, but execution is still deferred to Phase 3
+detail: Phase 2 planned 2 actions, seeded 0 outputs, and still has 2 pending actions that require the Phase 3 executor
