@@ -142,6 +142,12 @@
 
 ### 8.2 TODO
 
+当前状态（2026-05-22）：
+
+- `bin/uyabuild build` 已进入 Phase 3 本地执行路径：待执行的 `legacy.shell` / `task` 动作会在私有临时工作区中运行，并把 `stdout` / `stderr` 分离采集到 `.uya-build/tmp/actions/<run-id>/<action-key>/`。
+- 已完成的首批闭环：本地 Executor 骨架、动作临时工作区、日志采集、原子输出提交、环境变量白名单，以及 `executed-local` / `execution-failed` 元数据落盘。
+- 当前仍受限于兼容执行路径：`cxx` / `node` / `oci` 等动作尚未接入本地执行器，命中待执行动作时会返回 `UYABUILD_E_EXECUTOR_UNSUPPORTED`；依赖追踪、严格模式、执行模式、资源池与网络策略仍待后续收口。
+
 | ID | 优先级 | 任务 | 依赖 | 验收标准 |
 |---|---|---|---|---|
 | `P3-1` | `P0` | 实现本地 Executor 骨架 | `P2-6` | 可执行单个动作并返回状态 |

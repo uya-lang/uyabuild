@@ -1,4 +1,4 @@
-uyabuild 0.3.0-phase2
+uyabuild 0.4.0-phase3
 
 Usage:
   uyabuild [global-options] <command> [command-options]
@@ -7,7 +7,7 @@ Bootstrap:
   make bootstrap        build the pure Uya bootstrap binary into bin/uyabuild
 
 Commands:
-  build                 analyze, snapshot, and plan targets (execution begins in Phase 3)
+  build                 analyze, snapshot, and execute supported local actions
   query                 inspect the typed target graph
   plan                  emit the typed IR plus Phase 2 action graph
   version               print the bootstrap version

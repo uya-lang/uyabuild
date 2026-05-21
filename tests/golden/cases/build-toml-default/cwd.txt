@@ -1,1 +1,1 @@
-fixture:toml-compat
+fixture-copy:toml-compat

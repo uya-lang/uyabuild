@@ -5,6 +5,6 @@ workspace {
 use legacy
 
 legacy.shell "//:noop" {
-  script = ["sh", "-c", "true"]
+  script = ["sh", "-c", "mkdir -p out && : > out/ok"]
   outputs = ["out/ok"]
 }

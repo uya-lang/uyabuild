@@ -17,12 +17,19 @@ Phase 2 currently provides:
 - a native DSL lexer/parser with source locations
 - schema validation, label normalization, and a stable typed IR
 - target-closure planning, input snapshots, CAS object emission, action key calculation, and file-backed NoSQLite-style metadata indexes
-- `uyabuild query`, `uyabuild plan --json`, and planning-only `uyabuild build` with `seeded-output`, `local-hit`, and `success-no-change`
+- `uyabuild query`, `uyabuild plan --json`, and Phase 2 cache decisions such as `seeded-output`, `local-hit`, and `success-no-change`
 
-Build execution intentionally still stops before the Phase 3 executor:
+Phase 3 now provides an initial local executor for `legacy.shell` and `task`:
 
-- `uyabuild build` now plans actions, performs early-cutoff output digest checks, seeds/checks the local cache index, and persists Phase 2 metadata
-- pending actions still require the future executor/sandbox pipeline
+- `uyabuild build` materializes a per-action temporary workspace, runs supported actions locally, captures `stdout`/`stderr`, and atomically commits declared outputs
+- supported actions inherit only a small environment allowlist plus explicit `env_allowlist` entries from the rule
+- executed actions persist `executed-local` metadata and log paths alongside the existing CAS/meta records
+
+Still pending for later Phase 3 work:
+
+- execution modes such as `pure/host/volatile`
+- filesystem dependency tracking and strict hidden-input enforcement
+- parallel resource pools, network policy, and broader rule-kind execution backends
 
 Reference docs:
 

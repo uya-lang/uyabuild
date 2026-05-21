@@ -1,2 +1,3 @@
-UYABUILD_E_EXECUTOR_REQUIRED: build planning completed, but execution is still deferred to Phase 3
-detail: Phase 2 planned 2 actions, seeded 0 outputs, and still has 2 pending actions that require the Phase 3 executor
+UYABUILD_E_EXECUTOR_UNSUPPORTED: the local executor does not yet support this action kind
+at: uya.build:9:1
+detail: cxx.library

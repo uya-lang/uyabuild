@@ -8,15 +8,23 @@ use libc.fopen;
 use libc.fprintf;
 use libc.fputc;
 use libc.fputs;
+use libc.chdir;
+use libc.execve;
+use libc.fork;
+use libc.getenv;
 use libc.getcwd;
 use libc.getpid;
 use libc.mkdir;
+use libc.remove;
+use libc.rename;
 use libc.snprintf;
 use libc.stat;
 use libc.strcmp;
 use libc.strlen;
 use libc.time;
 use libc.time_t;
+use libc.waitpid;
+use libc._exit;
 use libc.DIR;
 use libc.Dirent;
 use libc.closedir;
@@ -33,12 +41,13 @@ use std.mem.memset;
 use std.runtime.get_argc;
 use std.runtime.get_argv;
 
-const VERSION: &byte = "0.3.0-phase2" as &byte;
+const VERSION: &byte = "0.4.0-phase3" as &byte;
 
 const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 2;
 const EXIT_CONFIG: i32 = 3;
 const EXIT_IO: i32 = 4;
+const EXIT_ACTION: i32 = 5;
 const EXIT_NOT_IMPLEMENTED: i32 = 6;
 
 const OUTPUT_TEXT: i32 = 0;
@@ -49,7 +58,8 @@ const S_IFDIR: u32 = 16384u32;
 const S_IFREG: u32 = 32768u32;
 
 const MAX_ARGS: i32 = 256;
-const PHASE_NUMBER: i32 = 2;
+const PLAN_PHASE_NUMBER: i32 = 2;
+const BUILD_PHASE_NUMBER: i32 = 3;
 const PHASE1_ARENA_SIZE: i32 = 16 * 1024 * 1024;
 const MAX_STRING_BUILD: usize = 8192usize;
 const DIGEST_BYTES: usize = 32usize;
@@ -313,6 +323,8 @@ struct PlannedAction {
     label: &byte,
     kind: &byte,
     mnemonic: &byte,
+    stdout_path: &byte,
+    stderr_path: &byte,
     command_head: &StringNode,
     command_tail: &StringNode,
     input_head: &StringNode,
@@ -325,6 +337,7 @@ struct PlannedAction {
     output_root_digest: &byte,
     action_key: &byte,
     cache_status: &byte,
+    exit_code: i32,
     pending_execution: i32,
     order_index: i32,
     next: &PlannedAction,
@@ -4855,6 +4868,683 @@ fn persist_text(path: &byte, text: &byte) i32 {
     return persist_bytes(path, text, strlen(text));
 }
 
+fn phase_number_for_subcommand(subcommand: &byte) i32 {
+    if string_equals(subcommand, "build" as &byte) != 0 {
+        return BUILD_PHASE_NUMBER;
+    }
+    if string_equals(subcommand, "plan" as &byte) != 0 {
+        return PLAN_PHASE_NUMBER;
+    }
+    if string_equals(subcommand, "query" as &byte) != 0 {
+        return 1;
+    }
+    return BUILD_PHASE_NUMBER;
+}
+
+fn path_basename_text(path: &byte, out: &byte, out_cap: usize) i32 {
+    if path == null || out == null || out_cap == 0 {
+        return -1;
+    }
+    const len: usize = strlen(path);
+    if len == 0 {
+        return copy_string(out, out_cap, "." as &byte);
+    }
+
+    var start: usize = 0usize;
+    var i: usize = 0usize;
+    while i < len {
+        if path[i] == 47 as byte {
+            start = i + 1usize;
+        }
+        i = i + 1usize;
+    }
+    return copy_string(out, out_cap, &path[start] as &byte);
+}
+
+fn wait_status_signal(wait_status: i32) i32 {
+    if wait_status < 0 {
+        return 0;
+    }
+    const low: i32 = wait_status & 127;
+    if low == 0 {
+        return 0;
+    }
+    return low & 127;
+}
+
+fn wait_status_exit_code(wait_status: i32) i32 {
+    if wait_status < 0 {
+        return 1;
+    }
+    const signal_code: i32 = wait_status_signal(wait_status);
+    if signal_code != 0 {
+        return 128 + signal_code;
+    }
+    return (wait_status >> 8) & 255;
+}
+
+fn set_action_diagnostic(ctx: &Phase2Context,
+                         action: &PlannedAction,
+                         exit_code: i32,
+                         code: &byte,
+                         message: &byte,
+                         detail: &byte) i32 {
+    var file_text: &byte = action.label;
+    var line: i32 = 0;
+    var column: i32 = 0;
+    if action != null && action.owner != null && action.owner.file != null {
+        file_text = action.owner.file.rel_path;
+        line = action.owner.span.start.line;
+        column = action.owner.span.start.column;
+    }
+    return set_diagnostic(ctx.phase1, exit_code, code, message, detail, file_text, line, column);
+}
+
+fn shell_append_quoted(buffer: &byte, used: &usize, cap: usize, text: &byte) i32 {
+    if append_buffer_byte(buffer, used, cap, 39 as byte) != 0 {
+        return -1;
+    }
+    if text != null {
+        var i: usize = 0usize;
+        while text[i] != 0 as byte {
+            const ch: byte = text[i];
+            if ch == 39 as byte {
+                if append_buffer_byte(buffer, used, cap, 39 as byte) != 0 ||
+                    append_buffer_byte(buffer, used, cap, 92 as byte) != 0 ||
+                    append_buffer_byte(buffer, used, cap, 39 as byte) != 0 ||
+                    append_buffer_byte(buffer, used, cap, 39 as byte) != 0 {
+                    return -1;
+                }
+            } else if append_buffer_byte(buffer, used, cap, ch) != 0 {
+                return -1;
+            }
+            i = i + 1usize;
+        }
+    }
+    return append_buffer_byte(buffer, used, cap, 39 as byte);
+}
+
+fn build_action_shell_command(ctx: &Phase1Context,
+                              action: &PlannedAction,
+                              stdout_path: &byte,
+                              stderr_path: &byte) &byte {
+    if ctx == null || action == null || action.command_head == null {
+        return null;
+    }
+    var buffer: [byte: MAX_STRING_BUILD] = [];
+    var used: usize = 0usize;
+    var first: i32 = 1;
+    var arg: &StringNode = action.command_head;
+    while arg != null {
+        if first == 0 && append_buffer_byte(&buffer[0] as &byte, &used, MAX_STRING_BUILD, 32 as byte) != 0 {
+            return null;
+        }
+        if shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, arg.text) != 0 {
+            return null;
+        }
+        first = 0;
+        arg = arg.next;
+    }
+    if stdout_path != null {
+        if append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " > " as &byte) != 0 ||
+            shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, stdout_path) != 0 {
+            return null;
+        }
+    }
+    if stderr_path != null {
+        if append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " 2> " as &byte) != 0 ||
+            shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, stderr_path) != 0 {
+            return null;
+        }
+    }
+    return arena_copy_cstr(&ctx.arena, &buffer[0] as &byte);
+}
+
+fn copy_file_path(ctx: &Phase1Context, source_abs: &byte, dest_abs: &byte) i32 {
+    if ctx == null || source_abs == null || dest_abs == null {
+        return -1;
+    }
+    var parent: [byte: PATH_MAX] = [];
+    if path_dirname_text(dest_abs, &parent[0] as &byte, PATH_MAX) != 0 ||
+        ensure_dir_recursive(&parent[0] as &byte) != 0 {
+        return -1;
+    }
+    if path_is_file(dest_abs) != 0 && remove(dest_abs as &const byte) != 0 {
+        return -1;
+    }
+    var size_out: usize = 0usize;
+    const content: &byte = read_file_into_arena(ctx, source_abs, &size_out);
+    if content == null {
+        return -1;
+    }
+    return persist_bytes(dest_abs, content, size_out);
+}
+
+fn copy_path_recursive(ctx: &Phase1Context, source_abs: &byte, dest_abs: &byte) i32 {
+    if ctx == null || source_abs == null || dest_abs == null {
+        return -1;
+    }
+    if path_is_file(source_abs) != 0 {
+        return copy_file_path(ctx, source_abs, dest_abs);
+    }
+    if path_is_dir(source_abs) == 0 {
+        return -1;
+    }
+    if ensure_dir_recursive(dest_abs) != 0 {
+        return -1;
+    }
+    const dir: &DIR = opendir(source_abs as &const byte);
+    if dir == null {
+        return -1;
+    }
+    var entry_dir: &Dirent = readdir(dir);
+    while entry_dir != null {
+        const name: &byte = &entry_dir.d_name[0] as &byte;
+        if is_dirent_dot(name) != 0 {
+            entry_dir = readdir(dir);
+            continue;
+        }
+        var child_source: [byte: PATH_MAX] = [];
+        var child_dest: [byte: PATH_MAX] = [];
+        if join_path(source_abs, name, &child_source[0] as &byte, PATH_MAX) != 0 ||
+            join_path(dest_abs, name, &child_dest[0] as &byte, PATH_MAX) != 0 ||
+            copy_path_recursive(ctx, &child_source[0] as &byte, &child_dest[0] as &byte) != 0 {
+            _ = closedir(dir);
+            return -1;
+        }
+        entry_dir = readdir(dir);
+    }
+    _ = closedir(dir);
+    return 0;
+}
+
+fn recursive_remove_path(path: &byte) i32 {
+    if path == null {
+        return -1;
+    }
+    if path_is_file(path) != 0 {
+        if remove(path as &const byte) != 0 {
+            return -1;
+        }
+        return 0;
+    }
+    if path_is_dir(path) == 0 {
+        return 0;
+    }
+    const dir: &DIR = opendir(path as &const byte);
+    if dir == null {
+        return -1;
+    }
+    var entry_dir: &Dirent = readdir(dir);
+    while entry_dir != null {
+        const name: &byte = &entry_dir.d_name[0] as &byte;
+        if is_dirent_dot(name) != 0 {
+            entry_dir = readdir(dir);
+            continue;
+        }
+        var child_path: [byte: PATH_MAX] = [];
+        if join_path(path, name, &child_path[0] as &byte, PATH_MAX) != 0 ||
+            recursive_remove_path(&child_path[0] as &byte) != 0 {
+            _ = closedir(dir);
+            return -1;
+        }
+        entry_dir = readdir(dir);
+    }
+    _ = closedir(dir);
+    if remove(path as &const byte) != 0 {
+        return -1;
+    }
+    return 0;
+}
+
+fn build_action_workspace_root(ctx: &Phase2Context, action: &PlannedAction, out: &byte, out_cap: usize) i32 {
+    if ctx == null || action == null || out == null {
+        return -1;
+    }
+    var parent_path: [byte: PATH_MAX] = [];
+    if path_dirname_text(ctx.phase1.workspace_root, &parent_path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    const written: i32 = snprintf(out as *byte,
+                                  out_cap,
+                                  "%s/.uyabuild-action-%s-%d" as *byte,
+                                  &parent_path[0] as *byte,
+                                  &ctx.manifest.run_id[0] as *byte,
+                                  action.order_index);
+    if written < 0 || written >= out_cap as i32 {
+        return -1;
+    }
+    return 0;
+}
+
+fn build_action_log_paths(ctx: &Phase2Context,
+                          action: &PlannedAction,
+                          stdout_out: &byte,
+                          stderr_out: &byte,
+                          stdout_cap: usize,
+                          stderr_cap: usize) i32 {
+    if ctx == null || action == null || stdout_out == null || stderr_out == null {
+        return -1;
+    }
+    var action_tmp_root: [byte: PATH_MAX] = [];
+    var run_root: [byte: PATH_MAX] = [];
+    if join_path(&ctx.state_layout.tmp[0] as &byte, "actions" as &byte, &action_tmp_root[0] as &byte, PATH_MAX) != 0 ||
+        ensure_dir_recursive(&action_tmp_root[0] as &byte) != 0 ||
+        join_path(&action_tmp_root[0] as &byte, &ctx.manifest.run_id[0] as &byte, &run_root[0] as &byte, PATH_MAX) != 0 ||
+        ensure_dir_recursive(&run_root[0] as &byte) != 0 {
+        return -1;
+    }
+    var action_root: [byte: PATH_MAX] = [];
+    if join_path(&run_root[0] as &byte, action.action_key, &action_root[0] as &byte, PATH_MAX) != 0 ||
+        ensure_dir_recursive(&action_root[0] as &byte) != 0 {
+        return -1;
+    }
+    if join_path(&action_root[0] as &byte, "stdout.log" as &byte, stdout_out, stdout_cap) != 0 ||
+        join_path(&action_root[0] as &byte, "stderr.log" as &byte, stderr_out, stderr_cap) != 0 {
+        return -1;
+    }
+    return 0;
+}
+
+fn materialize_workspace_rel_path(ctx: &Phase2Context,
+                                  rel_path: &byte,
+                                  action_root: &byte,
+                                  must_exist: i32) i32 {
+    if ctx == null || rel_path == null || action_root == null {
+        return -1;
+    }
+    var source_abs: [byte: PATH_MAX] = [];
+    var dest_abs: [byte: PATH_MAX] = [];
+    if join_and_normalize_path(ctx.phase1.workspace_root, rel_path, &source_abs[0] as &byte, PATH_MAX) != 0 ||
+        join_path(action_root, rel_path, &dest_abs[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    if path_is_file(&source_abs[0] as &byte) == 0 && path_is_dir(&source_abs[0] as &byte) == 0 {
+        if must_exist != 0 {
+            return -1;
+        }
+        return 0;
+    }
+    return copy_path_recursive(ctx.phase1, &source_abs[0] as &byte, &dest_abs[0] as &byte);
+}
+
+fn materialize_action_workspace(ctx: &Phase2Context, action: &PlannedAction, action_root: &byte) i32 {
+    if ctx == null || action == null || action_root == null {
+        return -1;
+    }
+    var input: &StringNode = action.input_head;
+    while input != null {
+        if materialize_workspace_rel_path(ctx, input.text, action_root, 1) != 0 {
+            return -1;
+        }
+        input = input.next;
+    }
+    var dep: &StringNode = action.dep_head;
+    while dep != null {
+        const dep_action: &PlannedAction = find_planned_action_by_label(ctx, dep.text);
+        if dep_action != null {
+            var dep_output: &StringNode = dep_action.output_head;
+            while dep_output != null {
+                if materialize_workspace_rel_path(ctx, dep_output.text, action_root, 0) != 0 {
+                    return -1;
+                }
+                dep_output = dep_output.next;
+            }
+        }
+        dep = dep.next;
+    }
+    return 0;
+}
+
+fn append_env_name(names: [&byte: MAX_ARGS], count: &i32, name: &byte) i32 {
+    if count == null || name == null || name[0] == 0 as byte {
+        return -1;
+    }
+    var i: i32 = 0;
+    while i < count[0] {
+        const idx: usize = i32_to_usize_checked(i);
+        if idx >= MAX_ARGS as usize {
+            return -1;
+        }
+        if string_equals(names[idx], name) != 0 {
+            return 0;
+        }
+        i = i + 1;
+    }
+    if count[0] >= MAX_ARGS - 1 {
+        return -1;
+    }
+    const out_index: usize = i32_to_usize_checked(count[0]);
+    if out_index >= MAX_ARGS as usize {
+        return -1;
+    }
+    names[out_index] = name;
+    count[0] = count[0] + 1;
+    return 0;
+}
+
+fn append_env_entry(ctx: &Phase1Context,
+                    env_out: [&byte: MAX_ARGS],
+                    env_count: &i32,
+                    name: &byte,
+                    value: &byte) i32 {
+    if ctx == null || env_count == null || name == null || value == null {
+        return -1;
+    }
+    if env_count[0] >= MAX_ARGS - 1 {
+        return -1;
+    }
+    const name_len: usize = strlen(name);
+    const value_len: usize = strlen(value);
+    const entry: &byte = arena_alloc_zero(&ctx.arena, name_len + 1usize + value_len + 1usize);
+    if entry == null {
+        return -1;
+    }
+    if name_len > 0 {
+        memcpy(entry, name, name_len);
+    }
+    const sep_ptr: &byte = entry + name_len;
+    sep_ptr[0] = 61 as byte;
+    if value_len > 0 {
+        memcpy(entry + name_len + 1usize, value, value_len);
+    }
+    const tail_ptr: &byte = entry + name_len + 1usize + value_len;
+    tail_ptr[0] = 0 as byte;
+    const out_index: usize = i32_to_usize_checked(env_count[0]);
+    if out_index >= MAX_ARGS as usize {
+        return -1;
+    }
+    env_out[out_index] = entry;
+    env_count[0] = env_count[0] + 1;
+    return 0;
+}
+
+fn build_action_exec_env(ctx: &Phase2Context,
+                         action: &PlannedAction,
+                         action_root: &byte,
+                         env_out: [&byte: MAX_ARGS],
+                         env_count: &i32) i32 {
+    if ctx == null || action == null || action_root == null || env_count == null {
+        return -1;
+    }
+    env_count[0] = 0;
+    var names: [&byte: MAX_ARGS] = [];
+    var name_count: i32 = 0;
+    if append_env_name(names, &name_count, "PATH" as &byte) != 0 ||
+        append_env_name(names, &name_count, "HOME" as &byte) != 0 ||
+        append_env_name(names, &name_count, "TMPDIR" as &byte) != 0 ||
+        append_env_name(names, &name_count, "TMP" as &byte) != 0 ||
+        append_env_name(names, &name_count, "TEMP" as &byte) != 0 ||
+        append_env_name(names, &name_count, "USER" as &byte) != 0 ||
+        append_env_name(names, &name_count, "LOGNAME" as &byte) != 0 ||
+        append_env_name(names, &name_count, "LANG" as &byte) != 0 ||
+        append_env_name(names, &name_count, "LC_ALL" as &byte) != 0 ||
+        append_env_name(names, &name_count, "SHELL" as &byte) != 0 ||
+        append_env_name(names, &name_count, "UYA_BOOTSTRAP" as &byte) != 0 ||
+        append_env_name(names, &name_count, "UYA_BUILD_FLAGS" as &byte) != 0 {
+        return -1;
+    }
+
+    const allow_field: &IRField = find_ir_field(action.owner.attrs, "env_allowlist" as &byte);
+    if allow_field != null && allow_field.value != null && allow_field.value.kind == TYPED_VALUE_LIST {
+        var allow_item: &StringNode = collect_typed_strings_sorted(ctx.phase1, allow_field.value, null);
+        while allow_item != null {
+            if append_env_name(names, &name_count, allow_item.text) != 0 {
+                return -1;
+            }
+            allow_item = allow_item.next;
+        }
+    }
+
+    var i: i32 = 0;
+    while i < name_count {
+        const name_index: usize = i32_to_usize_checked(i);
+        if name_index >= MAX_ARGS as usize {
+            return -1;
+        }
+        const current_value: &byte = getenv(names[name_index] as &const byte);
+        if current_value != null && append_env_entry(ctx.phase1, env_out, env_count, names[name_index], current_value) != 0 {
+            return -1;
+        }
+        i = i + 1;
+    }
+    if append_env_entry(ctx.phase1, env_out, env_count, "PWD" as &byte, action_root) != 0 {
+        return -1;
+    }
+    const tail_index: usize = i32_to_usize_checked(env_count[0]);
+    if tail_index >= MAX_ARGS as usize {
+        return -1;
+    }
+    env_out[tail_index] = null;
+    return 0;
+}
+
+fn commit_action_outputs(ctx: &Phase2Context, action: &PlannedAction, action_root: &byte) i32 {
+    if ctx == null || action == null || action_root == null {
+        return -1;
+    }
+    var output: &StringNode = action.output_head;
+    while output != null {
+        var staged_abs: [byte: PATH_MAX] = [];
+        if join_path(action_root, output.text, &staged_abs[0] as &byte, PATH_MAX) != 0 {
+            return -1;
+        }
+        if path_is_file(&staged_abs[0] as &byte) == 0 && path_is_dir(&staged_abs[0] as &byte) == 0 {
+            return -1;
+        }
+        output = output.next;
+    }
+
+    output = action.output_head;
+    while output != null {
+        var staged_abs: [byte: PATH_MAX] = [];
+        var final_abs: [byte: PATH_MAX] = [];
+        var final_parent: [byte: PATH_MAX] = [];
+        if join_path(action_root, output.text, &staged_abs[0] as &byte, PATH_MAX) != 0 ||
+            join_and_normalize_path(ctx.phase1.workspace_root, output.text, &final_abs[0] as &byte, PATH_MAX) != 0 ||
+            path_dirname_text(&final_abs[0] as &byte, &final_parent[0] as &byte, PATH_MAX) != 0 ||
+            ensure_dir_recursive(&final_parent[0] as &byte) != 0 {
+            return -1;
+        }
+        if path_is_file(&final_abs[0] as &byte) != 0 || path_is_dir(&final_abs[0] as &byte) != 0 {
+            if recursive_remove_path(&final_abs[0] as &byte) != 0 {
+                return -1;
+            }
+        }
+        if rename(&staged_abs[0] as &const byte, &final_abs[0] as &const byte) != 0 {
+            if copy_path_recursive(ctx.phase1, &staged_abs[0] as &byte, &final_abs[0] as &byte) != 0 ||
+                recursive_remove_path(&staged_abs[0] as &byte) != 0 {
+                return -1;
+            }
+        }
+        output = output.next;
+    }
+    return 0;
+}
+
+fn action_supports_local_executor(action: &PlannedAction) i32 {
+    if action == null {
+        return 0;
+    }
+    if string_equals(action.kind, "legacy.shell" as &byte) != 0 ||
+        string_equals(action.kind, "task" as &byte) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn execute_local_action(ctx: &Phase2Context, action: &PlannedAction) i32 {
+    if ctx == null || action == null {
+        return -1;
+    }
+    var action_root: [byte: PATH_MAX] = [];
+    var stdout_path: [byte: PATH_MAX] = [];
+    var stderr_path: [byte: PATH_MAX] = [];
+    if build_action_workspace_root(ctx, action, &action_root[0] as &byte, PATH_MAX) != 0 ||
+        build_action_log_paths(ctx,
+                               action,
+                               &stdout_path[0] as &byte,
+                               &stderr_path[0] as &byte,
+                               PATH_MAX,
+                               PATH_MAX) != 0 {
+        return set_action_diagnostic(ctx,
+                                     action,
+                                     EXIT_IO,
+                                     "UYABUILD_E_EXECUTOR_SETUP" as &byte,
+                                     "failed to prepare local executor directories" as &byte,
+                                     "check temporary directory permissions and path lengths" as &byte);
+    }
+    if path_is_file(&action_root[0] as &byte) != 0 || path_is_dir(&action_root[0] as &byte) != 0 {
+        if recursive_remove_path(&action_root[0] as &byte) != 0 {
+            return set_action_diagnostic(ctx,
+                                         action,
+                                         EXIT_IO,
+                                         "UYABUILD_E_EXECUTOR_SETUP" as &byte,
+                                         "failed to clear a stale local executor workspace" as &byte,
+                                         &action_root[0] as &byte);
+        }
+    }
+    if ensure_dir_recursive(&action_root[0] as &byte) != 0 ||
+        materialize_action_workspace(ctx, action, &action_root[0] as &byte) != 0 {
+        return set_action_diagnostic(ctx,
+                                     action,
+                                     EXIT_IO,
+                                     "UYABUILD_E_ACTION_MATERIALIZE" as &byte,
+                                     "failed to materialize the action workspace" as &byte,
+                                     action.label);
+    }
+    const command_text: &byte = build_action_shell_command(ctx.phase1,
+                                                           action,
+                                                           &stdout_path[0] as &byte,
+                                                           &stderr_path[0] as &byte);
+    if command_text == null {
+        return set_action_diagnostic(ctx,
+                                     action,
+                                     EXIT_CONFIG,
+                                     "UYABUILD_E_ACTION_COMMAND" as &byte,
+                                     "failed to serialize the action command line" as &byte,
+                                     action.label);
+    }
+
+    var envp: [&byte: MAX_ARGS] = [];
+    var env_count: i32 = 0;
+    if build_action_exec_env(ctx, action, &action_root[0] as &byte, envp, &env_count) != 0 {
+        return set_action_diagnostic(ctx,
+                                     action,
+                                     EXIT_IO,
+                                     "UYABUILD_E_EXECUTOR_ENV" as &byte,
+                                     "failed to build the action environment whitelist" as &byte,
+                                     action.label);
+    }
+
+    const shell_path: &byte = "/bin/sh" as &byte;
+    var exec_args: [&byte: 4] = [shell_path, "-c" as &byte, command_text, null];
+    const child_pid: i32 = fork();
+    if child_pid < 0 {
+        return set_action_diagnostic(ctx,
+                                     action,
+                                     EXIT_IO,
+                                     "UYABUILD_E_EXECUTOR_FORK" as &byte,
+                                     "failed to fork the local executor child" as &byte,
+                                     action.label);
+    }
+    if child_pid == 0 {
+        if chdir(&action_root[0] as &const byte) != 0 {
+            _exit(127);
+        }
+        execve(shell_path as &const byte, &exec_args[0] as & &byte, &envp[0] as & &byte);
+        _exit(127);
+    }
+
+    action.stdout_path = arena_copy_cstr(&ctx.phase1.arena, &stdout_path[0] as &byte);
+    action.stderr_path = arena_copy_cstr(&ctx.phase1.arena, &stderr_path[0] as &byte);
+
+    var wait_status: i32 = 0;
+    if waitpid(child_pid, &wait_status, 0) < 0 {
+        action.cache_status = "execution-failed" as &byte;
+        action.pending_execution = 0;
+        action.exit_code = 127;
+        if ctx.pending_count > 0 {
+            ctx.pending_count = ctx.pending_count - 1;
+        }
+        return set_action_diagnostic(ctx,
+                                     action,
+                                     EXIT_IO,
+                                     "UYABUILD_E_EXECUTOR_WAIT" as &byte,
+                                     "failed to collect the local executor result" as &byte,
+                                     action.label);
+    }
+
+    action.exit_code = wait_status_exit_code(wait_status);
+    action.pending_execution = 0;
+    if ctx.pending_count > 0 {
+        ctx.pending_count = ctx.pending_count - 1;
+    }
+    if action.exit_code != 0 {
+        action.cache_status = "execution-failed" as &byte;
+        var detail_buf: [byte: PATH_MAX] = [];
+        _ = snprintf(&detail_buf[0] as *byte,
+                     PATH_MAX,
+                     "%s exited with status %d; see %s" as *byte,
+                     action.label as *byte,
+                     action.exit_code,
+                     &stderr_path[0] as *byte);
+        return set_action_diagnostic(ctx,
+                                     action,
+                                     EXIT_ACTION,
+                                     "UYABUILD_E_ACTION_FAILED" as &byte,
+                                     "build action exited with a non-zero status" as &byte,
+                                     arena_copy_cstr(&ctx.phase1.arena, &detail_buf[0] as &byte));
+    }
+
+    if commit_action_outputs(ctx, action, &action_root[0] as &byte) != 0 {
+        action.cache_status = "execution-failed" as &byte;
+        return set_action_diagnostic(ctx,
+                                     action,
+                                     EXIT_ACTION,
+                                     "UYABUILD_E_OUTPUT_COMMIT" as &byte,
+                                     "action completed but declared outputs could not be committed" as &byte,
+                                     action.label);
+    }
+    action.output_root_digest = action_collect_observed_outputs(ctx, action);
+    if action.output_head != null && action.output_root_digest == null {
+        action.cache_status = "execution-failed" as &byte;
+        return set_action_diagnostic(ctx,
+                                     action,
+                                     EXIT_ACTION,
+                                     "UYABUILD_E_OUTPUT_MISSING" as &byte,
+                                     "action completed without producing every declared output" as &byte,
+                                     action.label);
+    }
+    action.cache_status = "executed-local" as &byte;
+    _ = recursive_remove_path(&action_root[0] as &byte);
+    return 0;
+}
+
+fn execute_pending_actions(ctx: &Phase2Context) i32 {
+    if ctx == null {
+        return -1;
+    }
+    var action: &PlannedAction = ctx.action_head;
+    while action != null {
+        if action.pending_execution != 0 {
+            if action_supports_local_executor(action) == 0 {
+                return set_action_diagnostic(ctx,
+                                             action,
+                                             EXIT_NOT_IMPLEMENTED,
+                                             "UYABUILD_E_EXECUTOR_UNSUPPORTED" as &byte,
+                                             "the local executor does not yet support this action kind" as &byte,
+                                             action.kind);
+            }
+            if execute_local_action(ctx, action) != 0 {
+                return -1;
+            }
+        }
+        action = action.next;
+    }
+    return 0;
+}
+
 fn snapshot_store_blob(ctx: &Phase2Context, digest_hex: &byte, data: &byte, data_len: usize) i32 {
     var path: [byte: PATH_MAX] = [];
     if join_path(&ctx.state_layout.cas_blobs[0] as &byte, digest_hex, &path[0] as &byte, PATH_MAX) != 0 {
@@ -5648,7 +6338,8 @@ fn is_reusable_action_status(status: &byte) i32 {
     if status == null {
         return 0;
     }
-    if string_equals(status, "pending-execution" as &byte) != 0 {
+    if string_equals(status, "pending-execution" as &byte) != 0 ||
+        string_equals(status, "execution-failed" as &byte) != 0 {
         return 0;
     }
     return 1;
@@ -6173,6 +6864,30 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
         } else {
             fputs("null" as *byte, action_file);
         }
+        fputs(",\"exit_code\":" as *byte, action_file);
+        fprintf(action_file, "%d" as *byte, action.exit_code);
+        fputs(",\"pending_execution\":" as *byte, action_file);
+        if action.pending_execution != 0 {
+            fputs("true" as *byte, action_file);
+        } else {
+            fputs("false" as *byte, action_file);
+        }
+        fputs(",\"stdout_log\":" as *byte, action_file);
+        if action.stdout_path != null {
+            fputc(34, action_file);
+            write_json_escape(action_file, action.stdout_path);
+            fputc(34, action_file);
+        } else {
+            fputs("null" as *byte, action_file);
+        }
+        fputs(",\"stderr_log\":" as *byte, action_file);
+        if action.stderr_path != null {
+            fputc(34, action_file);
+            write_json_escape(action_file, action.stderr_path);
+            fputc(34, action_file);
+        } else {
+            fputs("null" as *byte, action_file);
+        }
         fputs("}\n" as *byte, action_file);
         _ = fflush(action_file);
         if fclose(action_file) != 0 {
@@ -6330,11 +7045,29 @@ fn emit_action_json(stream: &FILE, action: &PlannedAction) void {
     }
     fputs(",\"cache_status\":\"" as *byte, stream);
     write_json_escape(stream, action.cache_status);
-    fputs("\",\"pending_execution\":" as *byte, stream);
+    fputs("\",\"exit_code\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, action.exit_code);
+    fputs(",\"pending_execution\":" as *byte, stream);
     if action.pending_execution != 0 {
         fputs("true" as *byte, stream);
     } else {
         fputs("false" as *byte, stream);
+    }
+    fputs(",\"stdout_log\":" as *byte, stream);
+    if action.stdout_path != null {
+        fputc(34, stream);
+        write_json_escape(stream, action.stdout_path);
+        fputc(34, stream);
+    } else {
+        fputs("null" as *byte, stream);
+    }
+    fputs(",\"stderr_log\":" as *byte, stream);
+    if action.stderr_path != null {
+        fputc(34, stream);
+        write_json_escape(stream, action.stderr_path);
+        fputc(34, stream);
+    } else {
+        fputs("null" as *byte, stream);
     }
     fputs(",\"deps\":" as *byte, stream);
     emit_string_node_array_json(stream, action.dep_head);
@@ -6525,7 +7258,7 @@ fn emit_query_text(matches: &StringNode) void {
 
 fn emit_plan_text(ctx: &Phase1Context, phase2: &Phase2Context, matched: &StringNode) void {
     fprintf(libc.stdout, "workspace: %s\n" as *byte, ctx.workspace_ir.name as *byte);
-    fprintf(libc.stdout, "phase: %d\n" as *byte, PHASE_NUMBER);
+    fprintf(libc.stdout, "phase: %d\n" as *byte, PLAN_PHASE_NUMBER);
     fprintf(libc.stdout, "files: %d\n" as *byte, ctx.file_count);
     fprintf(libc.stdout, "rule_packs: %d\n" as *byte, ctx.use_count);
     fprintf(libc.stdout, "configs: %d\n" as *byte, ctx.config_count);
@@ -6557,7 +7290,7 @@ fn emit_plan_text(ctx: &Phase1Context, phase2: &Phase2Context, matched: &StringN
 }
 
 fn emit_build_json(ctx: &Phase1Context, phase2: &Phase2Context, matched: &StringNode) void {
-    fputs("{\"ok\":true,\"phase\":2,\"mode\":\"planning-only\",\"workspace\":\"" as *byte, libc.stdout);
+    fputs("{\"ok\":true,\"phase\":3,\"mode\":\"local-executor\",\"workspace\":\"" as *byte, libc.stdout);
     write_json_escape(libc.stdout, ctx.workspace_ir.name);
     fputs("\",\"matched\":" as *byte, libc.stdout);
     emit_string_node_array_json(libc.stdout, matched);
@@ -6580,7 +7313,7 @@ fn emit_build_json(ctx: &Phase1Context, phase2: &Phase2Context, matched: &String
 
 fn emit_build_text(ctx: &Phase1Context, phase2: &Phase2Context, matched: &StringNode) void {
     fprintf(libc.stdout, "workspace: %s\n" as *byte, ctx.workspace_ir.name as *byte);
-    fprintf(libc.stdout, "phase: %d\n" as *byte, PHASE_NUMBER);
+    fprintf(libc.stdout, "phase: %d\n" as *byte, BUILD_PHASE_NUMBER);
     fprintf(libc.stdout, "matched_targets: %d\n" as *byte, phase2.matched_count);
     fprintf(libc.stdout, "planned_actions: %d\n" as *byte, phase2.action_count);
     fprintf(libc.stdout, "cache_hits: %d\n" as *byte, phase2.cache_hit_count);
@@ -6618,7 +7351,7 @@ fn print_root_help() void {
     fputs("  make bootstrap        build the pure Uya bootstrap binary into bin/uyabuild\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
     fputs("Commands:\n" as *byte, libc.stdout);
-    fputs("  build                 analyze, snapshot, and plan targets (execution begins in Phase 3)\n" as *byte, libc.stdout);
+    fputs("  build                 analyze, snapshot, and execute supported local actions\n" as *byte, libc.stdout);
     fputs("  query                 inspect the typed target graph\n" as *byte, libc.stdout);
     fputs("  plan                  emit the typed IR plus Phase 2 action graph\n" as *byte, libc.stdout);
     fputs("  version               print the bootstrap version\n" as *byte, libc.stdout);
@@ -6649,10 +7382,10 @@ fn print_build_help() void {
     fputs("  -h, --help            show build help\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
     fputs("Notes:\n" as *byte, libc.stdout);
-    fputs("  Phase 2 validates uya.build, snapshots declared inputs, computes\n" as *byte, libc.stdout);
-    fputs("  action keys, and stops before the Phase 3 executor runs pending actions.\n" as *byte, libc.stdout);
-    fputs("  Existing outputs may resolve as local-hit, seeded-output, or\n" as *byte, libc.stdout);
-    fputs("  success-no-change without invoking the executor.\n" as *byte, libc.stdout);
+    fputs("  Build runs Phase 2 analysis/planning first, then executes pending\n" as *byte, libc.stdout);
+    fputs("  legacy.shell and task actions through the local executor.\n" as *byte, libc.stdout);
+    fputs("  Existing outputs may still resolve as local-hit, seeded-output, or\n" as *byte, libc.stdout);
+    fputs("  success-no-change without launching a child action.\n" as *byte, libc.stdout);
     _ = fflush(libc.stdout);
 }
 
@@ -6882,7 +7615,7 @@ fn create_run_manifest(layout: &StateLayout,
 
     fputs("{\n" as *byte, file);
     fprintf(file, "  \"version\": \"%s\",\n" as *byte, VERSION as *byte);
-    fprintf(file, "  \"phase\": %d,\n" as *byte, PHASE_NUMBER);
+    fprintf(file, "  \"phase\": %d,\n" as *byte, phase_number_for_subcommand(subcommand));
     fputs("  \"status\": \"analysis-ready\",\n" as *byte, file);
     fprintf(file, "  \"run_id\": \"%s\",\n" as *byte, &manifest.run_id[0] as *byte);
     fprintf(file, "  \"subcommand\": \"%s\",\n" as *byte, subcommand as *byte);
@@ -7191,6 +7924,17 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
                           "failed to build the Phase 2 action graph" as &byte,
                           "check declared inputs, target cycles, and CAS paths" as &byte);
     }
+    if phase2.pending_count > 0 && execute_pending_actions(&phase2) != 0 {
+        _ = persist_phase2_metadata(&phase2, "build" as &byte, matched);
+        if phase1.diagnostic.code != null {
+            return emit_diagnostic(options.output_mode, &phase1.diagnostic);
+        }
+        return emit_error(options.output_mode,
+                          EXIT_ACTION,
+                          "UYABUILD_E_EXECUTOR_FAILED" as &byte,
+                          "the local executor failed before build metadata could be reported" as &byte,
+                          "check action stderr logs under .uya-build/tmp/actions/" as &byte);
+    }
     if persist_phase2_metadata(&phase2, "build" as &byte, matched) != 0 {
         return emit_error(options.output_mode,
                           EXIT_IO,
@@ -7198,28 +7942,12 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
                           "failed to persist Phase 2 metadata" as &byte,
                           "check .uya-build/meta permissions and path lengths" as &byte);
     }
-
-    if phase2.pending_count == 0 {
-        if options.output_mode == OUTPUT_JSON {
-            emit_build_json(&phase1, &phase2, matched);
-        } else {
-            emit_build_text(&phase1, &phase2, matched);
-        }
-        return EXIT_OK;
+    if options.output_mode == OUTPUT_JSON {
+        emit_build_json(&phase1, &phase2, matched);
+    } else {
+        emit_build_text(&phase1, &phase2, matched);
     }
-
-    var detail: [byte: PATH_MAX] = [];
-    _ = snprintf(&detail[0] as *byte,
-                 PATH_MAX,
-                 "Phase 2 planned %d actions, seeded %d outputs, and still has %d pending actions that require the Phase 3 executor" as *byte,
-                 phase2.action_count,
-                 phase2.seeded_count,
-                 phase2.pending_count);
-    return emit_error(options.output_mode,
-                      EXIT_NOT_IMPLEMENTED,
-                      "UYABUILD_E_EXECUTOR_REQUIRED" as &byte,
-                      "build planning completed, but execution is still deferred to Phase 3" as &byte,
-                      &detail[0] as &byte);
+    return EXIT_OK;
 }
 
 fn run_query(start_index: i32, base_options: &Options) i32 {
