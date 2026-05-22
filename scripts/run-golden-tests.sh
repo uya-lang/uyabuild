@@ -106,6 +106,36 @@ for case_dir in "$CASES_DIR"/*; do
     done < "$case_dir/assert-dirs.txt"
   fi
 
+  if [ -f "$case_dir/assert-files.txt" ]; then
+    while IFS= read -r relative_file || [ -n "$relative_file" ]; do
+      [ -n "$relative_file" ] || continue
+      if [ ! -f "$workdir/$relative_file" ]; then
+        echo "FAIL $case_name: expected file $relative_file" >&2
+        exit 1
+      fi
+    done < "$case_dir/assert-files.txt"
+  fi
+
+  if [ -f "$case_dir/assert-contains.txt" ]; then
+    while IFS= read -r assertion || [ -n "$assertion" ]; do
+      [ -n "$assertion" ] || continue
+      relative_file=${assertion%%|*}
+      expected_text=${assertion#*|}
+      if [ "$relative_file" = "$assertion" ]; then
+        echo "FAIL $case_name: malformed assert-contains entry $assertion" >&2
+        exit 1
+      fi
+      if [ ! -f "$workdir/$relative_file" ]; then
+        echo "FAIL $case_name: expected file $relative_file for content assertion" >&2
+        exit 1
+      fi
+      if ! grep -F -- "$expected_text" "$workdir/$relative_file" >/dev/null 2>&1; then
+        echo "FAIL $case_name: expected '$expected_text' in $relative_file" >&2
+        exit 1
+      fi
+    done < "$case_dir/assert-contains.txt"
+  fi
+
   if [ -d "$workdir/.uya-build" ]; then
     rm -rf "$workdir/.uya-build"
   fi

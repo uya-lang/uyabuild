@@ -91,6 +91,7 @@ struct StateLayout {
     cas_blobs: [byte: PATH_MAX],
     cas_trees: [byte: PATH_MAX],
     cas_manifests: [byte: PATH_MAX],
+    cas_logs: [byte: PATH_MAX],
     meta: [byte: PATH_MAX],
     meta_build_runs: [byte: PATH_MAX],
     meta_actions: [byte: PATH_MAX],
@@ -325,6 +326,8 @@ struct PlannedAction {
     mnemonic: &byte,
     stdout_path: &byte,
     stderr_path: &byte,
+    stdout_digest: &byte,
+    stderr_digest: &byte,
     command_head: &StringNode,
     command_tail: &StringNode,
     input_head: &StringNode,
@@ -5480,6 +5483,30 @@ fn execute_local_action(ctx: &Phase2Context, action: &PlannedAction) i32 {
     if ctx.pending_count > 0 {
         ctx.pending_count = ctx.pending_count - 1;
     }
+    if path_is_file(&stdout_path[0] as &byte) != 0 {
+        action.stdout_digest = persist_action_log_digest(ctx, &stdout_path[0] as &byte);
+        if action.stdout_digest == null {
+            action.cache_status = "execution-failed" as &byte;
+            return set_action_diagnostic(ctx,
+                                         action,
+                                         EXIT_IO,
+                                         "UYABUILD_E_LOG_CAS_WRITE" as &byte,
+                                         "failed to persist stdout log into CAS" as &byte,
+                                         &stdout_path[0] as &byte);
+        }
+    }
+    if path_is_file(&stderr_path[0] as &byte) != 0 {
+        action.stderr_digest = persist_action_log_digest(ctx, &stderr_path[0] as &byte);
+        if action.stderr_digest == null {
+            action.cache_status = "execution-failed" as &byte;
+            return set_action_diagnostic(ctx,
+                                         action,
+                                         EXIT_IO,
+                                         "UYABUILD_E_LOG_CAS_WRITE" as &byte,
+                                         "failed to persist stderr log into CAS" as &byte,
+                                         &stderr_path[0] as &byte);
+        }
+    }
     if action.exit_code != 0 {
         action.cache_status = "execution-failed" as &byte;
         var detail_buf: [byte: PATH_MAX] = [];
@@ -5567,6 +5594,33 @@ fn action_store_manifest_json(ctx: &Phase2Context, digest_hex: &byte, text: &byt
         return -1;
     }
     return persist_text(&path[0] as &byte, text);
+}
+
+fn action_store_log_blob(ctx: &Phase2Context, digest_hex: &byte, data: &byte, data_len: usize) i32 {
+    var path: [byte: PATH_MAX] = [];
+    if join_path(&ctx.state_layout.cas_logs[0] as &byte, digest_hex, &path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    return persist_bytes(&path[0] as &byte, data, data_len);
+}
+
+fn persist_action_log_digest(ctx: &Phase2Context, abs_path: &byte) &byte {
+    if ctx == null || abs_path == null {
+        return null;
+    }
+    var size_out: usize = 0usize;
+    const content: &byte = read_file_into_arena(ctx.phase1, abs_path, &size_out);
+    if content == null {
+        return null;
+    }
+    const digest_hex: &byte = blake2s_hex_bytes(ctx.phase1, content, size_out);
+    if digest_hex == null {
+        return null;
+    }
+    if action_store_log_blob(ctx, digest_hex, content, size_out) != 0 {
+        return null;
+    }
+    return digest_hex;
 }
 
 fn snapshot_file(ctx: &Phase2Context, abs_path: &byte, rel_path: &byte) &SnapshotEntry {
@@ -6880,10 +6934,26 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
         } else {
             fputs("null" as *byte, action_file);
         }
+        fputs(",\"stdout_digest\":" as *byte, action_file);
+        if action.stdout_digest != null {
+            fputc(34, action_file);
+            write_json_escape(action_file, action.stdout_digest);
+            fputc(34, action_file);
+        } else {
+            fputs("null" as *byte, action_file);
+        }
         fputs(",\"stderr_log\":" as *byte, action_file);
         if action.stderr_path != null {
             fputc(34, action_file);
             write_json_escape(action_file, action.stderr_path);
+            fputc(34, action_file);
+        } else {
+            fputs("null" as *byte, action_file);
+        }
+        fputs(",\"stderr_digest\":" as *byte, action_file);
+        if action.stderr_digest != null {
+            fputc(34, action_file);
+            write_json_escape(action_file, action.stderr_digest);
             fputc(34, action_file);
         } else {
             fputs("null" as *byte, action_file);
@@ -7553,6 +7623,7 @@ fn prepare_state_layout(workspace: &Workspace,
         prepare_state_subdir(&layout.cas[0] as &byte, "blobs" as &byte, &layout.cas_blobs[0] as &byte, PATH_MAX) != 0 ||
         prepare_state_subdir(&layout.cas[0] as &byte, "trees" as &byte, &layout.cas_trees[0] as &byte, PATH_MAX) != 0 ||
         prepare_state_subdir(&layout.cas[0] as &byte, "manifests" as &byte, &layout.cas_manifests[0] as &byte, PATH_MAX) != 0 ||
+        prepare_state_subdir(&layout.cas[0] as &byte, "logs" as &byte, &layout.cas_logs[0] as &byte, PATH_MAX) != 0 ||
         prepare_state_subdir(&layout.root[0] as &byte, "meta" as &byte, &layout.meta[0] as &byte, PATH_MAX) != 0 ||
         prepare_state_subdir(&layout.meta[0] as &byte, "build_runs" as &byte, &layout.meta_build_runs[0] as &byte, PATH_MAX) != 0 ||
         prepare_state_subdir(&layout.meta[0] as &byte, "actions" as &byte, &layout.meta_actions[0] as &byte, PATH_MAX) != 0 ||
@@ -7831,6 +7902,7 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
         cas_blobs: [],
         cas_trees: [],
         cas_manifests: [],
+        cas_logs: [],
         meta: [],
         meta_build_runs: [],
         meta_actions: [],
@@ -8037,6 +8109,7 @@ fn run_query(start_index: i32, base_options: &Options) i32 {
         cas_blobs: [],
         cas_trees: [],
         cas_manifests: [],
+        cas_logs: [],
         meta: [],
         meta_build_runs: [],
         meta_actions: [],
@@ -8169,6 +8242,7 @@ fn run_plan(start_index: i32, base_options: &Options) i32 {
         cas_blobs: [],
         cas_trees: [],
         cas_manifests: [],
+        cas_logs: [],
         meta: [],
         meta_build_runs: [],
         meta_actions: [],
