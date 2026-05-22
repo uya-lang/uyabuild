@@ -1,0 +1,14 @@
+workspace {
+  name = "invalid-execution-mode"
+  default = ["//bad:demo"]
+  strict = false
+}
+
+use legacy
+
+legacy.shell "//bad:demo" {
+  script = ["sh", "build.sh"]
+  inputs = ["build.sh"]
+  outputs = ["out/result.txt"]
+  execution_mode = "shared"
+}

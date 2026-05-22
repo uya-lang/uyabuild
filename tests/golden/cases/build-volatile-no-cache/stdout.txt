@@ -1,0 +1,11 @@
+workspace: volatile-cache
+phase: 3
+matched_targets: 1
+planned_actions: 1
+cache_hits: 0
+seeded_outputs: 0
+success_no_change: 0
+pending_execution: 0
+root_digest: 2237fa03edb5219755b1266876e153fd8cddabbdc3d20bf46cb4621979de1a35
+matched:
+  //volatile:demo

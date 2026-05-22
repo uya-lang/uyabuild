@@ -144,8 +144,9 @@
 当前状态（2026-05-22）：
 
 - `bin/uyabuild build` 已进入 Phase 3 本地执行路径：待执行的 `legacy.shell` / `task` 动作会在私有临时工作区中运行，并把 `stdout` / `stderr` 分离采集到 `.uya-build/tmp/actions/<run-id>/<action-key>/`。
-- 已完成的首批闭环：本地 Executor 骨架、动作临时工作区、日志采集、原子输出提交、环境变量白名单，以及 `executed-local` / `execution-failed` 元数据落盘。
-- 当前仍受限于兼容执行路径：`cxx` / `node` / `oci` 等动作尚未接入本地执行器，命中待执行动作时会返回 `UYABUILD_E_EXECUTOR_UNSUPPORTED`；依赖追踪、严格模式、执行模式、资源池与网络策略仍待后续收口。
+- 已完成的首批闭环：本地 Executor 骨架、动作临时工作区、日志采集、原子输出提交、环境变量白名单、`pure/host/volatile` 执行模式，以及 `executed-local` / `execution-failed` 元数据落盘。
+- `execution_mode` 现已生效：`pure` 仅物化声明输入与依赖输出，`host` 会额外物化兼容所需的工作区内容，`volatile` 会跳过本地缓存与 `success-no-change` 复用路径。
+- 当前仍受限于兼容执行路径：`cxx` / `node` / `oci` 等动作尚未接入本地执行器，命中待执行动作时会返回 `UYABUILD_E_EXECUTOR_UNSUPPORTED`；依赖追踪、严格模式、资源池与网络策略仍待后续收口。
 
 | ID | 优先级 | 任务 | 依赖 | 验收标准 |
 |---|---|---|---|---|
@@ -154,7 +155,7 @@
 | `P3-3` | `P0` | 实现 stdout/stderr 缓冲采集 | `P3-1` | 并行动作日志不交错 |
 | `P3-4` | `P0` | 实现原子输出提交 | `P3-2` | 失败动作不污染正式输出 |
 | `P3-5` | `P0` | 实现环境变量白名单机制 | `P3-1` | 未放行变量默认不可见 |
-| `P3-6` | `P0` | 实现 `pure/host/volatile` 执行模式 | `P3-1` | 不同模式的缓存和权限策略生效 |
+| `P3-6` | `P0` | 已完成：实现 `pure/host/volatile` 执行模式 | `P3-1` | 不同模式的缓存和权限策略生效 |
 | `P3-7` | `P0` | 实现基础依赖追踪接口 | `P3-1` | 动作可记录读写路径 |
 | `P3-8` | `P1` | 接入 Linux/macOS 依赖追踪实现 | `P3-7` | 隐藏输入与越权写出可被捕获 |
 | `P3-9` | `P0` | 实现 strict/compat 模式开关 | `P3-7` | 严格模式下隐藏依赖会失败 |

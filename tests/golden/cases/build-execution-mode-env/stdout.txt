@@ -1,0 +1,12 @@
+workspace: execution-mode
+phase: 3
+matched_targets: 2
+planned_actions: 2
+cache_hits: 0
+seeded_outputs: 0
+success_no_change: 0
+pending_execution: 0
+root_digest: d97c2bd3e435519856ada103d45fb075c549a5187bd61d15665bc69862670866
+matched:
+  //modes:host
+  //modes:pure

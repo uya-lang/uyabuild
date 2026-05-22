@@ -1,0 +1,21 @@
+workspace {
+  name = "execution-mode"
+  default = ["//modes:pure", "//modes:host"]
+  strict = false
+}
+
+use legacy
+
+legacy.shell "//modes:pure" {
+  script = ["sh", "scripts/check-hidden.sh", "out/pure.txt", "hidden.txt"]
+  inputs = ["scripts/check-hidden.sh"]
+  outputs = ["out/pure.txt"]
+  execution_mode = "pure"
+}
+
+legacy.shell "//modes:host" {
+  script = ["sh", "scripts/check-hidden.sh", "out/host.txt", "hidden.txt"]
+  inputs = ["scripts/check-hidden.sh"]
+  outputs = ["out/host.txt"]
+  execution_mode = "host"
+}

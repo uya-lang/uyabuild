@@ -324,6 +324,7 @@ struct PlannedAction {
     label: &byte,
     kind: &byte,
     mnemonic: &byte,
+    execution_mode: &byte,
     stdout_path: &byte,
     stderr_path: &byte,
     stdout_digest: &byte,
@@ -2974,6 +2975,9 @@ fn field_expected_type(kind: &byte, field_name: &byte) i32 {
         string_equals(field_name, "visibility" as &byte) != 0 {
         return EXPECT_STRING_LIST;
     }
+    if string_equals(field_name, "execution_mode" as &byte) != 0 {
+        return EXPECT_STRING;
+    }
 
     if string_equals(kind, "cxx.library" as &byte) != 0 {
         if string_equals(field_name, "srcs" as &byte) != 0 ||
@@ -4190,9 +4194,70 @@ fn target_field_exists(target: &IRTarget, name: &byte) i32 {
     return 0;
 }
 
+fn is_valid_execution_mode(text: &byte) i32 {
+    if text == null {
+        return 0;
+    }
+    if string_equals(text, "pure" as &byte) != 0 ||
+        string_equals(text, "host" as &byte) != 0 ||
+        string_equals(text, "volatile" as &byte) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn default_execution_mode_for_kind(kind: &byte) &byte {
+    if kind == null {
+        return "host" as &byte;
+    }
+    if string_equals(kind, "legacy.shell" as &byte) != 0 ||
+        string_equals(kind, "task" as &byte) != 0 ||
+        string_has_prefix(kind, "node." as &byte) != 0 ||
+        string_has_prefix(kind, "oci." as &byte) != 0 {
+        return "host" as &byte;
+    }
+    return "pure" as &byte;
+}
+
+fn target_execution_mode(target: &IRTarget) &byte {
+    if target == null {
+        return "host" as &byte;
+    }
+    const field: &IRField = find_ir_field(target.attrs, "execution_mode" as &byte);
+    if field != null && field.value != null && field.value.text != null &&
+        is_valid_execution_mode(field.value.text) != 0 {
+        return field.value.text;
+    }
+    return default_execution_mode_for_kind(target.kind);
+}
+
+fn action_uses_local_cache(action: &PlannedAction) i32 {
+    if action == null {
+        return 0;
+    }
+    if action.execution_mode != null &&
+        string_equals(action.execution_mode, "volatile" as &byte) != 0 {
+        return 0;
+    }
+    return 1;
+}
+
 fn validate_targets(ctx: &Phase1Context) i32 {
     var target: &IRTarget = ctx.targets_head;
     while target != null {
+        const execution_mode_field: &IRField = find_ir_field(target.attrs, "execution_mode" as &byte);
+        if execution_mode_field != null &&
+            (execution_mode_field.value == null ||
+             execution_mode_field.value.text == null ||
+             is_valid_execution_mode(execution_mode_field.value.text) == 0) {
+            return phase1_error(ctx,
+                                "UYABUILD_E_EXECUTION_MODE" as &byte,
+                                "execution_mode must be pure, host, or volatile" as &byte,
+                                target.label,
+                                target.file.rel_path,
+                                execution_mode_field.value.span.start.line,
+                                execution_mode_field.value.span.start.column);
+        }
         if string_equals(target.kind, "legacy.shell" as &byte) != 0 {
             if target_field_exists(target, "script" as &byte) == 0 &&
                 target_field_exists(target, "run" as &byte) == 0 {
@@ -5171,8 +5236,54 @@ fn materialize_workspace_rel_path(ctx: &Phase2Context,
     return copy_path_recursive(ctx.phase1, &source_abs[0] as &byte, &dest_abs[0] as &byte);
 }
 
+fn should_skip_host_workspace_entry(name: &byte) i32 {
+    if name == null {
+        return 1;
+    }
+    if is_dirent_dot(name) != 0 ||
+        string_equals(name, ".uya-build" as &byte) != 0 ||
+        string_equals(name, ".uya-build-custom" as &byte) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn materialize_host_workspace(ctx: &Phase2Context, action_root: &byte) i32 {
+    if ctx == null || action_root == null {
+        return -1;
+    }
+    const dir: &DIR = opendir(ctx.phase1.workspace_root as &const byte);
+    if dir == null {
+        return -1;
+    }
+    var entry_dir: &Dirent = readdir(dir);
+    while entry_dir != null {
+        const name: &byte = &entry_dir.d_name[0] as &byte;
+        if should_skip_host_workspace_entry(name) != 0 {
+            entry_dir = readdir(dir);
+            continue;
+        }
+        var source_abs: [byte: PATH_MAX] = [];
+        var dest_abs: [byte: PATH_MAX] = [];
+        if join_path(ctx.phase1.workspace_root, name, &source_abs[0] as &byte, PATH_MAX) != 0 ||
+            join_path(action_root, name, &dest_abs[0] as &byte, PATH_MAX) != 0 ||
+            copy_path_recursive(ctx.phase1, &source_abs[0] as &byte, &dest_abs[0] as &byte) != 0 {
+            _ = closedir(dir);
+            return -1;
+        }
+        entry_dir = readdir(dir);
+    }
+    _ = closedir(dir);
+    return 0;
+}
+
 fn materialize_action_workspace(ctx: &Phase2Context, action: &PlannedAction, action_root: &byte) i32 {
     if ctx == null || action == null || action_root == null {
+        return -1;
+    }
+    if action.execution_mode != null &&
+        string_equals(action.execution_mode, "pure" as &byte) == 0 &&
+        materialize_host_workspace(ctx, action_root) != 0 {
         return -1;
     }
     var input: &StringNode = action.input_head;
@@ -5262,6 +5373,60 @@ fn append_env_entry(ctx: &Phase1Context,
     return 0;
 }
 
+fn read_proc_environ_value(ctx: &Phase1Context, name: &byte) &byte {
+    if ctx == null || name == null || name[0] == 0 as byte {
+        return null;
+    }
+    const max_bytes: usize = 65535usize;
+    const content: &byte = arena_alloc_zero(&ctx.arena, max_bytes + 1usize);
+    if content == null {
+        return null;
+    }
+    const file: &FILE = fopen("/proc/self/environ" as *byte, "r" as *byte);
+    if file == null {
+        return null;
+    }
+    const size_out: usize = fread(content as *void, 1usize, max_bytes, file);
+    _ = fclose(file);
+    const tail_ptr: &byte = content + size_out;
+    tail_ptr[0] = 0 as byte;
+    const name_len: usize = strlen(name);
+    var pos: usize = 0usize;
+    while pos < size_out {
+        var end: usize = pos;
+        while end < size_out && content[end] != 0 as byte {
+            end = end + 1usize;
+        }
+        if end > pos + name_len && content[pos + name_len] == 61 as byte {
+            var matches: i32 = 1;
+            var i: usize = 0usize;
+            while i < name_len {
+                if content[pos + i] != name[i] {
+                    matches = 0;
+                    break;
+                }
+                i = i + 1usize;
+            }
+            if matches != 0 {
+                return arena_copy_range(&ctx.arena, content, pos + name_len + 1usize, end - pos - name_len - 1usize);
+            }
+        }
+        pos = end + 1usize;
+    }
+    return null;
+}
+
+fn read_process_env_value(ctx: &Phase1Context, name: &byte) &byte {
+    if ctx == null || name == null {
+        return null;
+    }
+    const direct_value: &byte = getenv(name as &const byte);
+    if direct_value != null {
+        return direct_value;
+    }
+    return read_proc_environ_value(ctx, name);
+}
+
 fn build_action_exec_env(ctx: &Phase2Context,
                          action: &PlannedAction,
                          action_root: &byte,
@@ -5274,18 +5439,23 @@ fn build_action_exec_env(ctx: &Phase2Context,
     var names: [&byte: MAX_ARGS] = [];
     var name_count: i32 = 0;
     if append_env_name(names, &name_count, "PATH" as &byte) != 0 ||
-        append_env_name(names, &name_count, "HOME" as &byte) != 0 ||
         append_env_name(names, &name_count, "TMPDIR" as &byte) != 0 ||
         append_env_name(names, &name_count, "TMP" as &byte) != 0 ||
         append_env_name(names, &name_count, "TEMP" as &byte) != 0 ||
-        append_env_name(names, &name_count, "USER" as &byte) != 0 ||
-        append_env_name(names, &name_count, "LOGNAME" as &byte) != 0 ||
         append_env_name(names, &name_count, "LANG" as &byte) != 0 ||
         append_env_name(names, &name_count, "LC_ALL" as &byte) != 0 ||
-        append_env_name(names, &name_count, "SHELL" as &byte) != 0 ||
         append_env_name(names, &name_count, "UYA_BOOTSTRAP" as &byte) != 0 ||
         append_env_name(names, &name_count, "UYA_BUILD_FLAGS" as &byte) != 0 {
         return -1;
+    }
+    if action.execution_mode == null ||
+        string_equals(action.execution_mode, "pure" as &byte) == 0 {
+        if append_env_name(names, &name_count, "HOME" as &byte) != 0 ||
+            append_env_name(names, &name_count, "USER" as &byte) != 0 ||
+            append_env_name(names, &name_count, "LOGNAME" as &byte) != 0 ||
+            append_env_name(names, &name_count, "SHELL" as &byte) != 0 {
+            return -1;
+        }
     }
 
     const allow_field: &IRField = find_ir_field(action.owner.attrs, "env_allowlist" as &byte);
@@ -5305,7 +5475,7 @@ fn build_action_exec_env(ctx: &Phase2Context,
         if name_index >= MAX_ARGS as usize {
             return -1;
         }
-        const current_value: &byte = getenv(names[name_index] as &const byte);
+        const current_value: &byte = read_process_env_value(ctx.phase1, names[name_index]);
         if current_value != null && append_env_entry(ctx.phase1, env_out, env_count, names[name_index], current_value) != 0 {
             return -1;
         }
@@ -5918,6 +6088,7 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
     action.label = target.label;
     action.kind = target.kind;
     action.mnemonic = target.kind;
+    action.execution_mode = target_execution_mode(target);
     action.cache_status = "pending-execution" as &byte;
     action.pending_execution = 1;
 
@@ -6096,6 +6267,13 @@ fn compute_action_digests(ctx: &Phase2Context, action: &PlannedAction) i32 {
         append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 {
         return -1;
     }
+    if find_ir_field(action.owner.attrs, "execution_mode" as &byte) != null {
+        if append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "execution_mode:" as &byte) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, action.execution_mode) != 0 ||
+            append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 {
+            return -1;
+        }
+    }
 
     var dep: &StringNode = action.dep_head;
     while dep != null {
@@ -6144,7 +6322,7 @@ fn compute_action_digests(ctx: &Phase2Context, action: &PlannedAction) i32 {
     }
     var cached_output_digest: [byte: DIGEST_HEX_BYTES + 1usize] = [];
     var previous_output_digest: [byte: DIGEST_HEX_BYTES + 1usize] = [];
-    if action.output_root_digest != null {
+    if action.output_root_digest != null && action_uses_local_cache(action) != 0 {
         if read_cache_output_digest(ctx, action.action_key, &cached_output_digest[0] as &byte, DIGEST_HEX_BYTES + 1usize) == 0 &&
             string_equals(&cached_output_digest[0] as &byte, action.output_root_digest) != 0 {
             action.cache_status = "local-hit" as &byte;
@@ -6906,6 +7084,8 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
         write_json_escape(action_file, action.label);
         fputs("\",\"kind\":\"" as *byte, action_file);
         write_json_escape(action_file, action.kind);
+        fputs("\",\"execution_mode\":\"" as *byte, action_file);
+        write_json_escape(action_file, action.execution_mode);
         fputs("\",\"cache_status\":\"" as *byte, action_file);
         write_json_escape(action_file, action.cache_status);
         fputs("\",\"input_root_digest\":\"" as *byte, action_file);
@@ -6981,42 +7161,44 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
         write_json_escape(events_file, action.cache_status);
         fputs("\"}\n" as *byte, events_file);
 
-        var cache_path: [byte: PATH_MAX] = [];
-        if join_path(&ctx.state_layout.meta_cache_entries[0] as &byte, action.action_key, &cache_path[0] as &byte, PATH_MAX) != 0 {
-            _ = fclose(events_file);
-            return -1;
-        }
-        const cache_file: &FILE = fopen(&cache_path[0] as &const byte, "w" as &const byte);
-        if cache_file == null {
-            _ = fclose(events_file);
-            return -1;
-        }
-        fputs("{\"action_key\":\"" as *byte, cache_file);
-        write_json_escape(cache_file, action.action_key);
-        fputs("\",\"owner\":\"" as *byte, cache_file);
-        write_json_escape(cache_file, action.label);
-        fputs("\",\"output_root_digest\":" as *byte, cache_file);
-        if action.output_root_digest != null {
-            fputc(34, cache_file);
-            write_json_escape(cache_file, action.output_root_digest);
-            fputc(34, cache_file);
-        } else {
-            fputs("null" as *byte, cache_file);
-        }
-        fputs(",\"status\":\"" as *byte, cache_file);
-        write_json_escape(cache_file, action.cache_status);
-        fputs("\"}\n" as *byte, cache_file);
-        _ = fflush(cache_file);
-        if fclose(cache_file) != 0 {
-            _ = fclose(events_file);
-            return -1;
-        }
-        if append_index_doc_id(ctx,
-                               "cache_entries.by_action_digest" as &byte,
-                               action.action_key,
-                               action.action_key) != 0 {
-            _ = fclose(events_file);
-            return -1;
+        if action_uses_local_cache(action) != 0 {
+            var cache_path: [byte: PATH_MAX] = [];
+            if join_path(&ctx.state_layout.meta_cache_entries[0] as &byte, action.action_key, &cache_path[0] as &byte, PATH_MAX) != 0 {
+                _ = fclose(events_file);
+                return -1;
+            }
+            const cache_file: &FILE = fopen(&cache_path[0] as &const byte, "w" as &const byte);
+            if cache_file == null {
+                _ = fclose(events_file);
+                return -1;
+            }
+            fputs("{\"action_key\":\"" as *byte, cache_file);
+            write_json_escape(cache_file, action.action_key);
+            fputs("\",\"owner\":\"" as *byte, cache_file);
+            write_json_escape(cache_file, action.label);
+            fputs("\",\"output_root_digest\":" as *byte, cache_file);
+            if action.output_root_digest != null {
+                fputc(34, cache_file);
+                write_json_escape(cache_file, action.output_root_digest);
+                fputc(34, cache_file);
+            } else {
+                fputs("null" as *byte, cache_file);
+            }
+            fputs(",\"status\":\"" as *byte, cache_file);
+            write_json_escape(cache_file, action.cache_status);
+            fputs("\"}\n" as *byte, cache_file);
+            _ = fflush(cache_file);
+            if fclose(cache_file) != 0 {
+                _ = fclose(events_file);
+                return -1;
+            }
+            if append_index_doc_id(ctx,
+                                   "cache_entries.by_action_digest" as &byte,
+                                   action.action_key,
+                                   action.action_key) != 0 {
+                _ = fclose(events_file);
+                return -1;
+            }
         }
 
         var output: &StringNode = action.output_head;

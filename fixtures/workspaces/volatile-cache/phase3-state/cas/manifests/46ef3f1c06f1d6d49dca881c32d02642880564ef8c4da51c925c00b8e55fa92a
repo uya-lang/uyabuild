@@ -1,0 +1,9 @@
+action
+legacy.shell
+//volatile:demo
+a2ea587b0fd57e65c57b4b506864cc3f8fd5a16ec591d49d109a9e4625d78391
+execution_mode:volatile
+out/result.txt
+sh
+scripts/write-output.sh
+out/result.txt

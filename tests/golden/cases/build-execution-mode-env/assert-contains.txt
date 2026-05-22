@@ -1,0 +1,2 @@
+out/pure.txt|HIDDEN=missing
+out/host.txt|HIDDEN=present

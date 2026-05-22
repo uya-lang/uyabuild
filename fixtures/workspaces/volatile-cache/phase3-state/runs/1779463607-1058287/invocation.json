@@ -1,0 +1,12 @@
+{
+  "version": "0.4.0-phase3",
+  "phase": 3,
+  "status": "analysis-ready",
+  "run_id": "1779463607-1058287",
+  "subcommand": "build",
+  "cwd": "/media/winger/_dde_data/winger/uya/uyabuild/fixtures/workspaces/volatile-cache",
+  "workspace_root": "/media/winger/_dde_data/winger/uya/uyabuild/fixtures/workspaces/volatile-cache",
+  "workspace_entrypoint": "/media/winger/_dde_data/winger/uya/uyabuild/fixtures/workspaces/volatile-cache/uya.build",
+  "state_dir": "/media/winger/_dde_data/winger/uya/uyabuild/fixtures/workspaces/volatile-cache/phase3-state",
+  "argv": []
+}

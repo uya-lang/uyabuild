@@ -22,12 +22,12 @@ Phase 2 currently provides:
 Phase 3 now provides an initial local executor for `legacy.shell` and `task`:
 
 - `uyabuild build` materializes a per-action temporary workspace, runs supported actions locally, captures `stdout`/`stderr`, and atomically commits declared outputs
+- supported actions now honor `execution_mode = "pure" | "host" | "volatile"`: `pure` keeps undeclared workspace files out of the action root, `host` materializes the broader workspace for compatibility, and `volatile` always re-executes instead of reusing local cache decisions
 - supported actions inherit only a small environment allowlist plus explicit `env_allowlist` entries from the rule
 - executed actions persist `executed-local` metadata, log digests, and dedicated CAS log objects alongside the existing CAS/meta records
 
 Still pending for later Phase 3 work:
 
-- execution modes such as `pure/host/volatile`
 - filesystem dependency tracking and strict hidden-input enforcement
 - parallel resource pools, network policy, and broader rule-kind execution backends
 

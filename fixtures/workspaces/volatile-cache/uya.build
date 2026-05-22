@@ -1,0 +1,14 @@
+workspace {
+  name = "volatile-cache"
+  default = ["//volatile:demo"]
+  strict = false
+}
+
+use legacy
+
+legacy.shell "//volatile:demo" {
+  script = ["sh", "scripts/write-output.sh", "out/result.txt"]
+  inputs = ["scripts/write-output.sh"]
+  outputs = ["out/result.txt"]
+  execution_mode = "volatile"
+}

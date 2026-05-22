@@ -1,0 +1,2 @@
+{"event":"BuildPlanned","run_id":"1779463607-1058287","root_digest":"2237fa03edb5219755b1266876e153fd8cddabbdc3d20bf46cb4621979de1a35","actions":1}
+{"event":"ActionPlanned","run_id":"1779463607-1058287","action_key":"46ef3f1c06f1d6d49dca881c32d02642880564ef8c4da51c925c00b8e55fa92a","label":"//volatile:demo","status":"executed-local"}
