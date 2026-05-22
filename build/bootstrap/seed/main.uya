@@ -32,7 +32,7 @@ use libc.opendir;
 use libc.readdir;
 use std.io.fread;
 use std.io.fwrite;
-use std.crypto.blake2s.blake2s_digest;
+use std.crypto.blake3.blake3_digest;
 use std.mem.arena.Arena;
 use std.mem.arena.arena_alloc;
 use std.mem.arena.arena_init;
@@ -1350,21 +1350,21 @@ fn bytes_to_hex_text(ctx: &Phase1Context, bytes: &byte, len: usize) &byte {
     return out;
 }
 
-fn blake2s_hex_bytes(ctx: &Phase1Context, data: &byte, data_len: usize) &byte {
+fn blake3_hex_bytes(ctx: &Phase1Context, data: &byte, data_len: usize) &byte {
     if ctx == null || data == null {
         return null;
     }
     var digest: [byte: DIGEST_BYTES] = [];
     const data_slice: &[byte] = data[0: data_len];
-    blake2s_digest(data_slice, digest[0: DIGEST_BYTES]);
+    blake3_digest(data_slice, digest[0: DIGEST_BYTES]);
     return bytes_to_hex_text(ctx, &digest[0] as &byte, DIGEST_BYTES);
 }
 
-fn blake2s_hex_text(ctx: &Phase1Context, text: &byte) &byte {
+fn blake3_hex_text(ctx: &Phase1Context, text: &byte) &byte {
     if text == null {
         return null;
     }
-    return blake2s_hex_bytes(ctx, text, strlen(text));
+    return blake3_hex_bytes(ctx, text, strlen(text));
 }
 
 fn find_source_file(ctx: &Phase1Context, abs_path: &byte) &SourceFile {
@@ -5613,7 +5613,7 @@ fn persist_action_log_digest(ctx: &Phase2Context, abs_path: &byte) &byte {
     if content == null {
         return null;
     }
-    const digest_hex: &byte = blake2s_hex_bytes(ctx.phase1, content, size_out);
+    const digest_hex: &byte = blake3_hex_bytes(ctx.phase1, content, size_out);
     if digest_hex == null {
         return null;
     }
@@ -5643,7 +5643,7 @@ fn snapshot_file(ctx: &Phase2Context, abs_path: &byte, rel_path: &byte) &Snapsho
         return null;
     }
 
-    const content_digest: &byte = blake2s_hex_bytes(ctx.phase1, content, size_out);
+    const content_digest: &byte = blake3_hex_bytes(ctx.phase1, content, size_out);
     if content_digest == null {
         return null;
     }
@@ -5661,7 +5661,7 @@ fn snapshot_file(ctx: &Phase2Context, abs_path: &byte, rel_path: &byte) &Snapsho
         return null;
     }
 
-    const digest_hex: &byte = blake2s_hex_bytes(ctx.phase1, &manifest[0] as &byte, used);
+    const digest_hex: &byte = blake3_hex_bytes(ctx.phase1, &manifest[0] as &byte, used);
     if digest_hex == null {
         return null;
     }
@@ -5760,7 +5760,7 @@ fn snapshot_directory(ctx: &Phase2Context, abs_path: &byte, rel_path: &byte) &Sn
         child = child.next;
     }
 
-    const digest_hex: &byte = blake2s_hex_bytes(ctx.phase1, &manifest[0] as &byte, used);
+    const digest_hex: &byte = blake3_hex_bytes(ctx.phase1, &manifest[0] as &byte, used);
     if digest_hex == null {
         return null;
     }
@@ -5830,7 +5830,7 @@ fn action_collect_observed_outputs(ctx: &Phase2Context, action: &PlannedAction) 
         }
         output = output.next;
     }
-    return blake2s_hex_bytes(ctx.phase1, &manifest[0] as &byte, used);
+    return blake3_hex_bytes(ctx.phase1, &manifest[0] as &byte, used);
 }
 
 fn collect_target_dependencies(ctx: &Phase1Context, target: &IRTarget) &StringNode {
@@ -6082,7 +6082,7 @@ fn compute_action_digests(ctx: &Phase2Context, action: &PlannedAction) i32 {
         }
         input = input.next;
     }
-    action.input_root_digest = blake2s_hex_bytes(ctx.phase1, &input_manifest[0] as &byte, input_used);
+    action.input_root_digest = blake3_hex_bytes(ctx.phase1, &input_manifest[0] as &byte, input_used);
     action.output_root_digest = action_collect_observed_outputs(ctx, action);
 
     var manifest: [byte: MAX_DIGEST_MANIFEST] = [];
@@ -6138,7 +6138,7 @@ fn compute_action_digests(ctx: &Phase2Context, action: &PlannedAction) i32 {
         command = command.next;
     }
 
-    action.action_key = blake2s_hex_bytes(ctx.phase1, &manifest[0] as &byte, used);
+    action.action_key = blake3_hex_bytes(ctx.phase1, &manifest[0] as &byte, used);
     if action.action_key == null {
         return -1;
     }
@@ -6267,7 +6267,7 @@ fn compute_plan_root_digest(ctx: &Phase2Context, matched: &StringNode) &byte {
         }
         action = action.next;
     }
-    return blake2s_hex_bytes(ctx.phase1, &manifest[0] as &byte, used);
+    return blake3_hex_bytes(ctx.phase1, &manifest[0] as &byte, used);
 }
 
 fn build_phase2_plan(ctx: &Phase2Context, matched: &StringNode) i32 {
@@ -6410,7 +6410,7 @@ fn build_index_entry_path(ctx: &Phase2Context, index_name: &byte, key: &byte, ou
     if ensure_dir_recursive(&dir_path[0] as &byte) != 0 {
         return -1;
     }
-    const key_digest: &byte = blake2s_hex_text(ctx.phase1, key);
+    const key_digest: &byte = blake3_hex_text(ctx.phase1, key);
     if key_digest == null {
         return -1;
     }
@@ -7021,7 +7021,7 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
 
         var output: &StringNode = action.output_head;
         while output != null {
-            const artifact_id: &byte = blake2s_hex_text(ctx.phase1, output.text);
+            const artifact_id: &byte = blake3_hex_text(ctx.phase1, output.text);
             var artifact_path: [byte: PATH_MAX] = [];
             if artifact_id == null ||
                 join_path(&ctx.state_layout.meta_artifacts[0] as &byte, artifact_id, &artifact_path[0] as &byte, PATH_MAX) != 0 {

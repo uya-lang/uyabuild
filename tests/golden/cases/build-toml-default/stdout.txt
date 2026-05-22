@@ -6,6 +6,6 @@ cache_hits: 0
 seeded_outputs: 0
 success_no_change: 0
 pending_execution: 0
-root_digest: 936af61b43b68f52a04399c871916fd05b96fde885961ff3ee10fb8ff0879e78
+root_digest: 524bbe5eef64c21b67c51d1265b25e6c1c50dab8ec864f0599264250557dc0e5
 matched:
   //:noop

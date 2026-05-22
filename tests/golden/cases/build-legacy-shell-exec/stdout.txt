@@ -6,6 +6,6 @@ cache_hits: 0
 seeded_outputs: 0
 success_no_change: 0
 pending_execution: 0
-root_digest: f1b02c47531d477456ebe60ff22eaca2d22511ab8fc315747b2b7cfb1b743057
+root_digest: 5a0a37a6299bd1481cac8a8932dc04876e886090fc3f90dc7c5e5e80267da3bb
 matched:
   //legacy:echo
