@@ -1,0 +1,4 @@
+"actions":2
+"label":"//lib:gen"
+"label":"//app:bundle"
+"deps":["//lib:gen"]

@@ -1,0 +1,3 @@
+"configs":[{"name":"debug"
+debug-linux\\n
+"outputs":["out/debug-linux.txt"]

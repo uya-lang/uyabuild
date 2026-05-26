@@ -1,0 +1,12 @@
+workspace {
+  name = "parser-minimal"
+  default = ["//app:emit"]
+  strict = true
+}
+
+use legacy
+
+legacy.shell "//app:emit" {
+  script = ["sh", "-c", "true"]
+  outputs = ["out/emit.txt"]
+}

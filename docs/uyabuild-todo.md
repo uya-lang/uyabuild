@@ -309,7 +309,7 @@
 
 ### 14.1 测试与质量
 
-- [ ] `P0` 建立 parser/analyzer/planner/executor 的单元测试矩阵。
+- [x] `P0` 建立 parser/analyzer/planner/executor 的单元测试矩阵。
 - [ ] `P0` 建立 golden test：输入 DSL -> IR / plan / why 输出。
 - [ ] `P0` 建立 end-to-end 样例仓回归测试。
 - [ ] `P1` 建立隐藏依赖、未声明输出、写源码树等错误样例集。

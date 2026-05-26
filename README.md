@@ -6,10 +6,17 @@
 
 ```sh
 make bootstrap
+make test
 ./bin/uyabuild help
 ./bin/uyabuild query //...
 ./bin/uyabuild plan //bootstrap:uyabuild --json
 ```
+
+Test entrypoints:
+
+- `make test` runs the focused unit matrix plus the golden regression suite
+- `./scripts/run-unit-tests.sh` runs the parser/analyzer/planner/executor unit matrix only
+- `./scripts/run-golden-tests.sh` runs the CLI golden cases
 
 Phase 2 currently provides:
 
