@@ -1,0 +1,11 @@
+workspace: network-policy
+phase: 3
+matched_targets: 1
+planned_actions: 3
+cache_hits: 0
+seeded_outputs: 0
+success_no_change: 0
+pending_execution: 0
+root_digest: 011bfb48de4626e93ba2911233b91a8d979c1f0e41f4f316e28e6cdb93fd95b8
+matched:
+  //net:summary

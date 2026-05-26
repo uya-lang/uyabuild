@@ -94,6 +94,7 @@ struct StateLayout {
     cas_trees: [byte: PATH_MAX],
     cas_manifests: [byte: PATH_MAX],
     cas_logs: [byte: PATH_MAX],
+    cas_action_records: [byte: PATH_MAX],
     meta: [byte: PATH_MAX],
     meta_build_runs: [byte: PATH_MAX],
     meta_actions: [byte: PATH_MAX],
@@ -328,6 +329,7 @@ struct PlannedAction {
     mnemonic: &byte,
     pool_name: &byte,
     execution_mode: &byte,
+    allow_network: i32,
     action_root_path: &byte,
     trace_prefix_path: &byte,
     stdout_path: &byte,
@@ -3018,6 +3020,9 @@ fn field_expected_type(kind: &byte, field_name: &byte) i32 {
         string_equals(field_name, "visibility" as &byte) != 0 {
         return EXPECT_STRING_LIST;
     }
+    if string_equals(field_name, "allow_network" as &byte) != 0 {
+        return EXPECT_BOOL;
+    }
     if string_equals(field_name, "execution_mode" as &byte) != 0 {
         return EXPECT_STRING;
     }
@@ -4327,6 +4332,18 @@ fn target_pool_name(target: &IRTarget) &byte {
     return default_pool_for_kind(target.kind);
 }
 
+fn target_allows_network(target: &IRTarget) i32 {
+    if target == null {
+        return 0;
+    }
+    const field: &IRField = find_ir_field(target.attrs, "allow_network" as &byte);
+    if field != null && field.value != null && field.value.kind == TYPED_VALUE_BOOL &&
+        field.value.bool_value != 0 {
+        return 1;
+    }
+    return 0;
+}
+
 fn action_uses_local_cache(action: &PlannedAction) i32 {
     if action == null {
         return 0;
@@ -5507,6 +5524,16 @@ fn dependency_tracer_path() &byte {
     return null;
 }
 
+fn network_namespace_tool_path() &byte {
+    if path_is_file("/usr/bin/unshare" as &byte) != 0 {
+        return "/usr/bin/unshare" as &byte;
+    }
+    if path_is_file("/bin/unshare" as &byte) != 0 {
+        return "/bin/unshare" as &byte;
+    }
+    return null;
+}
+
 fn normalize_traced_action_path(ctx: &Phase2Context,
                                 action_root: &byte,
                                 raw_path: &byte,
@@ -6194,6 +6221,16 @@ fn start_local_action(ctx: &Phase2Context, action: &PlannedAction) i32 {
     const shell_path: &byte = "/bin/sh" as &byte;
     var exec_args: [&byte: 4] = [shell_path, "-c" as &byte, command_text, null];
     const tracer_path: &byte = dependency_tracer_path();
+    const network_tool_path: &byte = network_namespace_tool_path();
+    if action.allow_network == 0 && network_tool_path == null {
+        return fail_pending_action(ctx,
+                                   action,
+                                   127,
+                                   EXIT_NOT_IMPLEMENTED,
+                                   "UYABUILD_E_EXECUTOR_NETWORK" as &byte,
+                                   "failed to enforce default network isolation for the local action" as &byte,
+                                   "install unshare or set allow_network = true on rules that intentionally need host networking" as &byte);
+    }
     const child_pid: i32 = fork();
     if child_pid < 0 {
         return fail_pending_action(ctx,
@@ -6208,7 +6245,36 @@ fn start_local_action(ctx: &Phase2Context, action: &PlannedAction) i32 {
         if chdir(&action_root[0] as &const byte) != 0 {
             _exit(127);
         }
-        if tracer_path != null {
+        if action.allow_network == 0 {
+            if tracer_path != null {
+                var sandbox_trace_exec_args: [&byte: 15] = [network_tool_path,
+                                                            "-Urn" as &byte,
+                                                            tracer_path,
+                                                            "-ff" as &byte,
+                                                            "-qq" as &byte,
+                                                            "-s" as &byte,
+                                                            "4096" as &byte,
+                                                            "-e" as &byte,
+                                                            "trace=%file" as &byte,
+                                                            "-o" as &byte,
+                                                            &trace_prefix[0] as &byte,
+                                                            shell_path,
+                                                            "-c" as &byte,
+                                                            command_text,
+                                                            null];
+                execve(network_tool_path as &const byte,
+                       &sandbox_trace_exec_args[0] as & &byte,
+                       &envp[0] as & &byte);
+            } else {
+                var sandbox_exec_args: [&byte: 6] = [network_tool_path,
+                                                     "-Urn" as &byte,
+                                                     shell_path,
+                                                     "-c" as &byte,
+                                                     command_text,
+                                                     null];
+                execve(network_tool_path as &const byte, &sandbox_exec_args[0] as & &byte, &envp[0] as & &byte);
+            }
+        } else if tracer_path != null {
             var trace_exec_args: [&byte: 13] = [tracer_path,
                                                 "-ff" as &byte,
                                                 "-qq" as &byte,
@@ -6523,6 +6589,14 @@ fn action_store_log_blob(ctx: &Phase2Context, digest_hex: &byte, data: &byte, da
     return persist_bytes(&path[0] as &byte, data, data_len);
 }
 
+fn action_store_record_json(ctx: &Phase2Context, digest_hex: &byte, text: &byte) i32 {
+    var path: [byte: PATH_MAX] = [];
+    if join_path(&ctx.state_layout.cas_action_records[0] as &byte, digest_hex, &path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    return persist_text(&path[0] as &byte, text);
+}
+
 fn persist_action_log_digest(ctx: &Phase2Context, abs_path: &byte) &byte {
     if ctx == null || abs_path == null {
         return null;
@@ -6537,6 +6611,25 @@ fn persist_action_log_digest(ctx: &Phase2Context, abs_path: &byte) &byte {
         return null;
     }
     if action_store_log_blob(ctx, digest_hex, content, size_out) != 0 {
+        return null;
+    }
+    return digest_hex;
+}
+
+fn persist_action_record_digest(ctx: &Phase2Context, abs_path: &byte) &byte {
+    if ctx == null || abs_path == null {
+        return null;
+    }
+    var size_out: usize = 0usize;
+    const content: &byte = read_file_into_arena(ctx.phase1, abs_path, &size_out);
+    if content == null {
+        return null;
+    }
+    const digest_hex: &byte = blake3_hex_bytes(ctx.phase1, content, size_out);
+    if digest_hex == null {
+        return null;
+    }
+    if action_store_record_json(ctx, digest_hex, content) != 0 {
         return null;
     }
     return digest_hex;
@@ -6839,6 +6932,7 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
     action.mnemonic = target.kind;
     action.pool_name = target_pool_name(target);
     action.execution_mode = target_execution_mode(target);
+    action.allow_network = target_allows_network(target);
     action.cache_status = "pending-execution" as &byte;
     action.pending_execution = 1;
 
@@ -7021,6 +7115,11 @@ fn compute_action_digests(ctx: &Phase2Context, action: &PlannedAction) i32 {
         if append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "execution_mode:" as &byte) != 0 ||
             append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, action.execution_mode) != 0 ||
             append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "\n" as &byte) != 0 {
+            return -1;
+        }
+    }
+    if action.allow_network != 0 {
+        if append_buffer_text(&manifest[0] as &byte, &used, MAX_DIGEST_MANIFEST, "allow_network:true\n" as &byte) != 0 {
             return -1;
         }
     }
@@ -7817,97 +7916,50 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
 
     var action: &PlannedAction = ctx.action_head;
     while action != null {
-        var action_path: [byte: PATH_MAX] = [];
-        if join_path(&ctx.state_layout.meta_actions[0] as &byte, action.action_key, &action_path[0] as &byte, PATH_MAX) != 0 {
+        var action_doc_id: [byte: PATH_MAX] = [];
+        const action_doc_id_written: i32 = snprintf(&action_doc_id[0] as *byte,
+                                                    PATH_MAX,
+                                                    "%s-%s" as *byte,
+                                                    &ctx.manifest.run_id[0] as *byte,
+                                                    action.action_key as *byte);
+        if action_doc_id_written < 0 || action_doc_id_written >= PATH_MAX {
             _ = fclose(events_file);
             return -1;
         }
-        const action_file: &FILE = fopen(&action_path[0] as &const byte, "w" as &const byte);
-        if action_file == null {
+
+        var action_history_path: [byte: PATH_MAX] = [];
+        var action_latest_path: [byte: PATH_MAX] = [];
+        if join_path(&ctx.state_layout.meta_actions[0] as &byte, &action_doc_id[0] as &byte, &action_history_path[0] as &byte, PATH_MAX) != 0 ||
+            join_path(&ctx.state_layout.meta_actions[0] as &byte, action.action_key, &action_latest_path[0] as &byte, PATH_MAX) != 0 {
             _ = fclose(events_file);
             return -1;
         }
-        fputs("{\"action_key\":\"" as *byte, action_file);
-        write_json_escape(action_file, action.action_key);
-        fputs("\",\"run_id\":\"" as *byte, action_file);
-        write_json_escape(action_file, &ctx.manifest.run_id[0] as &byte);
-        fputs("\",\"label\":\"" as *byte, action_file);
-        write_json_escape(action_file, action.label);
-        fputs("\",\"kind\":\"" as *byte, action_file);
-        write_json_escape(action_file, action.kind);
-        fputs("\",\"pool\":\"" as *byte, action_file);
-        write_json_escape(action_file, action.pool_name);
-        fputs("\",\"execution_mode\":\"" as *byte, action_file);
-        write_json_escape(action_file, action.execution_mode);
-        fputs("\",\"cache_status\":\"" as *byte, action_file);
-        write_json_escape(action_file, action.cache_status);
-        fputs("\",\"input_root_digest\":\"" as *byte, action_file);
-        write_json_escape(action_file, action.input_root_digest);
-        fputs("\",\"output_root_digest\":" as *byte, action_file);
-        if action.output_root_digest != null {
-            fputc(34, action_file);
-            write_json_escape(action_file, action.output_root_digest);
-            fputc(34, action_file);
-        } else {
-            fputs("null" as *byte, action_file);
-        }
-        fputs(",\"exit_code\":" as *byte, action_file);
-        fprintf(action_file, "%d" as *byte, action.exit_code);
-        fputs(",\"pending_execution\":" as *byte, action_file);
-        if action.pending_execution != 0 {
-            fputs("true" as *byte, action_file);
-        } else {
-            fputs("false" as *byte, action_file);
-        }
-        fputs(",\"stdout_log\":" as *byte, action_file);
-        if action.stdout_path != null {
-            fputc(34, action_file);
-            write_json_escape(action_file, action.stdout_path);
-            fputc(34, action_file);
-        } else {
-            fputs("null" as *byte, action_file);
-        }
-        fputs(",\"stdout_digest\":" as *byte, action_file);
-        if action.stdout_digest != null {
-            fputc(34, action_file);
-            write_json_escape(action_file, action.stdout_digest);
-            fputc(34, action_file);
-        } else {
-            fputs("null" as *byte, action_file);
-        }
-        fputs(",\"stderr_log\":" as *byte, action_file);
-        if action.stderr_path != null {
-            fputc(34, action_file);
-            write_json_escape(action_file, action.stderr_path);
-            fputc(34, action_file);
-        } else {
-            fputs("null" as *byte, action_file);
-        }
-        fputs(",\"stderr_digest\":" as *byte, action_file);
-        if action.stderr_digest != null {
-            fputc(34, action_file);
-            write_json_escape(action_file, action.stderr_digest);
-            fputc(34, action_file);
-        } else {
-            fputs("null" as *byte, action_file);
-        }
-        fputs(",\"tracked_reads\":" as *byte, action_file);
-        emit_string_node_array_json(action_file, action.tracked_read_head);
-        fputs(",\"tracked_writes\":" as *byte, action_file);
-        emit_string_node_array_json(action_file, action.tracked_write_head);
-        fputs(",\"hidden_inputs\":" as *byte, action_file);
-        emit_string_node_array_json(action_file, action.hidden_input_head);
-        fputs(",\"undeclared_outputs\":" as *byte, action_file);
-        emit_string_node_array_json(action_file, action.undeclared_output_head);
-        fputs("}\n" as *byte, action_file);
-        _ = fflush(action_file);
-        if fclose(action_file) != 0 {
+        if write_action_record_file(ctx,
+                                    &action_history_path[0] as &byte,
+                                    action,
+                                    &action_doc_id[0] as &byte,
+                                    null) != 0 {
             _ = fclose(events_file);
             return -1;
         }
-        if append_index_doc_id(ctx, "actions.by_digest" as &byte, action.action_key, action.action_key) != 0 ||
-            append_index_doc_id(ctx, "actions.by_owner" as &byte, action.label, action.action_key) != 0 ||
-            append_index_doc_id(ctx, "actions.by_status" as &byte, action.cache_status, action.action_key) != 0 {
+        const action_record_digest: &byte = persist_action_record_digest(ctx, &action_history_path[0] as &byte);
+        if action_record_digest == null ||
+            write_action_record_file(ctx,
+                                     &action_history_path[0] as &byte,
+                                     action,
+                                     &action_doc_id[0] as &byte,
+                                     action_record_digest) != 0 ||
+            write_action_record_file(ctx,
+                                     &action_latest_path[0] as &byte,
+                                     action,
+                                     &action_doc_id[0] as &byte,
+                                     action_record_digest) != 0 {
+            _ = fclose(events_file);
+            return -1;
+        }
+        if append_index_doc_id(ctx, "actions.by_digest" as &byte, action.action_key, &action_doc_id[0] as &byte) != 0 ||
+            append_index_doc_id(ctx, "actions.by_owner" as &byte, action.label, &action_doc_id[0] as &byte) != 0 ||
+            append_index_doc_id(ctx, "actions.by_status" as &byte, action.cache_status, &action_doc_id[0] as &byte) != 0 {
             _ = fclose(events_file);
             return -1;
         }
@@ -8035,6 +8087,114 @@ fn emit_string_node_array_json(stream: &FILE, head: &StringNode) void {
         node = node.next;
     }
     fputs("]" as *byte, stream);
+}
+
+fn emit_json_bool(stream: &FILE, value: i32) void {
+    if value != 0 {
+        fputs("true" as *byte, stream);
+    } else {
+        fputs("false" as *byte, stream);
+    }
+}
+
+fn write_action_record_file(ctx: &Phase2Context,
+                            path: &byte,
+                            action: &PlannedAction,
+                            action_doc_id: &byte,
+                            record_digest: &byte) i32 {
+    if ctx == null || path == null || action == null || action_doc_id == null {
+        return -1;
+    }
+    const action_file: &FILE = fopen(path as &const byte, "w" as &const byte);
+    if action_file == null {
+        return -1;
+    }
+    fputs("{\"action_key\":\"" as *byte, action_file);
+    write_json_escape(action_file, action.action_key);
+    fputs("\",\"action_doc_id\":\"" as *byte, action_file);
+    write_json_escape(action_file, action_doc_id);
+    fputs("\",\"run_id\":\"" as *byte, action_file);
+    write_json_escape(action_file, &ctx.manifest.run_id[0] as &byte);
+    fputs("\",\"label\":\"" as *byte, action_file);
+    write_json_escape(action_file, action.label);
+    fputs("\",\"kind\":\"" as *byte, action_file);
+    write_json_escape(action_file, action.kind);
+    fputs("\",\"pool\":\"" as *byte, action_file);
+    write_json_escape(action_file, action.pool_name);
+    fputs("\",\"execution_mode\":\"" as *byte, action_file);
+    write_json_escape(action_file, action.execution_mode);
+    fputs("\",\"allow_network\":" as *byte, action_file);
+    emit_json_bool(action_file, action.allow_network);
+    fputs(",\"cache_status\":\"" as *byte, action_file);
+    write_json_escape(action_file, action.cache_status);
+    fputs("\",\"record_digest\":" as *byte, action_file);
+    if record_digest != null {
+        fputc(34, action_file);
+        write_json_escape(action_file, record_digest);
+        fputc(34, action_file);
+    } else {
+        fputs("null" as *byte, action_file);
+    }
+    fputs(",\"input_root_digest\":\"" as *byte, action_file);
+    write_json_escape(action_file, action.input_root_digest);
+    fputs("\",\"output_root_digest\":" as *byte, action_file);
+    if action.output_root_digest != null {
+        fputc(34, action_file);
+        write_json_escape(action_file, action.output_root_digest);
+        fputc(34, action_file);
+    } else {
+        fputs("null" as *byte, action_file);
+    }
+    fputs(",\"exit_code\":" as *byte, action_file);
+    fprintf(action_file, "%d" as *byte, action.exit_code);
+    fputs(",\"pending_execution\":" as *byte, action_file);
+    emit_json_bool(action_file, action.pending_execution);
+    fputs(",\"stdout_log\":" as *byte, action_file);
+    if action.stdout_path != null {
+        fputc(34, action_file);
+        write_json_escape(action_file, action.stdout_path);
+        fputc(34, action_file);
+    } else {
+        fputs("null" as *byte, action_file);
+    }
+    fputs(",\"stdout_digest\":" as *byte, action_file);
+    if action.stdout_digest != null {
+        fputc(34, action_file);
+        write_json_escape(action_file, action.stdout_digest);
+        fputc(34, action_file);
+    } else {
+        fputs("null" as *byte, action_file);
+    }
+    fputs(",\"stderr_log\":" as *byte, action_file);
+    if action.stderr_path != null {
+        fputc(34, action_file);
+        write_json_escape(action_file, action.stderr_path);
+        fputc(34, action_file);
+    } else {
+        fputs("null" as *byte, action_file);
+    }
+    fputs(",\"stderr_digest\":" as *byte, action_file);
+    if action.stderr_digest != null {
+        fputc(34, action_file);
+        write_json_escape(action_file, action.stderr_digest);
+        fputc(34, action_file);
+    } else {
+        fputs("null" as *byte, action_file);
+    }
+    fputs(",\"tracked_reads\":" as *byte, action_file);
+    emit_string_node_array_json(action_file, action.tracked_read_head);
+    fputs(",\"tracked_writes\":" as *byte, action_file);
+    emit_string_node_array_json(action_file, action.tracked_write_head);
+    fputs(",\"hidden_inputs\":" as *byte, action_file);
+    emit_string_node_array_json(action_file, action.hidden_input_head);
+    fputs(",\"undeclared_outputs\":" as *byte, action_file);
+    emit_string_node_array_json(action_file, action.undeclared_output_head);
+    fputs("}\n" as *byte, action_file);
+    _ = fflush(action_file);
+    if fclose(action_file) != 0 {
+        return -1;
+    }
+    return 0;
 }
 
 fn emit_action_json(stream: &FILE, action: &PlannedAction) void {
@@ -8580,6 +8740,7 @@ fn prepare_state_layout(workspace: &Workspace,
         prepare_state_subdir(&layout.cas[0] as &byte, "trees" as &byte, &layout.cas_trees[0] as &byte, PATH_MAX) != 0 ||
         prepare_state_subdir(&layout.cas[0] as &byte, "manifests" as &byte, &layout.cas_manifests[0] as &byte, PATH_MAX) != 0 ||
         prepare_state_subdir(&layout.cas[0] as &byte, "logs" as &byte, &layout.cas_logs[0] as &byte, PATH_MAX) != 0 ||
+        prepare_state_subdir(&layout.cas[0] as &byte, "action-records" as &byte, &layout.cas_action_records[0] as &byte, PATH_MAX) != 0 ||
         prepare_state_subdir(&layout.root[0] as &byte, "meta" as &byte, &layout.meta[0] as &byte, PATH_MAX) != 0 ||
         prepare_state_subdir(&layout.meta[0] as &byte, "build_runs" as &byte, &layout.meta_build_runs[0] as &byte, PATH_MAX) != 0 ||
         prepare_state_subdir(&layout.meta[0] as &byte, "actions" as &byte, &layout.meta_actions[0] as &byte, PATH_MAX) != 0 ||
@@ -8891,6 +9052,7 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
         cas_trees: [],
         cas_manifests: [],
         cas_logs: [],
+        cas_action_records: [],
         meta: [],
         meta_build_runs: [],
         meta_actions: [],
@@ -9100,6 +9262,7 @@ fn run_query(start_index: i32, base_options: &Options) i32 {
         cas_trees: [],
         cas_manifests: [],
         cas_logs: [],
+        cas_action_records: [],
         meta: [],
         meta_build_runs: [],
         meta_actions: [],
@@ -9234,6 +9397,7 @@ fn run_plan(start_index: i32, base_options: &Options) i32 {
         cas_trees: [],
         cas_manifests: [],
         cas_logs: [],
+        cas_action_records: [],
         meta: [],
         meta_build_runs: [],
         meta_actions: [],

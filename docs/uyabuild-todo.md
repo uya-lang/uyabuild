@@ -148,7 +148,9 @@
 - `execution_mode` 现已生效：`pure` 仅物化声明输入与依赖输出，`host` 会额外物化兼容所需的工作区内容，`volatile` 会跳过本地缓存与 `success-no-change` 复用路径。
 - Linux 兼容执行路径现已接入 `strace` 依赖追踪：动作元数据会记录 `tracked_reads` / `tracked_writes`、`hidden_inputs`、`undeclared_outputs`；`workspace.strict = true` 时，隐藏输入和未声明输出会在输出提交前直接失败。
 - `uyabuild build --jobs <n>` 现已启用并行调度：`cpu` 池使用作业并发上限，`link` / `docker` / `network` 和其他非 `cpu` 池按池名串行化，`plan --json` / 动作元数据也会显式记录 `pool`。
-- 当前仍受限于兼容执行路径：`cxx` / `node` / `oci` 等动作尚未接入本地执行器，命中待执行动作时会返回 `UYABUILD_E_EXECUTOR_UNSUPPORTED`；macOS 依赖追踪后端、网络策略与 ActionRecord 的 CAS 写入仍待后续收口。
+- Linux 本地执行现已默认关闭宿主网络；只有显式声明 `allow_network = true` 的动作才会跳过 `unshare -Urn` 隔离并使用宿主网络。
+- ActionRecord 现已同时写入 `meta/actions/` 与 `.uya-build/cas/action-records/`：`meta/actions/<action-key>` 保留最新快照，`meta/actions/<run-id>-<action-key>` 保留历史记录，索引会指向历史 doc 以支持后续查询。
+- 当前仍受限于兼容执行路径：`cxx` / `node` / `oci` 等动作尚未接入本地执行器，命中待执行动作时会返回 `UYABUILD_E_EXECUTOR_UNSUPPORTED`；macOS 依赖追踪后端仍待后续收口。
 
 | ID | 优先级 | 任务 | 依赖 | 验收标准 |
 |---|---|---|---|---|
@@ -162,8 +164,8 @@
 | `P3-8` | `P1` | 部分完成：已接入 Linux 依赖追踪实现，macOS 待补 | `P3-7` | 隐藏输入与越权写出可被捕获 |
 | `P3-9` | `P0` | 已完成：实现 strict/compat 模式开关 | `P3-7` | 严格模式下隐藏依赖会失败 |
 | `P3-10` | `P1` | 已完成：实现资源池与并行调度 | `P3-1`, `P2-6` | `link/docker/network` 池生效 |
-| `P3-11` | `P1` | 实现网络默认关闭策略 | `P3-6` | 未显式声明的动作不可访问网络 |
-| `P3-12` | `P1` | 把 ActionRecord 写入 NoSQLite 和 CAS | `P3-3`, `P2-4` | 可查询历史执行记录 |
+| `P3-11` | `P1` | 已完成：实现网络默认关闭策略 | `P3-6` | 未显式声明的动作不可访问网络 |
+| `P3-12` | `P1` | 已完成：把 ActionRecord 写入 NoSQLite 和 CAS | `P3-3`, `P2-4` | 可查询历史执行记录 |
 
 ### 8.3 退出条件
 

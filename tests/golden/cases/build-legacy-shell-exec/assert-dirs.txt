@@ -1,3 +1,4 @@
 out
 .uya-build/cas/logs
+.uya-build/cas/action-records
 .uya-build/tmp/actions

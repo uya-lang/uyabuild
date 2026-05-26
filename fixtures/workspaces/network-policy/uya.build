@@ -1,0 +1,26 @@
+workspace {
+  name = "network-policy"
+  default = ["//net:summary"]
+  strict = false
+}
+
+use legacy
+
+legacy.shell "//net:blocked" {
+  script = ["sh", "scripts/check-network.sh", "blocked", "out/blocked.txt"]
+  inputs = ["scripts/check-network.sh"]
+  outputs = ["out/blocked.txt"]
+}
+
+legacy.shell "//net:allowed" {
+  script = ["sh", "scripts/check-network.sh", "allowed", "out/allowed.txt"]
+  inputs = ["scripts/check-network.sh"]
+  outputs = ["out/allowed.txt"]
+  allow_network = true
+}
+
+legacy.shell "//net:summary" {
+  run = ["sh", "-c", "cat out/blocked.txt out/allowed.txt > out/summary.txt"]
+  deps = ["//net:blocked", "//net:allowed"]
+  outputs = ["out/summary.txt"]
+}

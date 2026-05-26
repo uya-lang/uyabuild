@@ -324,6 +324,7 @@ Action {
   tools: [ToolRef]
   outputs: [OutputSpec]
   env_allowlist: [string]
+  allow_network: bool
   execution_mode: pure | host | volatile
   pool: string?
   cache_policy: CachePolicy
@@ -700,6 +701,7 @@ legacy.shell "//legacy:gen" {
   inputs = ["scripts/gen.sh", "config.yaml"]
   outputs = ["out/generated/**"]
   env_allowlist = ["PATH", "HOME"]
+  allow_network = true
   mode = "compat"
 }
 ```
@@ -708,6 +710,7 @@ legacy.shell "//legacy:gen" {
 
 - `mode = "compat"` 默认允许追踪补依赖
 - `mode = "strict"` 要求无隐藏输入
+- 只有显式声明 `allow_network = true` 的动作才可访问宿主网络
 - 必须声明输出
 
 ## 17. 互操作设计
