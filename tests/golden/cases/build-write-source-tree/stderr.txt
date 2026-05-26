@@ -1,0 +1,3 @@
+UYABUILD_E_STRICT_UNDECLARED_OUTPUT: strict mode blocked an undeclared output
+at: uya.build:9:1
+detail: generated.txt

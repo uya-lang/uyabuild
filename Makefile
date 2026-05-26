@@ -5,7 +5,7 @@ BOOTSTRAP_SRC := build/bootstrap/seed/main.uya
 BIN_DIR := bin
 BIN := $(BIN_DIR)/uyabuild
 
-.PHONY: all bootstrap clean test test-unit test-golden benchmark-baseline
+.PHONY: all bootstrap clean test test-unit test-golden test-e2e benchmark-baseline
 
 all: bootstrap
 
@@ -20,13 +20,16 @@ $(BIN_DIR):
 clean:
 	rm -rf .uyacache "$(BIN)"
 
-test: test-unit test-golden
+test: test-unit test-golden test-e2e
 
 test-unit: bootstrap
 	./scripts/run-unit-tests.sh
 
 test-golden: bootstrap
 	./scripts/run-golden-tests.sh
+
+test-e2e: bootstrap
+	./scripts/run-e2e-tests.sh
 
 benchmark-baseline: bootstrap
 	./scripts/benchmark-baseline.sh

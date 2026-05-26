@@ -1,0 +1,8 @@
+workspace: success-no-change
+phase: 3
+matched_targets: 1
+matched:
+  //app:bundle
+why:
+  //app:bundle [local-hit] matched cached output for the current action key
+    //lib:gen [success-no-change] declared outputs match the latest successful output for this target

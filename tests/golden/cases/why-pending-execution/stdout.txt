@@ -1,0 +1,7 @@
+workspace: legacy-shell
+phase: 3
+matched_targets: 1
+matched:
+  //legacy:echo
+why:
+  //legacy:echo [pending-execution] declared outputs are missing, so the action must run

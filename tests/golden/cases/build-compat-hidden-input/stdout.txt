@@ -1,0 +1,11 @@
+workspace: compat-hidden-input
+phase: 3
+matched_targets: 1
+planned_actions: 1
+cache_hits: 0
+seeded_outputs: 0
+success_no_change: 0
+pending_execution: 0
+root_digest: 2f436eb8819ea06b3dfd493be9657f0e4a7b1d97643ee4003fe9791eef0bd604
+matched:
+  //modes:host

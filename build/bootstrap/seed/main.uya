@@ -5596,6 +5596,9 @@ fn phase_number_for_subcommand(subcommand: &byte) i32 {
     if string_equals(subcommand, "build" as &byte) != 0 {
         return BUILD_PHASE_NUMBER;
     }
+    if string_equals(subcommand, "why" as &byte) != 0 {
+        return BUILD_PHASE_NUMBER;
+    }
     if string_equals(subcommand, "plan" as &byte) != 0 {
         return PLAN_PHASE_NUMBER;
     }
@@ -8839,6 +8842,179 @@ fn emit_plan_text(ctx: &Phase1Context, phase2: &Phase2Context, matched: &StringN
     _ = fflush(libc.stdout);
 }
 
+fn why_reason_text(ctx: &Phase2Context, action: &PlannedAction) &byte {
+    if action == null {
+        return "target has no planned action" as &byte;
+    }
+
+    var dep: &StringNode = action.dep_head;
+    while dep != null {
+        const dep_action: &PlannedAction = find_planned_action_by_label(ctx, dep.text);
+        if dep_action != null && is_reusable_action_status(dep_action.cache_status) == 0 {
+            return "waiting on a dirty dependency" as &byte;
+        }
+        dep = dep.next;
+    }
+
+    if string_equals(action.cache_status, "local-hit" as &byte) != 0 {
+        return "matched cached output for the current action key" as &byte;
+    }
+    if string_equals(action.cache_status, "success-no-change" as &byte) != 0 {
+        return "declared outputs match the latest successful output for this target" as &byte;
+    }
+    if string_equals(action.cache_status, "seeded-output" as &byte) != 0 {
+        return "declared outputs already exist and were adopted into local state" as &byte;
+    }
+    if string_equals(action.cache_status, "executed-local" as &byte) != 0 {
+        return "the action executed locally in this build" as &byte;
+    }
+    if string_equals(action.cache_status, "execution-failed" as &byte) != 0 {
+        return "the last attempted local execution failed" as &byte;
+    }
+    if action.output_root_digest == null {
+        return "declared outputs are missing, so the action must run" as &byte;
+    }
+    if action.execution_mode != null &&
+        string_equals(action.execution_mode, "volatile" as &byte) != 0 {
+        return "execution_mode=volatile disables local cache reuse" as &byte;
+    }
+    return "no reusable local cache decision was available" as &byte;
+}
+
+fn emit_why_indent(depth: i32) void {
+    var i: i32 = 0;
+    while i < depth {
+        fputs("  " as *byte, libc.stdout);
+        i = i + 1;
+    }
+}
+
+fn emit_why_missing_action_text(label: &byte, depth: i32) void {
+    emit_why_indent(depth);
+    fprintf(libc.stdout,
+            "%s [not-planned] dependency was referenced but not planned\n" as *byte,
+            label as *byte);
+}
+
+fn emit_why_action_text(ctx: &Phase2Context, action: &PlannedAction, depth: i32) void {
+    if action == null {
+        emit_why_missing_action_text("<unknown>" as &byte, depth);
+        return;
+    }
+
+    emit_why_indent(depth);
+    fprintf(libc.stdout,
+            "%s [%s] %s\n" as *byte,
+            action.label as *byte,
+            action.cache_status as *byte,
+            why_reason_text(ctx, action) as *byte);
+
+    var dep: &StringNode = action.dep_head;
+    while dep != null {
+        const dep_action: &PlannedAction = find_planned_action_by_label(ctx, dep.text);
+        if dep_action != null {
+            emit_why_action_text(ctx, dep_action, depth + 1);
+        } else {
+            emit_why_missing_action_text(dep.text, depth + 1);
+        }
+        dep = dep.next;
+    }
+}
+
+fn emit_why_missing_action_json(stream: &FILE, label: &byte) void {
+    fputs("{\"label\":\"" as *byte, stream);
+    write_json_escape(stream, label);
+    fputs("\",\"status\":\"not-planned\",\"reason\":\"dependency was referenced but not planned\",\"deps\":[]}" as *byte, stream);
+}
+
+fn emit_why_action_json(stream: &FILE, ctx: &Phase2Context, action: &PlannedAction) void {
+    if action == null {
+        emit_why_missing_action_json(stream, "<unknown>" as &byte);
+        return;
+    }
+
+    fputs("{\"label\":\"" as *byte, stream);
+    write_json_escape(stream, action.label);
+    fputs("\",\"kind\":\"" as *byte, stream);
+    write_json_escape(stream, action.kind);
+    fputs("\",\"status\":\"" as *byte, stream);
+    write_json_escape(stream, action.cache_status);
+    fputs("\",\"reason\":\"" as *byte, stream);
+    write_json_escape(stream, why_reason_text(ctx, action));
+    fputs("\",\"deps\":[" as *byte, stream);
+
+    var first_dep: i32 = 1;
+    var dep: &StringNode = action.dep_head;
+    while dep != null {
+        if first_dep == 0 {
+            fputs("," as *byte, stream);
+        }
+        const dep_action: &PlannedAction = find_planned_action_by_label(ctx, dep.text);
+        if dep_action != null {
+            emit_why_action_json(stream, ctx, dep_action);
+        } else {
+            emit_why_missing_action_json(stream, dep.text);
+        }
+        first_dep = 0;
+        dep = dep.next;
+    }
+    fputs("]}" as *byte, stream);
+}
+
+fn emit_why_json(ctx: &Phase1Context, phase2: &Phase2Context, matched: &StringNode) void {
+    fputs("{\"ok\":true,\"phase\":" as *byte, libc.stdout);
+    fprintf(libc.stdout, "%d" as *byte, BUILD_PHASE_NUMBER);
+    fputs(",\"workspace\":\"" as *byte, libc.stdout);
+    write_json_escape(libc.stdout, ctx.workspace_ir.name);
+    fputs("\",\"matched\":" as *byte, libc.stdout);
+    emit_string_node_array_json(libc.stdout, matched);
+    fputs(",\"planning\":" as *byte, libc.stdout);
+    emit_phase2_summary_json(libc.stdout, phase2);
+    fputs(",\"why\":[" as *byte, libc.stdout);
+
+    var first_match: i32 = 1;
+    var node: &StringNode = matched;
+    while node != null {
+        if first_match == 0 {
+            fputs("," as *byte, libc.stdout);
+        }
+        const action: &PlannedAction = find_planned_action_by_label(phase2, node.text);
+        if action != null {
+            emit_why_action_json(libc.stdout, phase2, action);
+        } else {
+            emit_why_missing_action_json(libc.stdout, node.text);
+        }
+        first_match = 0;
+        node = node.next;
+    }
+    fputs("]}\n" as *byte, libc.stdout);
+    _ = fflush(libc.stdout);
+}
+
+fn emit_why_text(ctx: &Phase1Context, phase2: &Phase2Context, matched: &StringNode) void {
+    fprintf(libc.stdout, "workspace: %s\n" as *byte, ctx.workspace_ir.name as *byte);
+    fprintf(libc.stdout, "phase: %d\n" as *byte, BUILD_PHASE_NUMBER);
+    fprintf(libc.stdout, "matched_targets: %d\n" as *byte, phase2.matched_count);
+    fputs("matched:\n" as *byte, libc.stdout);
+    var node: &StringNode = matched;
+    while node != null {
+        fprintf(libc.stdout, "  %s\n" as *byte, node.text as *byte);
+        node = node.next;
+    }
+    fputs("why:\n" as *byte, libc.stdout);
+    node = matched;
+    while node != null {
+        const action: &PlannedAction = find_planned_action_by_label(phase2, node.text);
+        if action != null {
+            emit_why_action_text(phase2, action, 1);
+        } else {
+            emit_why_missing_action_text(node.text, 1);
+        }
+        node = node.next;
+    }
+    _ = fflush(libc.stdout);
+}
+
 fn emit_build_json(ctx: &Phase1Context, phase2: &Phase2Context, matched: &StringNode) void {
     fputs("{\"ok\":true,\"phase\":3,\"mode\":\"local-executor\",\"workspace\":\"" as *byte, libc.stdout);
     write_json_escape(libc.stdout, ctx.workspace_ir.name);
@@ -8907,6 +9083,7 @@ fn print_root_help() void {
     fputs("  build                 analyze, snapshot, and execute supported local actions\n" as *byte, libc.stdout);
     fputs("  query                 inspect the typed target graph\n" as *byte, libc.stdout);
     fputs("  plan                  emit the typed IR plus Phase 2 action graph\n" as *byte, libc.stdout);
+    fputs("  why                   explain why targets are clean or pending\n" as *byte, libc.stdout);
     fputs("  version               print the bootstrap version\n" as *byte, libc.stdout);
     fputs("  help                  show command help\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
@@ -8922,6 +9099,7 @@ fn print_root_help() void {
     fputs("  uyabuild build //bootstrap:uyabuild\n" as *byte, libc.stdout);
     fputs("  uyabuild query //...\n" as *byte, libc.stdout);
     fputs("  uyabuild plan //app:hello --json\n" as *byte, libc.stdout);
+    fputs("  uyabuild why //app:hello\n" as *byte, libc.stdout);
     _ = fflush(libc.stdout);
 }
 
@@ -8978,6 +9156,25 @@ fn print_plan_help() void {
     fputs("  When no target is provided, workspace.default is used.\n" as *byte, libc.stdout);
     fputs("  Phase 2 plan output includes snapshots, action keys, cache status,\n" as *byte, libc.stdout);
     fputs("  and success-no-change decisions for reusable outputs.\n" as *byte, libc.stdout);
+    _ = fflush(libc.stdout);
+}
+
+fn print_why_help() void {
+    fputs("Usage:\n" as *byte, libc.stdout);
+    fputs("  uyabuild why [options] [<target> ...]\n" as *byte, libc.stdout);
+    fputs("\n" as *byte, libc.stdout);
+    fputs("Options:\n" as *byte, libc.stdout);
+    fputs("  --workspace <path>    override workspace root discovery\n" as *byte, libc.stdout);
+    fputs("  --state-dir <path>    override state directory\n" as *byte, libc.stdout);
+    fputs("  --config <list>       activate config names for select() expansion\n" as *byte, libc.stdout);
+    fputs("  --json                emit structured why output as JSON\n" as *byte, libc.stdout);
+    fputs("  -h, --help            show why help\n" as *byte, libc.stdout);
+    fputs("\n" as *byte, libc.stdout);
+    fputs("Notes:\n" as *byte, libc.stdout);
+    fputs("  When no target is provided, workspace.default is used.\n" as *byte, libc.stdout);
+    fputs("  Why runs Phase 2 planning without executing pending actions.\n" as *byte, libc.stdout);
+    fputs("  It reports local-hit, seeded-output, success-no-change, or\n" as *byte, libc.stdout);
+    fputs("  pending-execution explanations from the current workspace state.\n" as *byte, libc.stdout);
     _ = fflush(libc.stdout);
 }
 
@@ -9919,6 +10116,192 @@ fn run_plan(start_index: i32, base_options: &Options) i32 {
     return EXIT_OK;
 }
 
+fn run_why(start_index: i32, base_options: &Options) i32 {
+    var options: Options = Options {
+        workspace_override: base_options.workspace_override,
+        state_dir_override: base_options.state_dir_override,
+        config_selector: base_options.config_selector,
+        output_mode: base_options.output_mode,
+        jobs: base_options.jobs,
+    };
+    var targets: [&byte: MAX_ARGS] = [];
+    var target_count: i32 = 0;
+    const argc: i32 = get_argc();
+
+    var index: i32 = start_index;
+    while index < argc {
+        const argument: &byte = get_argv(index);
+        if argument == null {
+            index = index + 1;
+            continue;
+        }
+        if string_equals(argument, "-h" as &byte) != 0 || string_equals(argument, "--help" as &byte) != 0 {
+            print_why_help();
+            return EXIT_OK;
+        }
+        if argument[0] == 45 as byte {
+            if string_equals(argument, "--json" as &byte) != 0 {
+                options.output_mode = OUTPUT_JSON;
+                index = index + 1;
+                continue;
+            }
+            if index + 1 >= argc {
+                return emit_error(options.output_mode,
+                                  EXIT_USAGE,
+                                  "UYABUILD_E_USAGE" as &byte,
+                                  "option requires a value" as &byte,
+                                  argument);
+            }
+            const next_argument: &byte = get_argv(index + 1);
+            const shared_status: i32 = apply_shared_option(argument, next_argument, &options);
+            if shared_status > 0 {
+                index = index + 2;
+                continue;
+            }
+            if shared_status < 0 {
+                return emit_error(options.output_mode,
+                                  EXIT_USAGE,
+                                  "UYABUILD_E_USAGE" as &byte,
+                                  "--config may only be passed once" as &byte,
+                                  "use --config name[,name...] to activate multiple configs" as &byte);
+            }
+            return emit_error(options.output_mode,
+                              EXIT_USAGE,
+                              "UYABUILD_E_USAGE" as &byte,
+                              "unknown why option" as &byte,
+                              argument);
+        }
+        if is_target_pattern(argument) == 0 {
+            return emit_error(options.output_mode,
+                              EXIT_USAGE,
+                              "UYABUILD_E_TARGET_SYNTAX" as &byte,
+                              "why targets must use //pkg:name or //pkg/... syntax" as &byte,
+                              argument);
+        }
+        targets[target_count as usize] = argument;
+        target_count = target_count + 1;
+        index = index + 1;
+    }
+
+    var workspace: Workspace = Workspace { root: [], entrypoint: [] };
+    var state_layout: StateLayout = StateLayout {
+        root: [],
+        cas: [],
+        cas_blobs: [],
+        cas_trees: [],
+        cas_manifests: [],
+        cas_logs: [],
+        cas_action_records: [],
+        meta: [],
+        meta_build_runs: [],
+        meta_actions: [],
+        meta_artifacts: [],
+        meta_events: [],
+        meta_cache_entries: [],
+        meta_indexes: [],
+        runs: [],
+        tmp: [],
+        locks: [],
+        gc: [],
+    };
+    var manifest: RunManifest = RunManifest { run_id: [], run_dir: [], manifest_path: [] };
+    const status: i32 = resolve_runtime_context(&options,
+                                                &workspace,
+                                                &state_layout,
+                                                &manifest,
+                                                "why" as &byte,
+                                                targets,
+                                                target_count);
+    if status != 0 {
+        return status;
+    }
+
+    var phase1: Phase1Context = Phase1Context {
+        arena: Arena { buffer: null, size: 0usize, used: 0usize, has_last: false, last_start: 0usize, last_aligned: 0usize },
+        workspace_root: null,
+        root_build_path: null,
+        root_toml_path: null,
+        entrypoint_path: null,
+        files_head: null,
+        files_tail: null,
+        uses_head: null,
+        uses_tail: null,
+        active_configs: null,
+        configs_head: null,
+        configs_tail: null,
+        targets_head: null,
+        workspace_ir: IRWorkspace { source_file: null, span: zero_span(), name: null, defaults: null, strict: 0, has_name: 0, has_defaults: 0, has_strict: 0 },
+        toml_meta: TomlWorkspaceMeta { has_name: 0, has_default: 0, has_strict: 0, name: null, defaults: null, strict: 0 },
+        file_count: 0,
+        use_count: 0,
+        active_config_count: 0,
+        config_count: 0,
+        target_count: 0,
+        diagnostic: Diagnostic { exit_code: EXIT_CONFIG, code: null, message: null, detail: null, file: null, line: 0, column: 0 },
+    };
+    const load_status: i32 = load_phase1_model(&options, &workspace, &phase1);
+    if load_status != 0 {
+        return load_status;
+    }
+
+    var matched_count: i32 = 0;
+    const matched: &StringNode = resolve_requested_targets(&phase1, targets, target_count, &matched_count);
+    if matched == null && phase1.diagnostic.code != null {
+        return emit_diagnostic(options.output_mode, &phase1.diagnostic);
+    }
+    if matched_count == 0 {
+        return emit_error(options.output_mode,
+                          EXIT_CONFIG,
+                          "UYABUILD_E_TARGET_NOT_FOUND" as &byte,
+                          "why matched no targets" as &byte,
+                          "declare workspace.default or pass explicit targets" as &byte);
+    }
+
+    var phase2: Phase2Context = Phase2Context {
+        phase1: null,
+        state_layout: null,
+        manifest: null,
+        snapshot_head: null,
+        action_head: null,
+        action_tail: null,
+        visit_head: null,
+        requested_count: 0,
+        matched_count: 0,
+        snapshot_count: 0,
+        action_count: 0,
+        cache_hit_count: 0,
+        seeded_count: 0,
+        no_change_count: 0,
+        pending_count: 0,
+        max_jobs: options.jobs,
+        root_digest: null,
+    };
+    phase2_ctx_init(&phase2, &phase1, &state_layout, &manifest, target_count, matched_count, options.jobs);
+    if build_phase2_plan(&phase2, matched) != 0 {
+        if phase1.diagnostic.code != null {
+            return emit_diagnostic(options.output_mode, &phase1.diagnostic);
+        }
+        return emit_error(options.output_mode,
+                          EXIT_IO,
+                          "UYABUILD_E_PLAN_FAILED" as &byte,
+                          "failed to build the Phase 2 action graph" as &byte,
+                          "check declared inputs, target cycles, and CAS paths" as &byte);
+    }
+    if persist_phase2_metadata(&phase2, "why" as &byte, matched) != 0 {
+        return emit_error(options.output_mode,
+                          EXIT_IO,
+                          "UYABUILD_E_META_WRITE" as &byte,
+                          "failed to persist Phase 2 metadata" as &byte,
+                          "check .uya-build/meta permissions and path lengths" as &byte);
+    }
+    if options.output_mode == OUTPUT_JSON {
+        emit_why_json(&phase1, &phase2, matched);
+    } else {
+        emit_why_text(&phase1, &phase2, matched);
+    }
+    return EXIT_OK;
+}
+
 export fn main() i32 {
     const argc: i32 = get_argc();
     var options: Options = Options {
@@ -10015,6 +10398,10 @@ export fn main() i32 {
                 print_plan_help();
                 return EXIT_OK;
             }
+            if topic != null && string_equals(topic, "why" as &byte) != 0 {
+                print_why_help();
+                return EXIT_OK;
+            }
         }
         print_root_help();
         return EXIT_OK;
@@ -10032,6 +10419,9 @@ export fn main() i32 {
     }
     if string_equals(command, "plan" as &byte) != 0 {
         return run_plan(command_index + 1, &options);
+    }
+    if string_equals(command, "why" as &byte) != 0 {
+        return run_why(command_index + 1, &options);
     }
 
     return emit_error(options.output_mode,

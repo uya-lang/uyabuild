@@ -1,0 +1,14 @@
+workspace {
+  name = "compat-hidden-input"
+  default = ["//modes:host"]
+  strict = false
+}
+
+use legacy
+
+legacy.shell "//modes:host" {
+  script = ["sh", "scripts/check-hidden.sh", "out/host.txt", "hidden.txt"]
+  inputs = ["scripts/check-hidden.sh"]
+  outputs = ["out/host.txt"]
+  execution_mode = "host"
+}

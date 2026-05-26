@@ -10,13 +10,15 @@ make test
 ./bin/uyabuild help
 ./bin/uyabuild query //...
 ./bin/uyabuild plan //bootstrap:uyabuild --json
+./bin/uyabuild why //bootstrap:uyabuild
 ```
 
 Test entrypoints:
 
-- `make test` runs the focused unit matrix plus the golden regression suite
+- `make test` runs the focused unit matrix, the golden regression suite, and the sample-workspace end-to-end matrix
 - `./scripts/run-unit-tests.sh` runs the parser/analyzer/planner/executor unit matrix only
 - `./scripts/run-golden-tests.sh` runs the CLI golden cases
+- `./scripts/run-e2e-tests.sh` runs the representative workspace regression cases
 
 Phase 2 currently provides:
 
@@ -29,6 +31,7 @@ Phase 2 currently provides:
 Phase 3 now provides an initial local executor for `legacy.shell` and `task`:
 
 - `uyabuild build` materializes a per-action temporary workspace, runs supported actions locally, captures `stdout`/`stderr`, and atomically commits declared outputs
+- `uyabuild why` now explains whether planned targets are `local-hit`, `seeded-output`, `success-no-change`, or still `pending-execution`
 - `uyabuild build --jobs <n>` now schedules supported local actions in parallel, with `pool = "link" | "docker" | "network"` and other non-`cpu` pool names serialized one at a time
 - supported actions now honor `execution_mode = "pure" | "host" | "volatile"`: `pure` keeps undeclared workspace files out of the action root, `host` materializes the broader workspace for compatibility, and `volatile` always re-executes instead of reusing local cache decisions
 - supported actions now default to host networking off and require `allow_network = true` to opt back into the host network namespace

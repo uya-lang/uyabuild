@@ -10,6 +10,7 @@ Commands:
   build                 analyze, snapshot, and execute supported local actions
   query                 inspect the typed target graph
   plan                  emit the typed IR plus Phase 2 action graph
+  why                   explain why targets are clean or pending
   version               print the bootstrap version
   help                  show command help
 
@@ -25,3 +26,4 @@ Examples:
   uyabuild build //bootstrap:uyabuild
   uyabuild query //...
   uyabuild plan //app:hello --json
+  uyabuild why //app:hello
