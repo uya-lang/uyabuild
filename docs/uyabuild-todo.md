@@ -78,6 +78,11 @@
 
 ### 6.2 TODO
 
+当前状态（2026-05-26）：
+
+- `P1-8` 已完成：`bin/uyabuild` 的 Phase 1 分析现已支持 `glob()` 展开、`config "..."` 声明驱动的 `select()` 配置展开，以及 `build/query/plan --config <name[,name...]>` 共享入口。
+- 已补充配置矩阵样例仓与回归：`fixtures/workspaces/config-matrix/`、`plan-config-matrix-json`、`build-config-matrix`、`plan-unknown-config`，用于验证分支展开和错误诊断。
+
 | ID | 优先级 | 任务 | 依赖 | 验收标准 |
 |---|---|---|---|---|
 | `P1-1` | `P0` | 定义 `uya.build` 词法与语法规范 | `P0-3` | 文档化 grammar 初稿完成 |
@@ -87,7 +92,7 @@
 | `P1-5` | `P0` | 建立 schema 校验框架 | `P1-3` | 未知字段、类型错误在分析期失败 |
 | `P1-6` | `P0` | 定义 Typed IR 数据结构 | `P1-4`, `P1-5` | Parser 输出可稳定转换为 IR |
 | `P1-7` | `P1` | 实现单文件模式、分离模式与可选 `uya.toml` 兼容导入 | `P1-3`, `P1-6` | 根 `uya.build` 可独立工作，兼容模式下冲突字段可被检测 |
-| `P1-8` | `P1` | 实现 `glob()`、`select()`、配置展开 | `P1-6` | 样例仓的配置矩阵可展开 |
+| `P1-8` | `P1` | 已完成：实现 `glob()`、`select()`、配置展开 | `P1-6` | 样例仓的配置矩阵可展开 |
 | `P1-9` | `P1` | 定义 provider 机制和跨规则字段暴露 | `P1-6` | `cxx.library -> cxx.binary` provider 链可表达 |
 | `P1-10` | `P1` | 实现错误码和诊断分级 | `P1-5` | 诊断具备稳定 code 与建议文本 |
 | `P1-11` | `P1` | 输出 `uya plan --json` 的 IR 快照格式 | `P1-6` | IR 可序列化并用于回归测试 |

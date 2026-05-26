@@ -16,6 +16,7 @@ Commands:
 Global options:
   --workspace <path>    override workspace root discovery
   --state-dir <path>    override state directory (default: <workspace>/.uya-build)
+  --config <list>       activate config names for select() expansion
   --json                emit diagnostics as JSON
   -h, --help            show help
   --version             print version

@@ -78,6 +78,7 @@ const DT_REG: i32 = 8;
 struct Options {
     workspace_override: &byte,
     state_dir_override: &byte,
+    config_selector: &byte,
     output_mode: i32,
     jobs: i32,
 }
@@ -310,6 +311,7 @@ struct Phase1Context {
     files_tail: &SourceFile,
     uses_head: &RuleUse,
     uses_tail: &RuleUse,
+    active_configs: &StringNode,
     configs_head: &IRConfig,
     configs_tail: &IRConfig,
     targets_head: &IRTarget,
@@ -317,6 +319,7 @@ struct Phase1Context {
     toml_meta: TomlWorkspaceMeta,
     file_count: i32,
     use_count: i32,
+    active_config_count: i32,
     config_count: i32,
     target_count: i32,
     diagnostic: Diagnostic,
@@ -1157,6 +1160,7 @@ fn phase1_ctx_init(ctx: &Phase1Context, workspace_root: &byte, entrypoint_path: 
     ctx.files_tail = null;
     ctx.uses_head = null;
     ctx.uses_tail = null;
+    ctx.active_configs = null;
     ctx.configs_head = null;
     ctx.configs_tail = null;
     ctx.targets_head = null;
@@ -1180,6 +1184,7 @@ fn phase1_ctx_init(ctx: &Phase1Context, workspace_root: &byte, entrypoint_path: 
     };
     ctx.file_count = 0;
     ctx.use_count = 0;
+    ctx.active_config_count = 0;
     ctx.config_count = 0;
     ctx.target_count = 0;
     ctx.diagnostic = Diagnostic {
@@ -4060,6 +4065,364 @@ fn analyze_config_decl(ctx: &Phase1Context, decl: &AstDecl) i32 {
     return 0;
 }
 
+fn is_ascii_whitespace(ch: byte) i32 {
+    if ch == 32 as byte || ch == 9 as byte || ch == 10 as byte || ch == 13 as byte {
+        return 1;
+    }
+    return 0;
+}
+
+fn trim_slice_bounds(text: &byte,
+                     start: usize,
+                     end: usize,
+                     trimmed_start: &usize,
+                     trimmed_end: &usize) void {
+    var left: usize = start;
+    var right: usize = end;
+    while left < right && is_ascii_whitespace(text[left]) != 0 {
+        left = left + 1usize;
+    }
+    while right > left && is_ascii_whitespace(text[right - 1usize]) != 0 {
+        right = right - 1usize;
+    }
+    trimmed_start[0] = left;
+    trimmed_end[0] = right;
+}
+
+fn load_active_config_selection(ctx: &Phase1Context, selector: &byte) i32 {
+    if ctx == null || selector == null || selector[0] == 0 as byte {
+        return 0;
+    }
+    var start: usize = 0usize;
+    var pos: usize = 0usize;
+    while true {
+        const ch: byte = selector[pos];
+        if ch == 44 as byte || ch == 0 as byte {
+            var trimmed_start: usize = 0usize;
+            var trimmed_end: usize = 0usize;
+            trim_slice_bounds(selector, start, pos, &trimmed_start, &trimmed_end);
+            if trimmed_end <= trimmed_start {
+                return phase1_error(ctx,
+                                    "UYABUILD_E_CONFIG_SELECT" as &byte,
+                                    "empty config name in --config" as &byte,
+                                    "use --config name[,name...]" as &byte,
+                                    "command line" as &byte,
+                                    1,
+                                    1);
+            }
+            const name: &byte = arena_copy_range(&ctx.arena,
+                                                 selector,
+                                                 trimmed_start,
+                                                 trimmed_end - trimmed_start);
+            var inserted: i32 = 0;
+            ctx.active_configs = sorted_string_insert(ctx, ctx.active_configs, name, &inserted);
+            if inserted != 0 {
+                ctx.active_config_count = ctx.active_config_count + 1;
+            }
+            if ch == 0 as byte {
+                break;
+            }
+            start = pos + 1usize;
+        }
+        pos = pos + 1usize;
+    }
+    return 0;
+}
+
+fn find_config_by_name(ctx: &Phase1Context, name: &byte) &IRConfig {
+    var current: &IRConfig = ctx.configs_head;
+    while current != null {
+        if string_equals(current.name, name) != 0 {
+            return current;
+        }
+        current = current.next;
+    }
+    return null;
+}
+
+fn is_active_config_name(ctx: &Phase1Context, name: &byte) i32 {
+    var active: &StringNode = ctx.active_configs;
+    while active != null {
+        if string_equals(active.text, name) != 0 {
+            return 1;
+        }
+        active = active.next;
+    }
+    return 0;
+}
+
+fn validate_active_configs(ctx: &Phase1Context) i32 {
+    var active: &StringNode = ctx.active_configs;
+    while active != null {
+        if find_config_by_name(ctx, active.text) == null {
+            return phase1_error(ctx,
+                                "UYABUILD_E_CONFIG_SELECT" as &byte,
+                                "requested config is not declared" as &byte,
+                                active.text,
+                                "command line" as &byte,
+                                1,
+                                1);
+        }
+        active = active.next;
+    }
+    return 0;
+}
+
+fn is_default_select_key(key: &byte) i32 {
+    if key == null {
+        return 0;
+    }
+    if string_equals(key, "default" as &byte) != 0 ||
+        string_equals(key, "//conditions:default" as &byte) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn selector_specificity(ctx: &Phase1Context,
+                        owner_file: &byte,
+                        span: SourceSpan,
+                        selector: &byte,
+                        matched_out: &i32,
+                        specificity_out: &i32) i32 {
+    matched_out[0] = 0;
+    specificity_out[0] = 0;
+    if ctx == null || selector == null {
+        return 0;
+    }
+
+    var start: usize = 0usize;
+    var pos: usize = 0usize;
+    var all_active: i32 = 1;
+    var specificity: i32 = 0;
+    while true {
+        const ch: byte = selector[pos];
+        if ch == 44 as byte || ch == 0 as byte {
+            var trimmed_start: usize = 0usize;
+            var trimmed_end: usize = 0usize;
+            trim_slice_bounds(selector, start, pos, &trimmed_start, &trimmed_end);
+            if trimmed_end <= trimmed_start {
+                return phase1_error(ctx,
+                                    "UYABUILD_E_SELECT_BRANCH" as &byte,
+                                    "select() has an empty config selector" as &byte,
+                                    "use select({ \"debug\" = ..., \"debug,linux\" = ..., \"default\" = ... })" as &byte,
+                                    owner_file,
+                                    span.start.line,
+                                    span.start.column);
+            }
+            const name: &byte = arena_copy_range(&ctx.arena,
+                                                 selector,
+                                                 trimmed_start,
+                                                 trimmed_end - trimmed_start);
+            if find_config_by_name(ctx, name) == null {
+                return phase1_error(ctx,
+                                    "UYABUILD_E_SELECT_CONFIG" as &byte,
+                                    "select() references an unknown config" as &byte,
+                                    name,
+                                    owner_file,
+                                    span.start.line,
+                                    span.start.column);
+            }
+            specificity = specificity + 1;
+            if is_active_config_name(ctx, name) == 0 {
+                all_active = 0;
+            }
+            if ch == 0 as byte {
+                break;
+            }
+            start = pos + 1usize;
+        }
+        pos = pos + 1usize;
+    }
+    matched_out[0] = all_active;
+    specificity_out[0] = specificity;
+    return 0;
+}
+
+fn resolve_typed_value(ctx: &Phase1Context, owner_file: &byte, value: &TypedValue) &TypedValue {
+    if value == null {
+        return null;
+    }
+    if value.kind == TYPED_VALUE_CALL && string_equals(value.call_name, "select" as &byte) != 0 {
+        var best_value: &TypedValue = null;
+        var fallback_value: &TypedValue = null;
+        var best_specificity: i32 = -1;
+        var best_selector: &byte = null;
+        var arg: &TypedValueItem = value.arg_head;
+        while arg != null {
+            if arg.value == null || arg.value.kind != TYPED_VALUE_MAP {
+                phase1_error(ctx,
+                             "UYABUILD_E_SELECT_SHAPE" as &byte,
+                             "select() only accepts map branches" as &byte,
+                             "use select({ \"debug\" = ..., \"default\" = ... })" as &byte,
+                             owner_file,
+                             value.span.start.line,
+                             value.span.start.column);
+                return null;
+            }
+            var entry: &TypedMapEntry = arg.value.map_head;
+            while entry != null {
+                if is_default_select_key(entry.key) != 0 {
+                    if fallback_value != null {
+                        phase1_error(ctx,
+                                     "UYABUILD_E_SELECT_BRANCH" as &byte,
+                                     "select() has more than one default branch" as &byte,
+                                     entry.key,
+                                     owner_file,
+                                     value.span.start.line,
+                                     value.span.start.column);
+                        return null;
+                    }
+                    fallback_value = entry.value;
+                } else {
+                    var matched: i32 = 0;
+                    var specificity: i32 = 0;
+                    if selector_specificity(ctx,
+                                            owner_file,
+                                            value.span,
+                                            entry.key,
+                                            &matched,
+                                            &specificity) != 0 {
+                        return null;
+                    }
+                    if matched != 0 {
+                        if specificity > best_specificity {
+                            best_value = entry.value;
+                            best_specificity = specificity;
+                            best_selector = entry.key;
+                        } else if specificity == best_specificity {
+                            phase1_error(ctx,
+                                         "UYABUILD_E_SELECT_AMBIGUOUS" as &byte,
+                                         "select() matched more than one branch with the same specificity" as &byte,
+                                         best_selector,
+                                         owner_file,
+                                         value.span.start.line,
+                                         value.span.start.column);
+                            return null;
+                        }
+                    }
+                }
+                entry = entry.next;
+            }
+            arg = arg.next;
+        }
+
+        if best_value != null {
+            return resolve_typed_value(ctx, owner_file, best_value);
+        }
+        if fallback_value != null {
+            return resolve_typed_value(ctx, owner_file, fallback_value);
+        }
+        phase1_error(ctx,
+                     "UYABUILD_E_SELECT_UNMATCHED" as &byte,
+                     "select() did not match any active config" as &byte,
+                     "pass --config name[,name...] or add a default branch" as &byte,
+                     owner_file,
+                     value.span.start.line,
+                     value.span.start.column);
+        return null;
+    }
+    if value.kind == TYPED_VALUE_LIST {
+        const list_value: &TypedValue = typed_make_list(ctx, value.span);
+        if list_value == null {
+            return null;
+        }
+        var item: &TypedValueItem = value.list_head;
+        while item != null {
+            const resolved_item: &TypedValue = resolve_typed_value(ctx, owner_file, item.value);
+            if resolved_item == null {
+                return null;
+            }
+            if resolved_item.kind == TYPED_VALUE_LIST {
+                if typed_merge_list(ctx, list_value, resolved_item) != 0 {
+                    return null;
+                }
+            } else if typed_list_append_value(ctx, list_value, resolved_item) != 0 {
+                return null;
+            }
+            item = item.next;
+        }
+        return list_value;
+    }
+    if value.kind == TYPED_VALUE_MAP {
+        const map_value: &TypedValue = typed_make_map(ctx, value.span);
+        if map_value == null {
+            return null;
+        }
+        var entry_map: &TypedMapEntry = value.map_head;
+        while entry_map != null {
+            const resolved_entry: &TypedValue = resolve_typed_value(ctx, owner_file, entry_map.value);
+            if resolved_entry == null {
+                return null;
+            }
+            if typed_map_append_entry(ctx, map_value, entry_map.key, resolved_entry) != 0 {
+                return null;
+            }
+            entry_map = entry_map.next;
+        }
+        return map_value;
+    }
+    if value.kind == TYPED_VALUE_CALL {
+        const call_value: &TypedValue = typed_make_call(ctx, value.span, value.call_name);
+        if call_value == null {
+            return null;
+        }
+        var arg_call: &TypedValueItem = value.arg_head;
+        while arg_call != null {
+            const resolved_arg: &TypedValue = resolve_typed_value(ctx, owner_file, arg_call.value);
+            if resolved_arg == null {
+                return null;
+            }
+            if typed_call_append_arg(ctx, call_value, resolved_arg) != 0 {
+                return null;
+            }
+            arg_call = arg_call.next;
+        }
+        return call_value;
+    }
+    return value;
+}
+
+fn resolve_ir_field_values(ctx: &Phase1Context, owner_file: &byte, fields: &IRField) i32 {
+    var field: &IRField = fields;
+    while field != null {
+        const resolved: &TypedValue = resolve_typed_value(ctx, owner_file, field.value);
+        if resolved == null {
+            return -1;
+        }
+        field.value = resolved;
+        field = field.next;
+    }
+    return 0;
+}
+
+fn expand_configured_values(ctx: &Phase1Context) i32 {
+    if validate_active_configs(ctx) != 0 {
+        return -1;
+    }
+
+    if ctx.workspace_ir.defaults != null {
+        var workspace_file: &byte = "uya.build" as &byte;
+        if ctx.workspace_ir.source_file != null && ctx.workspace_ir.source_file.rel_path != null {
+            workspace_file = ctx.workspace_ir.source_file.rel_path;
+        }
+        const resolved_defaults: &TypedValue = resolve_typed_value(ctx, workspace_file, ctx.workspace_ir.defaults);
+        if resolved_defaults == null {
+            return -1;
+        }
+        ctx.workspace_ir.defaults = resolved_defaults;
+    }
+
+    var target: &IRTarget = ctx.targets_head;
+    while target != null {
+        if resolve_ir_field_values(ctx, target.file.rel_path, target.attrs) != 0 {
+            return -1;
+        }
+        target = target.next;
+    }
+    return 0;
+}
+
 fn label_package_part(ctx: &Phase1Context, canonical: &byte) &byte {
     _ = ctx;
     var i: usize = 2usize;
@@ -4582,6 +4945,10 @@ fn analyze_workspace(ctx: &Phase1Context) i32 {
     if ctx.workspace_ir.has_strict == 0 {
         ctx.workspace_ir.strict = 0;
         ctx.workspace_ir.has_strict = 1;
+    }
+
+    if expand_configured_values(ctx) != 0 {
+        return -1;
     }
 
     return validate_targets(ctx);
@@ -8515,6 +8882,9 @@ fn emit_build_text(ctx: &Phase1Context, phase2: &Phase2Context, matched: &String
 
 fn load_phase1_model(options: &Options, workspace: &Workspace, ctx: &Phase1Context) i32 {
     phase1_ctx_init(ctx, &workspace.root[0] as &byte, &workspace.entrypoint[0] as &byte);
+    if load_active_config_selection(ctx, options.config_selector) != 0 {
+        return emit_diagnostic(options.output_mode, &ctx.diagnostic);
+    }
     if load_workspace_files(ctx) != 0 {
         return emit_diagnostic(options.output_mode, &ctx.diagnostic);
     }
@@ -8543,6 +8913,7 @@ fn print_root_help() void {
     fputs("Global options:\n" as *byte, libc.stdout);
     fputs("  --workspace <path>    override workspace root discovery\n" as *byte, libc.stdout);
     fputs("  --state-dir <path>    override state directory (default: <workspace>/.uya-build)\n" as *byte, libc.stdout);
+    fputs("  --config <list>       activate config names for select() expansion\n" as *byte, libc.stdout);
     fputs("  --json                emit diagnostics as JSON\n" as *byte, libc.stdout);
     fputs("  -h, --help            show help\n" as *byte, libc.stdout);
     fputs("  --version             print version\n" as *byte, libc.stdout);
@@ -8562,6 +8933,7 @@ fn print_build_help() void {
     fputs("  -j, --jobs <n>        limit concurrent local actions (default: 4 or UYABUILD_JOBS)\n" as *byte, libc.stdout);
     fputs("  --workspace <path>    override workspace root discovery\n" as *byte, libc.stdout);
     fputs("  --state-dir <path>    override state directory\n" as *byte, libc.stdout);
+    fputs("  --config <list>       activate config names for select() expansion\n" as *byte, libc.stdout);
     fputs("  --json                emit diagnostics as JSON\n" as *byte, libc.stdout);
     fputs("  -h, --help            show build help\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
@@ -8582,6 +8954,7 @@ fn print_query_help() void {
     fputs("Options:\n" as *byte, libc.stdout);
     fputs("  --workspace <path>    override workspace root discovery\n" as *byte, libc.stdout);
     fputs("  --state-dir <path>    override state directory\n" as *byte, libc.stdout);
+    fputs("  --config <list>       activate config names for select() expansion\n" as *byte, libc.stdout);
     fputs("  --json                emit diagnostics as JSON\n" as *byte, libc.stdout);
     fputs("  -h, --help            show query help\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
@@ -8597,6 +8970,7 @@ fn print_plan_help() void {
     fputs("Options:\n" as *byte, libc.stdout);
     fputs("  --workspace <path>    override workspace root discovery\n" as *byte, libc.stdout);
     fputs("  --state-dir <path>    override state directory\n" as *byte, libc.stdout);
+    fputs("  --config <list>       activate config names for select() expansion\n" as *byte, libc.stdout);
     fputs("  --json                emit the typed IR and action graph as JSON\n" as *byte, libc.stdout);
     fputs("  -h, --help            show plan help\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
@@ -8937,6 +9311,13 @@ fn apply_shared_option(argument: &byte, next_argument: &byte, options: &Options)
         options.state_dir_override = next_argument;
         return 1;
     }
+    if string_equals(argument, "--config" as &byte) != 0 {
+        if options.config_selector != null {
+            return -1;
+        }
+        options.config_selector = next_argument;
+        return 1;
+    }
     return 0;
 }
 
@@ -8953,6 +9334,7 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
     var options: Options = Options {
         workspace_override: base_options.workspace_override,
         state_dir_override: base_options.state_dir_override,
+        config_selector: base_options.config_selector,
         output_mode: base_options.output_mode,
         jobs: base_options.jobs,
     };
@@ -9011,9 +9393,17 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
             }
 
             const next_argument: &byte = get_argv(index + 1);
-            if apply_shared_option(argument, next_argument, &options) != 0 {
+            const shared_status: i32 = apply_shared_option(argument, next_argument, &options);
+            if shared_status > 0 {
                 index = index + 2;
                 continue;
+            }
+            if shared_status < 0 {
+                return emit_error(options.output_mode,
+                                  EXIT_USAGE,
+                                  "UYABUILD_E_USAGE" as &byte,
+                                  "--config may only be passed once" as &byte,
+                                  "use --config name[,name...] to activate multiple configs" as &byte);
             }
 
             return emit_error(options.output_mode,
@@ -9088,6 +9478,7 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
         files_tail: null,
         uses_head: null,
         uses_tail: null,
+        active_configs: null,
         configs_head: null,
         configs_tail: null,
         targets_head: null,
@@ -9095,6 +9486,7 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
         toml_meta: TomlWorkspaceMeta { has_name: 0, has_default: 0, has_strict: 0, name: null, defaults: null, strict: 0 },
         file_count: 0,
         use_count: 0,
+        active_config_count: 0,
         config_count: 0,
         target_count: 0,
         diagnostic: Diagnostic { exit_code: EXIT_CONFIG, code: null, message: null, detail: null, file: null, line: 0, column: 0 },
@@ -9177,6 +9569,7 @@ fn run_query(start_index: i32, base_options: &Options) i32 {
     var options: Options = Options {
         workspace_override: base_options.workspace_override,
         state_dir_override: base_options.state_dir_override,
+        config_selector: base_options.config_selector,
         output_mode: base_options.output_mode,
         jobs: base_options.jobs,
     };
@@ -9213,9 +9606,17 @@ fn run_query(start_index: i32, base_options: &Options) i32 {
             }
 
             const next_argument: &byte = get_argv(index + 1);
-            if apply_shared_option(argument, next_argument, &options) != 0 {
+            const shared_status: i32 = apply_shared_option(argument, next_argument, &options);
+            if shared_status > 0 {
                 index = index + 2;
                 continue;
+            }
+            if shared_status < 0 {
+                return emit_error(options.output_mode,
+                                  EXIT_USAGE,
+                                  "UYABUILD_E_USAGE" as &byte,
+                                  "--config may only be passed once" as &byte,
+                                  "use --config name[,name...] to activate multiple configs" as &byte);
             }
 
             return emit_error(options.output_mode,
@@ -9298,6 +9699,7 @@ fn run_query(start_index: i32, base_options: &Options) i32 {
         files_tail: null,
         uses_head: null,
         uses_tail: null,
+        active_configs: null,
         configs_head: null,
         configs_tail: null,
         targets_head: null,
@@ -9305,6 +9707,7 @@ fn run_query(start_index: i32, base_options: &Options) i32 {
         toml_meta: TomlWorkspaceMeta { has_name: 0, has_default: 0, has_strict: 0, name: null, defaults: null, strict: 0 },
         file_count: 0,
         use_count: 0,
+        active_config_count: 0,
         config_count: 0,
         target_count: 0,
         diagnostic: Diagnostic { exit_code: EXIT_CONFIG, code: null, message: null, detail: null, file: null, line: 0, column: 0 },
@@ -9335,6 +9738,7 @@ fn run_plan(start_index: i32, base_options: &Options) i32 {
     var options: Options = Options {
         workspace_override: base_options.workspace_override,
         state_dir_override: base_options.state_dir_override,
+        config_selector: base_options.config_selector,
         output_mode: base_options.output_mode,
         jobs: base_options.jobs,
     };
@@ -9367,9 +9771,17 @@ fn run_plan(start_index: i32, base_options: &Options) i32 {
                                   argument);
             }
             const next_argument: &byte = get_argv(index + 1);
-            if apply_shared_option(argument, next_argument, &options) != 0 {
+            const shared_status: i32 = apply_shared_option(argument, next_argument, &options);
+            if shared_status > 0 {
                 index = index + 2;
                 continue;
+            }
+            if shared_status < 0 {
+                return emit_error(options.output_mode,
+                                  EXIT_USAGE,
+                                  "UYABUILD_E_USAGE" as &byte,
+                                  "--config may only be passed once" as &byte,
+                                  "use --config name[,name...] to activate multiple configs" as &byte);
             }
             return emit_error(options.output_mode,
                               EXIT_USAGE,
@@ -9432,6 +9844,7 @@ fn run_plan(start_index: i32, base_options: &Options) i32 {
         files_tail: null,
         uses_head: null,
         uses_tail: null,
+        active_configs: null,
         configs_head: null,
         configs_tail: null,
         targets_head: null,
@@ -9439,6 +9852,7 @@ fn run_plan(start_index: i32, base_options: &Options) i32 {
         toml_meta: TomlWorkspaceMeta { has_name: 0, has_default: 0, has_strict: 0, name: null, defaults: null, strict: 0 },
         file_count: 0,
         use_count: 0,
+        active_config_count: 0,
         config_count: 0,
         target_count: 0,
         diagnostic: Diagnostic { exit_code: EXIT_CONFIG, code: null, message: null, detail: null, file: null, line: 0, column: 0 },
@@ -9510,6 +9924,7 @@ export fn main() i32 {
     var options: Options = Options {
         workspace_override: null,
         state_dir_override: null,
+        config_selector: null,
         output_mode: OUTPUT_TEXT,
         jobs: default_parallel_jobs(),
     };
@@ -9551,9 +9966,17 @@ export fn main() i32 {
             }
 
             const next_argument: &byte = get_argv(command_index + 1);
-            if apply_shared_option(argument, next_argument, &options) != 0 {
+            const shared_status: i32 = apply_shared_option(argument, next_argument, &options);
+            if shared_status > 0 {
                 command_index = command_index + 2;
                 continue;
+            }
+            if shared_status < 0 {
+                return emit_error(options.output_mode,
+                                  EXIT_USAGE,
+                                  "UYABUILD_E_USAGE" as &byte,
+                                  "--config may only be passed once" as &byte,
+                                  "use --config name[,name...] to activate multiple configs" as &byte);
             }
 
             return emit_error(options.output_mode,

@@ -1,0 +1,4 @@
+build
+--config
+debug,linux
+//app:emit

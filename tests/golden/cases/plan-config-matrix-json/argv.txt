@@ -1,0 +1,5 @@
+plan
+--config
+debug,linux
+--json
+//app:emit

@@ -1,0 +1,36 @@
+workspace {
+  name = "config-matrix"
+  default = ["//app:emit"]
+  strict = true
+}
+
+config "debug" {}
+config "release" {}
+config "linux" {}
+
+use legacy
+
+legacy.shell "//app:emit" {
+  script = select({
+    "debug,linux" = [
+      "sh",
+      "-c",
+      "mkdir -p out && printf 'debug-linux\\n' > out/debug-linux.txt",
+    ],
+    "release" = [
+      "sh",
+      "-c",
+      "mkdir -p out && printf 'release\\n' > out/release.txt",
+    ],
+    "default" = [
+      "sh",
+      "-c",
+      "mkdir -p out && printf 'default\\n' > out/default.txt",
+    ],
+  })
+  outputs = select({
+    "debug,linux" = ["out/debug-linux.txt"],
+    "release" = ["out/release.txt"],
+    "default" = ["out/default.txt"],
+  })
+}

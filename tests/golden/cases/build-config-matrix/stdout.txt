@@ -1,0 +1,11 @@
+workspace: config-matrix
+phase: 3
+matched_targets: 1
+planned_actions: 1
+cache_hits: 0
+seeded_outputs: 0
+success_no_change: 0
+pending_execution: 0
+root_digest: d5e71371afcbe7d822c8deccdefba2aa9eb4218a2a4aad100b0211e3a684d9ba
+matched:
+  //app:emit

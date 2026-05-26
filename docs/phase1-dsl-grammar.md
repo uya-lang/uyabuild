@@ -13,7 +13,7 @@ Phase 1 covers:
 - target declarations such as `cxx.library "//pkg:name" {}`
 - string, bool, list, map, identifier, and call expressions
 - `glob(...)` expansion for string-list fields
-- `select(...)` preservation in typed IR
+- `select(...)` resolution through named configs
 
 ## Lexical Rules
 
@@ -69,6 +69,13 @@ bool            = "true" | "false" ;
   - `strict`
 - If a `uya.toml` workspace key overlaps with `uya.build`, the values must match.
 
+## Config Selection
+
+- `uyabuild build|plan|query --config debug,linux` activates a set of named `config "..." {}` declarations.
+- `select({ "debug" = ..., "debug,linux" = ..., "default" = ... })` picks the most specific matching branch.
+- `default` and `//conditions:default` are accepted fallback branch keys.
+- Every config name referenced in `--config` or in a `select()` branch key must be declared.
+
 ## Label Rules
 
 Supported label forms:
@@ -113,7 +120,7 @@ Notable field typing:
 - loaded files
 - imported rule packs
 - configs
-- normalized targets
+- normalized targets after config expansion
 - provider metadata
 - typed attrs
 
