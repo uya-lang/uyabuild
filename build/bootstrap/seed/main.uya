@@ -66,6 +66,7 @@ const MAX_STRING_BUILD: usize = 8192usize;
 const DIGEST_BYTES: usize = 32usize;
 const DIGEST_HEX_BYTES: usize = 64usize;
 const MAX_DIGEST_MANIFEST: usize = 65536usize;
+const EMPTY_BLAKE3_HEX: &byte = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262" as &byte;
 const SNAPSHOT_FILE: i32 = 1;
 const SNAPSHOT_DIR: i32 = 2;
 const VISIT_STATE_VISITING: i32 = 1;
@@ -5659,12 +5660,41 @@ fn string_node_matches_path(head: &StringNode, observed_path: &byte) i32 {
     return 0;
 }
 
+fn action_is_cxx_kind(action: &PlannedAction) i32 {
+    if action == null || action.kind == null {
+        return 0;
+    }
+    if string_has_prefix(action.kind, "cxx." as &byte) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn action_cxx_temp_path_allowed(action: &PlannedAction, observed_path: &byte) i32 {
+    if action == null || observed_path == null || action_is_cxx_kind(action) == 0 {
+        return 0;
+    }
+    var output: &StringNode = action.output_head;
+    while output != null {
+        var parent_path: [byte: PATH_MAX] = [];
+        if path_dirname_text(output.text, &parent_path[0] as &byte, PATH_MAX) == 0 &&
+            parent_path[0] != 0 as byte &&
+            string_equals(&parent_path[0] as &byte, "." as &byte) == 0 &&
+            path_text_matches_or_contains(&parent_path[0] as &byte, observed_path) != 0 {
+            return 1;
+        }
+        output = output.next;
+    }
+    return 0;
+}
+
 fn action_read_path_allowed(ctx: &Phase2Context, action: &PlannedAction, observed_path: &byte) i32 {
     if ctx == null || action == null || observed_path == null {
         return 0;
     }
     if string_node_matches_path(action.input_head, observed_path) != 0 ||
-        string_node_matches_path(action.output_head, observed_path) != 0 {
+        string_node_matches_path(action.output_head, observed_path) != 0 ||
+        action_cxx_temp_path_allowed(action, observed_path) != 0 {
         return 1;
     }
     var dep: &StringNode = action.dep_head;
@@ -5682,7 +5712,13 @@ fn action_write_path_allowed(action: &PlannedAction, observed_path: &byte) i32 {
     if action == null || observed_path == null {
         return 0;
     }
-    return string_node_matches_path(action.output_head, observed_path);
+    if string_node_matches_path(action.output_head, observed_path) != 0 {
+        return 1;
+    }
+    if action_cxx_temp_path_allowed(action, observed_path) != 0 {
+        return 1;
+    }
+    return 0;
 }
 
 fn refresh_single_action_dependency_findings(ctx: &Phase2Context, action: &PlannedAction) void {
@@ -6057,11 +6093,271 @@ fn shell_append_quoted(buffer: &byte, used: &usize, cap: usize, text: &byte) i32
     return append_buffer_byte(buffer, used, cap, 39 as byte);
 }
 
+fn shell_append_spaced_quoted(buffer: &byte,
+                              used: &usize,
+                              cap: usize,
+                              first: &i32,
+                              text: &byte) i32 {
+    if buffer == null || used == null || first == null {
+        return -1;
+    }
+    if first[0] == 0 && append_buffer_byte(buffer, used, cap, 32 as byte) != 0 {
+        return -1;
+    }
+    if shell_append_quoted(buffer, used, cap, text) != 0 {
+        return -1;
+    }
+    first[0] = 0;
+    return 0;
+}
+
+fn cxx_target_output_path(ctx: &Phase1Context,
+                          target: &IRTarget,
+                          out: &byte,
+                          out_cap: usize) i32 {
+    if ctx == null || target == null || out == null {
+        return -1;
+    }
+    if string_equals(target.kind, "cxx.binary" as &byte) != 0 {
+        const out_field: &IRField = find_ir_field(target.attrs, "out" as &byte);
+        if out_field != null && out_field.value != null && out_field.value.text != null {
+            var rel_out: [byte: PATH_MAX] = [];
+            var abs_out: [byte: PATH_MAX] = [];
+            if resolve_target_path(ctx, target, out_field.value.text, &rel_out[0] as &byte, &abs_out[0] as &byte) != 0 {
+                return -1;
+            }
+            return copy_string(out, out_cap, &rel_out[0] as &byte);
+        }
+        var raw_binary: [byte: PATH_MAX] = [];
+        if target.package_path != null && target.package_path[0] != 0 as byte {
+            _ = snprintf(&raw_binary[0] as *byte,
+                         PATH_MAX,
+                         "out/%s/%s" as *byte,
+                         target.package_path as *byte,
+                         target.name as *byte);
+        } else {
+            _ = snprintf(&raw_binary[0] as *byte,
+                         PATH_MAX,
+                         "out/%s" as *byte,
+                         target.name as *byte);
+        }
+        var binary_rel: [byte: PATH_MAX] = [];
+        var binary_abs: [byte: PATH_MAX] = [];
+        if resolve_target_path(ctx, target, &raw_binary[0] as &byte, &binary_rel[0] as &byte, &binary_abs[0] as &byte) != 0 {
+            return -1;
+        }
+        return copy_string(out, out_cap, &binary_rel[0] as &byte);
+    }
+    if string_equals(target.kind, "cxx.library" as &byte) != 0 {
+        var raw_library: [byte: PATH_MAX] = [];
+        if target.package_path != null && target.package_path[0] != 0 as byte {
+            _ = snprintf(&raw_library[0] as *byte,
+                         PATH_MAX,
+                         "out/%s/%s.a" as *byte,
+                         target.package_path as *byte,
+                         target.name as *byte);
+        } else {
+            _ = snprintf(&raw_library[0] as *byte,
+                         PATH_MAX,
+                         "out/%s.a" as *byte,
+                         target.name as *byte);
+        }
+        var library_rel: [byte: PATH_MAX] = [];
+        var library_abs: [byte: PATH_MAX] = [];
+        if resolve_target_path(ctx, target, &raw_library[0] as &byte, &library_rel[0] as &byte, &library_abs[0] as &byte) != 0 {
+            return -1;
+        }
+        return copy_string(out, out_cap, &library_rel[0] as &byte);
+    }
+    return -1;
+}
+
+fn cxx_compiler_path() &byte {
+    if path_is_file("/usr/bin/c++" as &byte) != 0 {
+        return "/usr/bin/c++" as &byte;
+    }
+    if path_is_file("/bin/c++" as &byte) != 0 {
+        return "/bin/c++" as &byte;
+    }
+    return "c++" as &byte;
+}
+
+fn mkdir_tool_path() &byte {
+    if path_is_file("/usr/bin/mkdir" as &byte) != 0 {
+        return "/usr/bin/mkdir" as &byte;
+    }
+    if path_is_file("/bin/mkdir" as &byte) != 0 {
+        return "/bin/mkdir" as &byte;
+    }
+    return "mkdir" as &byte;
+}
+
+fn cxx_tool_path_env() &byte {
+    return "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" as &byte;
+}
+
+fn cxx_compiler_path_env() &byte {
+    return "/usr/bin:/bin:/usr/local/bin:/usr/sbin:/sbin" as &byte;
+}
+
+fn build_cxx_library_shell_command(ctx: &Phase1Context,
+                                   action: &PlannedAction,
+                                   stdout_path: &byte,
+                                   stderr_path: &byte) &byte {
+    if ctx == null || action == null || action.owner == null || action.output_head == null {
+        return null;
+    }
+    var output_parent: [byte: PATH_MAX] = [];
+    if path_dirname_text(action.output_head.text, &output_parent[0] as &byte, PATH_MAX) != 0 {
+        return null;
+    }
+    var buffer: [byte: MAX_STRING_BUILD] = [];
+    var used: usize = 0usize;
+    if append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, "export PATH=" as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, cxx_tool_path_env()) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " COMPILER_PATH=" as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, cxx_compiler_path_env()) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " TMPDIR=" as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &output_parent[0] as &byte) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " TMP=" as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &output_parent[0] as &byte) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " TEMP=" as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &output_parent[0] as &byte) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " && " as &byte) != 0 {
+        return null;
+    }
+
+    var first: i32 = 1;
+    if shell_append_spaced_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first, cxx_compiler_path()) != 0 ||
+        shell_append_spaced_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first, "-std=c++17" as &byte) != 0 ||
+        shell_append_spaced_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first, "-r" as &byte) != 0 ||
+        shell_append_spaced_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first, "-o" as &byte) != 0 ||
+        shell_append_spaced_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first, action.output_head.text) != 0 {
+        return null;
+    }
+
+    const srcs_field: &IRField = find_ir_field(action.owner.attrs, "srcs" as &byte);
+    if srcs_field == null || srcs_field.value == null {
+        return null;
+    }
+    var srcs: &StringNode = collect_typed_strings_sorted(ctx, srcs_field.value, null);
+    while srcs != null {
+        var rel_src: [byte: PATH_MAX] = [];
+        var abs_src: [byte: PATH_MAX] = [];
+        if resolve_target_path(ctx, action.owner, srcs.text, &rel_src[0] as &byte, &abs_src[0] as &byte) != 0 ||
+            shell_append_spaced_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first, &rel_src[0] as &byte) != 0 {
+            return null;
+        }
+        srcs = srcs.next;
+    }
+
+    if stdout_path != null {
+        if append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " > " as &byte) != 0 ||
+            shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, stdout_path) != 0 {
+            return null;
+        }
+    }
+    if stderr_path != null {
+        if append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " 2> " as &byte) != 0 ||
+            shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, stderr_path) != 0 {
+            return null;
+        }
+    }
+    return arena_copy_cstr(&ctx.arena, &buffer[0] as &byte);
+}
+
+fn build_cxx_binary_shell_command(ctx: &Phase1Context,
+                                  action: &PlannedAction,
+                                  stdout_path: &byte,
+                                  stderr_path: &byte) &byte {
+    if ctx == null || action == null || action.owner == null || action.output_head == null {
+        return null;
+    }
+    var output_parent: [byte: PATH_MAX] = [];
+    if path_dirname_text(action.output_head.text, &output_parent[0] as &byte, PATH_MAX) != 0 {
+        return null;
+    }
+    var buffer: [byte: MAX_STRING_BUILD] = [];
+    var used: usize = 0usize;
+    if append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, "export PATH=" as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, cxx_tool_path_env()) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " COMPILER_PATH=" as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, cxx_compiler_path_env()) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " TMPDIR=" as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &output_parent[0] as &byte) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " TMP=" as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &output_parent[0] as &byte) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " TEMP=" as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &output_parent[0] as &byte) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " && " as &byte) != 0 {
+        return null;
+    }
+
+    var first: i32 = 1;
+    if shell_append_spaced_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first, cxx_compiler_path()) != 0 ||
+        shell_append_spaced_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first, "-std=c++17" as &byte) != 0 ||
+        shell_append_spaced_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first, "-o" as &byte) != 0 ||
+        shell_append_spaced_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first, action.output_head.text) != 0 {
+        return null;
+    }
+
+    const srcs_field: &IRField = find_ir_field(action.owner.attrs, "srcs" as &byte);
+    if srcs_field == null || srcs_field.value == null {
+        return null;
+    }
+    var srcs: &StringNode = collect_typed_strings_sorted(ctx, srcs_field.value, null);
+    while srcs != null {
+        var rel_src: [byte: PATH_MAX] = [];
+        var abs_src: [byte: PATH_MAX] = [];
+        if resolve_target_path(ctx, action.owner, srcs.text, &rel_src[0] as &byte, &abs_src[0] as &byte) != 0 ||
+            shell_append_spaced_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first, &rel_src[0] as &byte) != 0 {
+            return null;
+        }
+        srcs = srcs.next;
+    }
+
+    var dep: &StringNode = action.dep_head;
+    while dep != null {
+        const dep_target: &IRTarget = find_target_by_label(ctx, dep.text);
+        if dep_target != null && string_equals(dep_target.kind, "cxx.library" as &byte) != 0 {
+            var dep_output: [byte: PATH_MAX] = [];
+            if cxx_target_output_path(ctx, dep_target, &dep_output[0] as &byte, PATH_MAX) != 0 ||
+                shell_append_spaced_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first, &dep_output[0] as &byte) != 0 {
+                return null;
+            }
+        }
+        dep = dep.next;
+    }
+
+    if stdout_path != null {
+        if append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " > " as &byte) != 0 ||
+            shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, stdout_path) != 0 {
+            return null;
+        }
+    }
+    if stderr_path != null {
+        if append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " 2> " as &byte) != 0 ||
+            shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, stderr_path) != 0 {
+            return null;
+        }
+    }
+    return arena_copy_cstr(&ctx.arena, &buffer[0] as &byte);
+}
+
 fn build_action_shell_command(ctx: &Phase1Context,
                               action: &PlannedAction,
                               stdout_path: &byte,
                               stderr_path: &byte) &byte {
-    if ctx == null || action == null || action.command_head == null {
+    if ctx == null || action == null {
+        return null;
+    }
+    if string_equals(action.kind, "cxx.library" as &byte) != 0 {
+        return build_cxx_library_shell_command(ctx, action, stdout_path, stderr_path);
+    }
+    if string_equals(action.kind, "cxx.binary" as &byte) != 0 {
+        return build_cxx_binary_shell_command(ctx, action, stdout_path, stderr_path);
+    }
+    if action.command_head == null {
         return null;
     }
     var buffer: [byte: MAX_STRING_BUILD] = [];
@@ -6375,7 +6671,8 @@ fn record_traced_action_path(ctx: &Phase2Context,
                              action: &PlannedAction,
                              action_root: &byte,
                              raw_path: &byte,
-                             is_write: i32) void {
+                             is_write: i32,
+                             missing_probe: i32) void {
     if ctx == null || action == null || action_root == null || raw_path == null {
         return;
     }
@@ -6388,6 +6685,20 @@ fn record_traced_action_path(ctx: &Phase2Context,
                                                                 PATH_MAX);
     if normalized_status != 0 {
         return;
+    }
+    if missing_probe != 0 {
+        if is_write != 0 {
+            return;
+        }
+        var workspace_abs: [byte: PATH_MAX] = [];
+        if join_and_normalize_path(ctx.phase1.workspace_root,
+                                   &normalized_path[0] as &byte,
+                                   &workspace_abs[0] as &byte,
+                                   PATH_MAX) != 0 ||
+            path_is_file(&workspace_abs[0] as &byte) == 0 &&
+            path_is_dir(&workspace_abs[0] as &byte) == 0 {
+            return;
+        }
     }
     if is_write != 0 {
         action_track_write(ctx.phase1, action, &normalized_path[0] as &byte);
@@ -6403,6 +6714,7 @@ fn process_dependency_trace_line(ctx: &Phase2Context,
     if ctx == null || action == null || action_root == null || line == null {
         return;
     }
+    const missing_probe: i32 = string_contains_text(line, "= -1 ENOENT" as &byte) != 0;
 
     if string_has_prefix(line, "open(" as &byte) != 0 ||
         string_has_prefix(line, "openat(" as &byte) != 0 {
@@ -6415,7 +6727,7 @@ fn process_dependency_trace_line(ctx: &Phase2Context,
             string_contains_text(line, "O_APPEND" as &byte) != 0 {
             is_write = 1;
         }
-        record_traced_action_path(ctx, action, action_root, path_arg, is_write);
+        record_traced_action_path(ctx, action, action_root, path_arg, is_write, missing_probe);
         return;
     }
 
@@ -6425,7 +6737,7 @@ fn process_dependency_trace_line(ctx: &Phase2Context,
         string_has_prefix(line, "truncate(" as &byte) != 0 ||
         string_has_prefix(line, "unlink(" as &byte) != 0 ||
         string_has_prefix(line, "unlinkat(" as &byte) != 0 {
-        record_traced_action_path(ctx, action, action_root, trace_extract_quoted_arg(ctx, line, 0), 1);
+        record_traced_action_path(ctx, action, action_root, trace_extract_quoted_arg(ctx, line, 0), 1, missing_probe);
         return;
     }
 
@@ -6436,7 +6748,7 @@ fn process_dependency_trace_line(ctx: &Phase2Context,
         string_has_prefix(line, "linkat(" as &byte) != 0 ||
         string_has_prefix(line, "symlink(" as &byte) != 0 ||
         string_has_prefix(line, "symlinkat(" as &byte) != 0 {
-        record_traced_action_path(ctx, action, action_root, trace_extract_quoted_arg(ctx, line, 1), 1);
+        record_traced_action_path(ctx, action, action_root, trace_extract_quoted_arg(ctx, line, 1), 1, missing_probe);
         return;
     }
 
@@ -6449,7 +6761,7 @@ fn process_dependency_trace_line(ctx: &Phase2Context,
         string_has_prefix(line, "statx(" as &byte) != 0 ||
         string_has_prefix(line, "lstat(" as &byte) != 0 ||
         string_has_prefix(line, "chdir(" as &byte) != 0 {
-        record_traced_action_path(ctx, action, action_root, trace_extract_quoted_arg(ctx, line, 0), 0);
+        record_traced_action_path(ctx, action, action_root, trace_extract_quoted_arg(ctx, line, 0), 0, missing_probe);
         return;
     }
 }
@@ -6616,6 +6928,24 @@ fn materialize_action_workspace(ctx: &Phase2Context, action: &PlannedAction, act
     return 0;
 }
 
+fn prepare_action_output_dirs(action_root: &byte, action: &PlannedAction) i32 {
+    if action_root == null || action == null {
+        return -1;
+    }
+    var output: &StringNode = action.output_head;
+    while output != null {
+        var staged_abs: [byte: PATH_MAX] = [];
+        var parent_abs: [byte: PATH_MAX] = [];
+        if join_path(action_root, output.text, &staged_abs[0] as &byte, PATH_MAX) != 0 ||
+            path_dirname_text(&staged_abs[0] as &byte, &parent_abs[0] as &byte, PATH_MAX) != 0 ||
+            ensure_dir_recursive(&parent_abs[0] as &byte) != 0 {
+            return -1;
+        }
+        output = output.next;
+    }
+    return 0;
+}
+
 fn append_env_name(names: [&byte: MAX_ARGS], count: &i32, name: &byte) i32 {
     if count == null || name == null || name[0] == 0 as byte {
         return -1;
@@ -6733,6 +7063,33 @@ fn read_process_env_value(ctx: &Phase1Context, name: &byte) &byte {
     return read_proc_environ_value(ctx, name);
 }
 
+fn env_name_is_temp_dir(name: &byte) i32 {
+    if name == null {
+        return 0;
+    }
+    if string_equals(name, "TMPDIR" as &byte) != 0 ||
+        string_equals(name, "TMP" as &byte) != 0 ||
+        string_equals(name, "TEMP" as &byte) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn cxx_action_temp_root(action: &PlannedAction, out: &byte, out_cap: usize) i32 {
+    if action == null || out == null {
+        return -1;
+    }
+    if action_is_cxx_kind(action) == 0 || action.output_head == null || action.output_head.text == null {
+        return 1;
+    }
+    if path_dirname_text(action.output_head.text, out, out_cap) != 0 ||
+        out[0] == 0 as byte ||
+        string_equals(out, "." as &byte) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
 fn build_action_exec_env(ctx: &Phase2Context,
                          action: &PlannedAction,
                          action_root: &byte,
@@ -6775,13 +7132,18 @@ fn build_action_exec_env(ctx: &Phase2Context,
         }
     }
 
+    var temp_root: [byte: PATH_MAX] = [];
+    const has_cxx_temp_root: i32 = cxx_action_temp_root(action, &temp_root[0] as &byte, PATH_MAX) == 0;
     var i: i32 = 0;
     while i < name_count {
         const name_index: usize = i32_to_usize_checked(i);
         if name_index >= MAX_ARGS as usize {
             return -1;
         }
-        const current_value: &byte = read_process_env_value(ctx.phase1, names[name_index]);
+        var current_value: &byte = read_process_env_value(ctx.phase1, names[name_index]);
+        if has_cxx_temp_root != 0 && env_name_is_temp_dir(names[name_index]) != 0 {
+            current_value = &temp_root[0] as &byte;
+        }
         if current_value != null && append_env_entry(ctx.phase1, env_out, env_count, names[name_index], current_value) != 0 {
             return -1;
         }
@@ -6847,7 +7209,10 @@ fn action_supports_local_executor(ctx: &Phase2Context, action: &PlannedAction) i
         return 0;
     }
     const rule_kind: &RuleKindDef = find_rule_kind_def(ctx.phase1, action.kind);
-    if rule_kind != null && rule_kind.planner_kind == RULE_PLANNER_COMMAND {
+    if rule_kind != null &&
+        (rule_kind.planner_kind == RULE_PLANNER_COMMAND ||
+         rule_kind.planner_kind == RULE_PLANNER_CXX_LIBRARY ||
+         rule_kind.planner_kind == RULE_PLANNER_CXX_BINARY) {
         return 1;
     }
     return 0;
@@ -6919,7 +7284,8 @@ fn start_local_action(ctx: &Phase2Context, action: &PlannedAction) i32 {
         }
     }
     if ensure_dir_recursive(&action_root[0] as &byte) != 0 ||
-        materialize_action_workspace(ctx, action, &action_root[0] as &byte) != 0 {
+        materialize_action_workspace(ctx, action, &action_root[0] as &byte) != 0 ||
+        prepare_action_output_dirs(&action_root[0] as &byte, action) != 0 {
         return fail_pending_action(ctx,
                                    action,
                                    127,
@@ -7337,6 +7703,16 @@ fn persist_action_log_digest(ctx: &Phase2Context, abs_path: &byte) &byte {
     if ctx == null || abs_path == null {
         return null;
     }
+    var st: Stat = zero_stat();
+    if stat(abs_path as &const byte, &st) != 0 {
+        return null;
+    }
+    if st.st_size == 0 {
+        if action_store_log_blob(ctx, EMPTY_BLAKE3_HEX, "" as &byte, 0usize) != 0 {
+            return null;
+        }
+        return EMPTY_BLAKE3_HEX;
+    }
     var size_out: usize = 0usize;
     const content: &byte = read_file_into_arena(ctx.phase1, abs_path, &size_out);
     if content == null {
@@ -7662,6 +8038,30 @@ fn action_add_placeholder_output(ctx: &Phase1Context, action: &PlannedAction, ta
     return action_add_output_path(ctx, action, target, &raw[0] as &byte);
 }
 
+fn add_cxx_dependency_inputs(ctx: &Phase2Context, action: &PlannedAction) i32 {
+    if ctx == null || action == null {
+        return -1;
+    }
+    var dep: &StringNode = action.dep_head;
+    while dep != null {
+        const dep_target: &IRTarget = find_target_by_label(ctx.phase1, dep.text);
+        if dep_target != null && string_equals(dep_target.kind, "cxx.library" as &byte) != 0 {
+            const hdrs_field: &IRField = find_ir_field(dep_target.attrs, "hdrs" as &byte);
+            if hdrs_field != null && hdrs_field.value != null {
+                var hdrs: &StringNode = collect_typed_strings_sorted(ctx.phase1, hdrs_field.value, null);
+                while hdrs != null {
+                    if action_add_input_spec(ctx, action, dep_target, hdrs.text) != 0 {
+                        return -1;
+                    }
+                    hdrs = hdrs.next;
+                }
+            }
+        }
+        dep = dep.next;
+    }
+    return 0;
+}
+
 fn populate_command_action(ctx: &Phase2Context,
                            action: &PlannedAction,
                            target: &IRTarget,
@@ -7755,6 +8155,9 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
             }
             inputs = inputs.next;
         }
+        if add_cxx_dependency_inputs(ctx, action) != 0 {
+            return -1;
+        }
         return action_add_placeholder_output(ctx.phase1, action, target, ".a" as &byte);
     }
 
@@ -7770,6 +8173,9 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
                 }
                 inputs = inputs.next;
             }
+        }
+        if add_cxx_dependency_inputs(ctx, action) != 0 {
+            return -1;
         }
         const out_field: &IRField = find_ir_field(target.attrs, "out" as &byte);
         if out_field != null && out_field.value != null && out_field.value.text != null {

@@ -155,7 +155,7 @@
 - `uyabuild build --jobs <n>` 现已启用并行调度：`cpu` 池使用作业并发上限，`link` / `docker` / `network` 和其他非 `cpu` 池按池名串行化，`plan --json` / 动作元数据也会显式记录 `pool`。
 - Linux 本地执行现已默认关闭宿主网络；只有显式声明 `allow_network = true` 的动作才会跳过 `unshare -Urn` 隔离并使用宿主网络。
 - ActionRecord 现已同时写入 `meta/actions/` 与 `.uya-build/cas/action-records/`：`meta/actions/<action-key>` 保留最新快照，`meta/actions/<run-id>-<action-key>` 保留历史记录，索引会指向历史 doc 以支持后续查询。
-- 当前仍受限于兼容执行路径：`cxx` / `node` / `oci` 等动作尚未接入本地执行器，命中待执行动作时会返回 `UYABUILD_E_EXECUTOR_UNSUPPORTED`；macOS 依赖追踪后端仍待后续收口。
+- `cxx.library` / `cxx.binary` 现已接入最小本地执行路径：执行器会预创建声明输出父目录，`/usr/bin/c++` 在 `pure` 模式下复用宿主工具链完成编译/链接，并允许声明输出目录内的瞬时编译中间文件通过严格模式校验；`node` / `oci` 动作和 macOS 依赖追踪后端仍待后续收口。
 
 | ID | 优先级 | 任务 | 依赖 | 验收标准 |
 |---|---|---|---|---|
@@ -190,13 +190,14 @@
 
 - `P4-1` 已完成：`bin/uyabuild` 现已通过统一的 Rule Pack / Rule Kind 注册表声明 schema、provider、planner、scanner 元数据；`legacy.shell`、`task`、`cxx.*`、`node.*`、`oci.image` 都改为经由注册表接线，后续新增规则包无需再把映射散落进多处条件分支。
 - `P4-2` 已完成：`legacy.shell` 规则已具备 schema 校验、planner 接线、本地执行、输入输出声明、严格模式依赖追踪和错误诊断；相关 unit、golden、e2e 回归已稳定覆盖。
-- 现有回归已覆盖注册表接线后的四类内建规则：unit、golden、e2e 全量通过；`legacy.shell` 仍是当前唯一接入本地执行器的规则，`cxx` / `node` / `oci` 的执行后端继续留在后续条目推进。
+- `P4-3` 已完成：`cxx.library` / `cxx.binary` 现已可在 `pure` 本地执行器里完成最小 C++ 构建闭环；`cxx-minimal` 样例仓已可通过 `uyabuild build //app:hello` 产出并运行 `out/bin/hello`，`custom-state-dir`、e2e 和全量回归已覆盖该路径。
+- 现有回归已覆盖注册表接线后的四类内建规则：`legacy.shell` 与最小 `cxx` 执行路径已接入本地执行器，`node` / `oci` 的执行后端继续留在后续条目推进。
 
 | ID | 优先级 | 任务 | 依赖 | 验收标准 |
 |---|---|---|---|---|
 | `P4-1` | `P0` | 已完成：定义 Rule Pack 接口：schema/provider/planner/scanner | `P1-6`, `P2-6` | 新规则包可通过统一接口注册 |
 | `P4-2` | `P0` | 已完成：实现 `legacy.shell` 规则 | `P4-1`, `P3-9` | 可包装 shell 脚本并追踪输入输出 |
-| `P4-3` | `P0` | 实现 `cxx.library` / `cxx.binary` schema 与 planner | `P4-1` | 最小 C++ 项目可构建 |
+| `P4-3` | `P0` | 已完成：实现 `cxx.library` / `cxx.binary` schema 与 planner | `P4-1` | 最小 C++ 项目可构建 |
 | `P4-4` | `P0` | 接入头文件 depfile 或 include 扫描 | `P4-3`, `P3-7` | 修改头文件会触发正确增量重建 |
 | `P4-5` | `P1` | 实现 `cxx.test` 规则 | `P4-3` | `uya test` 可执行 C/C++ 测试 |
 | `P4-6` | `P0` | 实现 `node.workspace` / `node.app` 规则 | `P4-1` | Node workspace 项目可安装与构建 |

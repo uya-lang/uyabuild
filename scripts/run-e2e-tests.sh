@@ -43,6 +43,27 @@ assert_file_contains() {
   fi
 }
 
+assert_file_exists() {
+  file_path=$1
+  case_name=$2
+
+  if [ ! -f "$file_path" ]; then
+    echo "FAIL $case_name: expected file $file_path" >&2
+    exit 1
+  fi
+}
+
+assert_executable_runs() {
+  file_path=$1
+  case_name=$2
+
+  if [ ! -x "$file_path" ]; then
+    echo "FAIL $case_name: expected executable $file_path" >&2
+    exit 1
+  fi
+  "$file_path"
+}
+
 run_plan_case() {
   case_name=$1
   fixture_name=$2
@@ -68,6 +89,36 @@ run_plan_case() {
   assert_dir_exists "$workdir/.uya-build/cas" "$case_name"
   assert_dir_exists "$workdir/.uya-build/meta" "$case_name"
   assert_dir_exists "$workdir/.uya-build/runs" "$case_name"
+
+  printf 'PASS %s\n' "$case_name"
+}
+
+run_executable_build_case() {
+  case_name=$1
+  fixture_name=$2
+  target_label=$3
+  executable_path=$4
+  expected_workspace=$5
+  expected_action_count=$6
+
+  workdir=$(mktemp -d "$TMP_ROOT/$case_name.XXXXXX")
+  cp -R "$ROOT_DIR/fixtures/workspaces/$fixture_name/." "$workdir"
+
+  stdout_file="$workdir/stdout.txt"
+  stderr_file="$workdir/stderr.txt"
+
+  (
+    cd "$workdir"
+    "$BIN" build "$target_label"
+  ) >"$stdout_file" 2>"$stderr_file"
+
+  assert_file_exists "$workdir/$executable_path" "$case_name"
+  assert_executable_runs "$workdir/$executable_path" "$case_name"
+  assert_output_contains "$stdout_file" "workspace: $expected_workspace" "$case_name"
+  assert_output_contains "$stdout_file" "planned_actions: $expected_action_count" "$case_name"
+  assert_dir_exists "$workdir/.uya-build/cas" "$case_name"
+  assert_dir_exists "$workdir/.uya-build/meta" "$case_name"
+  assert_dir_exists "$workdir/.uya-build/tmp" "$case_name"
 
   printf 'PASS %s\n' "$case_name"
 }
@@ -111,14 +162,13 @@ trap 'rm -rf "$TMP_ROOT"' EXIT INT TERM
 
 pass_count=0
 
-run_plan_case \
+run_executable_build_case \
   "sample-cxx-minimal" \
   "cxx-minimal" \
   "//app:hello" \
-  '"name":"cxx-minimal"' \
-  '"label":"//lib:hello"' \
-  '"label":"//app:hello"' \
-  '"command":["uya-cxx-link","//app:hello"]'
+  "out/bin/hello" \
+  "cxx-minimal" \
+  "2"
 pass_count=$((pass_count + 1))
 
 run_plan_case \

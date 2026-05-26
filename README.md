@@ -28,7 +28,7 @@ Phase 2 currently provides:
 - target-closure planning, input snapshots, file/tree/action-manifest/log CAS emission, action key calculation, and file-backed NoSQLite-style metadata indexes
 - `uyabuild query`, `uyabuild plan --json`, and Phase 2 cache decisions such as `seeded-output`, `local-hit`, and `success-no-change`
 
-Phase 3 now provides an initial local executor for `legacy.shell` and `task`:
+Phase 3 now provides an initial local executor for `legacy.shell`, `task`, and the minimal `cxx` rule path:
 
 - `uyabuild build` materializes a per-action temporary workspace, runs supported actions locally, captures `stdout`/`stderr`, and atomically commits declared outputs
 - `uyabuild why` now explains whether planned targets are `local-hit`, `seeded-output`, `success-no-change`, or still `pending-execution`
@@ -44,7 +44,7 @@ Phase 3 now provides an initial local executor for `legacy.shell` and `task`:
 Still pending for later Phase 3 work:
 
 - a macOS dependency-tracing backend for the same hidden-input / undeclared-output checks
-- broader rule-kind execution backends
+- broader rule-kind execution backends beyond `cxx`, especially `node` and `oci`
 
 Reference docs:
 

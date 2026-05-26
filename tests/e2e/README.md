@@ -7,7 +7,7 @@ Each scenario copies a fixture workspace into `tests/.tmp/`, runs the primary
 `uyabuild` entrypoint for that sample, and checks for a small set of convincing
 signals:
 
-- `cxx-minimal`: `plan --json` produces the expected two-action graph
+- `cxx-minimal`: `build` executes the two-action C++ chain and emits a runnable binary
 - `node-workspace`: `plan --json` preserves the workspace/app action chain
 - `oci-multistage`: `plan --json` preserves the Docker action shape
 - `legacy-shell`: `build` executes locally and commits the declared output

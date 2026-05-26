@@ -1,3 +1,0 @@
-UYABUILD_E_EXECUTOR_UNSUPPORTED: the local executor does not yet support this action kind
-at: uya.build:9:1
-detail: cxx.library

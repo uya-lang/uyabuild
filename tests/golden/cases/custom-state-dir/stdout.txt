@@ -1,1 +1,11 @@
-
+workspace: cxx-minimal
+phase: 3
+matched_targets: 1
+planned_actions: 2
+cache_hits: 0
+seeded_outputs: 0
+success_no_change: 0
+pending_execution: 0
+root_digest: f13cfe478310b751da56652d04acaeaaa969fb0b8371e9ab4aff20afcc96bb60
+matched:
+  //app:hello
