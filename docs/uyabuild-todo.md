@@ -186,10 +186,16 @@
 
 ### 9.2 TODO
 
+当前状态（2026-05-26）：
+
+- `P4-1` 已完成：`bin/uyabuild` 现已通过统一的 Rule Pack / Rule Kind 注册表声明 schema、provider、planner、scanner 元数据；`legacy.shell`、`task`、`cxx.*`、`node.*`、`oci.image` 都改为经由注册表接线，后续新增规则包无需再把映射散落进多处条件分支。
+- `P4-2` 已完成：`legacy.shell` 规则已具备 schema 校验、planner 接线、本地执行、输入输出声明、严格模式依赖追踪和错误诊断；相关 unit、golden、e2e 回归已稳定覆盖。
+- 现有回归已覆盖注册表接线后的四类内建规则：unit、golden、e2e 全量通过；`legacy.shell` 仍是当前唯一接入本地执行器的规则，`cxx` / `node` / `oci` 的执行后端继续留在后续条目推进。
+
 | ID | 优先级 | 任务 | 依赖 | 验收标准 |
 |---|---|---|---|---|
-| `P4-1` | `P0` | 定义 Rule Pack 接口：schema/provider/planner/scanner | `P1-6`, `P2-6` | 新规则包可通过统一接口注册 |
-| `P4-2` | `P0` | 实现 `legacy.shell` 规则 | `P4-1`, `P3-9` | 可包装 shell 脚本并追踪输入输出 |
+| `P4-1` | `P0` | 已完成：定义 Rule Pack 接口：schema/provider/planner/scanner | `P1-6`, `P2-6` | 新规则包可通过统一接口注册 |
+| `P4-2` | `P0` | 已完成：实现 `legacy.shell` 规则 | `P4-1`, `P3-9` | 可包装 shell 脚本并追踪输入输出 |
 | `P4-3` | `P0` | 实现 `cxx.library` / `cxx.binary` schema 与 planner | `P4-1` | 最小 C++ 项目可构建 |
 | `P4-4` | `P0` | 接入头文件 depfile 或 include 扫描 | `P4-3`, `P3-7` | 修改头文件会触发正确增量重建 |
 | `P4-5` | `P1` | 实现 `cxx.test` 规则 | `P4-3` | `uya test` 可执行 C/C++ 测试 |

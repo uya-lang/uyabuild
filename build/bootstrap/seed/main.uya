@@ -261,6 +261,39 @@ struct RuleUse {
     next: &RuleUse,
 }
 
+struct RulePackDef {
+    name: &byte,
+    next: &RulePackDef,
+}
+
+struct RuleFieldDef {
+    name: &byte,
+    expected_type: i32,
+    next: &RuleFieldDef,
+}
+
+struct RuleKindDef {
+    name: &byte,
+    pack_name: &byte,
+    provider_mask: u32,
+    planner_kind: i32,
+    scanner_kind: i32,
+    default_execution_mode: &byte,
+    default_pool: &byte,
+    dep_provider_mask: u32,
+    extra_dep_field: &byte,
+    extra_dep_provider_mask: u32,
+    primary_command_field: &byte,
+    fallback_command_field: &byte,
+    input_field_name: &byte,
+    output_field_name: &byte,
+    require_one_of_a: &byte,
+    require_one_of_b: &byte,
+    field_head: &RuleFieldDef,
+    required_field_head: &StringNode,
+    next: &RuleKindDef,
+}
+
 struct IRConfig {
     name: &byte,
     file: &SourceFile,
@@ -309,6 +342,10 @@ struct Phase1Context {
     entrypoint_path: &byte,
     files_head: &SourceFile,
     files_tail: &SourceFile,
+    rule_packs_head: &RulePackDef,
+    rule_packs_tail: &RulePackDef,
+    rule_kinds_head: &RuleKindDef,
+    rule_kinds_tail: &RuleKindDef,
     uses_head: &RuleUse,
     uses_tail: &RuleUse,
     active_configs: &StringNode,
@@ -449,6 +486,17 @@ const PROVIDER_NODE_APP: u32 = 4u32;
 const PROVIDER_OCI_IMAGE: u32 = 8u32;
 const PROVIDER_LEGACY_ACTION: u32 = 16u32;
 const PROVIDER_TASK: u32 = 32u32;
+
+const RULE_PLANNER_NONE: i32 = 0;
+const RULE_PLANNER_COMMAND: i32 = 1;
+const RULE_PLANNER_CXX_LIBRARY: i32 = 2;
+const RULE_PLANNER_CXX_BINARY: i32 = 3;
+const RULE_PLANNER_NODE_WORKSPACE: i32 = 4;
+const RULE_PLANNER_NODE_APP: i32 = 5;
+const RULE_PLANNER_OCI_IMAGE: i32 = 6;
+
+const RULE_SCANNER_NONE: i32 = 0;
+const RULE_SCANNER_CPP_HEADERS: i32 = 1;
 
 var phase1_arena_storage: [byte: PHASE1_ARENA_SIZE] = [];
 
@@ -1158,6 +1206,10 @@ fn phase1_ctx_init(ctx: &Phase1Context, workspace_root: &byte, entrypoint_path: 
     ctx.root_toml_path = null;
     ctx.files_head = null;
     ctx.files_tail = null;
+    ctx.rule_packs_head = null;
+    ctx.rule_packs_tail = null;
+    ctx.rule_kinds_head = null;
+    ctx.rule_kinds_tail = null;
     ctx.uses_head = null;
     ctx.uses_tail = null;
     ctx.active_configs = null;
@@ -1633,6 +1685,30 @@ fn new_rule_use(ctx: &Phase1Context) &RuleUse {
     return mem as &RuleUse;
 }
 
+fn new_rule_pack_def(ctx: &Phase1Context) &RulePackDef {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(RulePackDef));
+    if mem == null {
+        return null;
+    }
+    return mem as &RulePackDef;
+}
+
+fn new_rule_field_def(ctx: &Phase1Context) &RuleFieldDef {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(RuleFieldDef));
+    if mem == null {
+        return null;
+    }
+    return mem as &RuleFieldDef;
+}
+
+fn new_rule_kind_def(ctx: &Phase1Context) &RuleKindDef {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(RuleKindDef));
+    if mem == null {
+        return null;
+    }
+    return mem as &RuleKindDef;
+}
+
 fn append_typed_list_item(value: &TypedValue, item: &TypedValueItem) void {
     if value.list_head == null {
         value.list_head = item;
@@ -1641,6 +1717,386 @@ fn append_typed_list_item(value: &TypedValue, item: &TypedValueItem) void {
         value.list_tail.next = item;
         value.list_tail = item;
     }
+}
+
+fn append_rule_pack_def(ctx: &Phase1Context, pack: &RulePackDef) void {
+    if ctx == null || pack == null {
+        return;
+    }
+    if ctx.rule_packs_head == null {
+        ctx.rule_packs_head = pack;
+        ctx.rule_packs_tail = pack;
+    } else {
+        ctx.rule_packs_tail.next = pack;
+        ctx.rule_packs_tail = pack;
+    }
+}
+
+fn append_rule_kind_def(ctx: &Phase1Context, kind: &RuleKindDef) void {
+    if ctx == null || kind == null {
+        return;
+    }
+    if ctx.rule_kinds_head == null {
+        ctx.rule_kinds_head = kind;
+        ctx.rule_kinds_tail = kind;
+    } else {
+        ctx.rule_kinds_tail.next = kind;
+        ctx.rule_kinds_tail = kind;
+    }
+}
+
+fn append_rule_field_def(kind: &RuleKindDef, field: &RuleFieldDef) void {
+    if kind == null || field == null {
+        return;
+    }
+    if kind.field_head == null {
+        kind.field_head = field;
+    } else {
+        var tail: &RuleFieldDef = kind.field_head;
+        while tail.next != null {
+            tail = tail.next;
+        }
+        tail.next = field;
+    }
+}
+
+fn find_rule_pack_def(ctx: &Phase1Context, name: &byte) &RulePackDef {
+    if ctx == null || name == null {
+        return null;
+    }
+    var current: &RulePackDef = ctx.rule_packs_head;
+    while current != null {
+        if string_equals(current.name, name) != 0 {
+            return current;
+        }
+        current = current.next;
+    }
+    return null;
+}
+
+fn find_rule_kind_def(ctx: &Phase1Context, name: &byte) &RuleKindDef {
+    if ctx == null || name == null {
+        return null;
+    }
+    var current: &RuleKindDef = ctx.rule_kinds_head;
+    while current != null {
+        if string_equals(current.name, name) != 0 {
+            return current;
+        }
+        current = current.next;
+    }
+    return null;
+}
+
+fn register_rule_pack_def(ctx: &Phase1Context, name: &byte) &RulePackDef {
+    if ctx == null || name == null {
+        return null;
+    }
+    const existing: &RulePackDef = find_rule_pack_def(ctx, name);
+    if existing != null {
+        return existing;
+    }
+    const pack: &RulePackDef = new_rule_pack_def(ctx);
+    if pack == null {
+        return null;
+    }
+    pack.name = arena_copy_cstr(&ctx.arena, name);
+    if pack.name == null {
+        return null;
+    }
+    append_rule_pack_def(ctx, pack);
+    return pack;
+}
+
+fn register_rule_kind_def(ctx: &Phase1Context,
+                          pack_name: &byte,
+                          name: &byte,
+                          provider_mask: u32,
+                          planner_kind: i32,
+                          scanner_kind: i32,
+                          default_execution_mode: &byte,
+                          default_pool: &byte,
+                          dep_provider_mask: u32,
+                          extra_dep_field: &byte,
+                          extra_dep_provider_mask: u32,
+                          primary_command_field: &byte,
+                          fallback_command_field: &byte,
+                          input_field_name: &byte,
+                          output_field_name: &byte) &RuleKindDef {
+    if ctx == null || name == null {
+        return null;
+    }
+    const existing: &RuleKindDef = find_rule_kind_def(ctx, name);
+    if existing != null {
+        return existing;
+    }
+    if pack_name != null && pack_name[0] != 0 as byte && register_rule_pack_def(ctx, pack_name) == null {
+        return null;
+    }
+    const kind: &RuleKindDef = new_rule_kind_def(ctx);
+    if kind == null {
+        return null;
+    }
+    kind.name = arena_copy_cstr(&ctx.arena, name);
+    kind.pack_name = arena_copy_cstr(&ctx.arena, pack_name);
+    kind.provider_mask = provider_mask;
+    kind.planner_kind = planner_kind;
+    kind.scanner_kind = scanner_kind;
+    kind.default_execution_mode = arena_copy_cstr(&ctx.arena, default_execution_mode);
+    kind.default_pool = arena_copy_cstr(&ctx.arena, default_pool);
+    kind.dep_provider_mask = dep_provider_mask;
+    kind.extra_dep_field = arena_copy_cstr(&ctx.arena, extra_dep_field);
+    kind.extra_dep_provider_mask = extra_dep_provider_mask;
+    kind.primary_command_field = arena_copy_cstr(&ctx.arena, primary_command_field);
+    kind.fallback_command_field = arena_copy_cstr(&ctx.arena, fallback_command_field);
+    kind.input_field_name = arena_copy_cstr(&ctx.arena, input_field_name);
+    kind.output_field_name = arena_copy_cstr(&ctx.arena, output_field_name);
+    if kind.name == null || kind.pack_name == null || kind.default_execution_mode == null || kind.default_pool == null {
+        return null;
+    }
+    append_rule_kind_def(ctx, kind);
+    return kind;
+}
+
+fn register_rule_kind_field(ctx: &Phase1Context, kind: &RuleKindDef, field_name: &byte, expected_type: i32) i32 {
+    if ctx == null || kind == null || field_name == null {
+        return -1;
+    }
+    var current: &RuleFieldDef = kind.field_head;
+    while current != null {
+        if string_equals(current.name, field_name) != 0 {
+            current.expected_type = expected_type;
+            return 0;
+        }
+        current = current.next;
+    }
+    const field: &RuleFieldDef = new_rule_field_def(ctx);
+    if field == null {
+        return -1;
+    }
+    field.name = arena_copy_cstr(&ctx.arena, field_name);
+    field.expected_type = expected_type;
+    if field.name == null {
+        return -1;
+    }
+    append_rule_field_def(kind, field);
+    return 0;
+}
+
+fn register_rule_kind_required_field(ctx: &Phase1Context, kind: &RuleKindDef, field_name: &byte) i32 {
+    if ctx == null || kind == null || field_name == null {
+        return -1;
+    }
+    var current: &StringNode = kind.required_field_head;
+    while current != null {
+        if string_equals(current.text, field_name) != 0 {
+            return 0;
+        }
+        current = current.next;
+    }
+    const required_field: &StringNode = new_string_node(ctx, field_name);
+    if required_field == null {
+        return -1;
+    }
+    if kind.required_field_head == null {
+        kind.required_field_head = required_field;
+        return 0;
+    }
+    current = kind.required_field_head;
+    while current.next != null {
+        current = current.next;
+    }
+    current.next = required_field;
+    return 0;
+}
+
+fn register_builtin_rule_packs(ctx: &Phase1Context) i32 {
+    if ctx == null {
+        return -1;
+    }
+    if register_rule_pack_def(ctx, "cxx" as &byte) == null ||
+        register_rule_pack_def(ctx, "node" as &byte) == null ||
+        register_rule_pack_def(ctx, "oci" as &byte) == null ||
+        register_rule_pack_def(ctx, "legacy" as &byte) == null {
+        return phase1_error(ctx,
+                            "UYABUILD_E_MEMORY" as &byte,
+                            "phase1 arena is exhausted" as &byte,
+                            "failed to register built-in rule packs" as &byte,
+                            ctx.entrypoint_path,
+                            1,
+                            1);
+    }
+
+    const cxx_library: &RuleKindDef = register_rule_kind_def(ctx,
+                                                             "cxx" as &byte,
+                                                             "cxx.library" as &byte,
+                                                             PROVIDER_CXX_LINKABLE,
+                                                             RULE_PLANNER_CXX_LIBRARY,
+                                                             RULE_SCANNER_CPP_HEADERS,
+                                                             "pure" as &byte,
+                                                             "cpu" as &byte,
+                                                             PROVIDER_CXX_LINKABLE,
+                                                             null,
+                                                             0u32,
+                                                             null,
+                                                             null,
+                                                             null,
+                                                             null);
+    const cxx_binary: &RuleKindDef = register_rule_kind_def(ctx,
+                                                            "cxx" as &byte,
+                                                            "cxx.binary" as &byte,
+                                                            0u32,
+                                                            RULE_PLANNER_CXX_BINARY,
+                                                            RULE_SCANNER_NONE,
+                                                            "pure" as &byte,
+                                                            "link" as &byte,
+                                                            PROVIDER_CXX_LINKABLE,
+                                                            null,
+                                                            0u32,
+                                                            null,
+                                                            null,
+                                                            null,
+                                                            null);
+    const node_workspace: &RuleKindDef = register_rule_kind_def(ctx,
+                                                                "node" as &byte,
+                                                                "node.workspace" as &byte,
+                                                                PROVIDER_NODE_WORKSPACE,
+                                                                RULE_PLANNER_NODE_WORKSPACE,
+                                                                RULE_SCANNER_NONE,
+                                                                "host" as &byte,
+                                                                "cpu" as &byte,
+                                                                0u32,
+                                                                null,
+                                                                0u32,
+                                                                null,
+                                                                null,
+                                                                null,
+                                                                null);
+    const node_app: &RuleKindDef = register_rule_kind_def(ctx,
+                                                          "node" as &byte,
+                                                          "node.app" as &byte,
+                                                          PROVIDER_NODE_APP,
+                                                          RULE_PLANNER_NODE_APP,
+                                                          RULE_SCANNER_NONE,
+                                                          "host" as &byte,
+                                                          "cpu" as &byte,
+                                                          0u32,
+                                                          "workspace" as &byte,
+                                                          PROVIDER_NODE_WORKSPACE,
+                                                          null,
+                                                          null,
+                                                          null,
+                                                          null);
+    const oci_image: &RuleKindDef = register_rule_kind_def(ctx,
+                                                           "oci" as &byte,
+                                                           "oci.image" as &byte,
+                                                           PROVIDER_OCI_IMAGE,
+                                                           RULE_PLANNER_OCI_IMAGE,
+                                                           RULE_SCANNER_NONE,
+                                                           "host" as &byte,
+                                                           "docker" as &byte,
+                                                           0u32,
+                                                           null,
+                                                           0u32,
+                                                           null,
+                                                           null,
+                                                           null,
+                                                           null);
+    const legacy_shell: &RuleKindDef = register_rule_kind_def(ctx,
+                                                              "legacy" as &byte,
+                                                              "legacy.shell" as &byte,
+                                                              PROVIDER_LEGACY_ACTION,
+                                                              RULE_PLANNER_COMMAND,
+                                                              RULE_SCANNER_NONE,
+                                                              "host" as &byte,
+                                                              "cpu" as &byte,
+                                                              0u32,
+                                                              null,
+                                                              0u32,
+                                                              "script" as &byte,
+                                                              "run" as &byte,
+                                                              "inputs" as &byte,
+                                                              "outputs" as &byte);
+    const task_kind: &RuleKindDef = register_rule_kind_def(ctx,
+                                                           "" as &byte,
+                                                           "task" as &byte,
+                                                           PROVIDER_TASK,
+                                                           RULE_PLANNER_COMMAND,
+                                                           RULE_SCANNER_NONE,
+                                                           "host" as &byte,
+                                                           "cpu" as &byte,
+                                                           0u32,
+                                                           null,
+                                                           0u32,
+                                                           "run" as &byte,
+                                                           null,
+                                                           null,
+                                                           null);
+    if cxx_library == null || cxx_binary == null || node_workspace == null ||
+        node_app == null || oci_image == null || legacy_shell == null || task_kind == null {
+        return phase1_error(ctx,
+                            "UYABUILD_E_MEMORY" as &byte,
+                            "phase1 arena is exhausted" as &byte,
+                            "failed to register built-in rule kinds" as &byte,
+                            ctx.entrypoint_path,
+                            1,
+                            1);
+    }
+
+    if register_rule_kind_field(ctx, cxx_library, "srcs" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, cxx_library, "hdrs" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, cxx_library, "include_dirs" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, cxx_library, "discover" as &byte, EXPECT_CALL) != 0 ||
+        register_rule_kind_field(ctx, cxx_binary, "srcs" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, cxx_binary, "out" as &byte, EXPECT_STRING) != 0 ||
+        register_rule_kind_field(ctx, cxx_binary, "toolchain" as &byte, EXPECT_STRING) != 0 ||
+        register_rule_kind_field(ctx, node_workspace, "root" as &byte, EXPECT_STRING) != 0 ||
+        register_rule_kind_field(ctx, node_workspace, "lockfile" as &byte, EXPECT_STRING) != 0 ||
+        register_rule_kind_field(ctx, node_workspace, "workspaces" as &byte, EXPECT_BOOL) != 0 ||
+        register_rule_kind_field(ctx, node_app, "workspace" as &byte, EXPECT_LABEL) != 0 ||
+        register_rule_kind_field(ctx, node_app, "package" as &byte, EXPECT_STRING) != 0 ||
+        register_rule_kind_field(ctx, node_app, "out" as &byte, EXPECT_STRING) != 0 ||
+        register_rule_kind_field(ctx, oci_image, "dockerfile" as &byte, EXPECT_STRING) != 0 ||
+        register_rule_kind_field(ctx, oci_image, "context" as &byte, EXPECT_STRING) != 0 ||
+        register_rule_kind_field(ctx, oci_image, "tags" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, legacy_shell, "script" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, legacy_shell, "run" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, legacy_shell, "inputs" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, legacy_shell, "outputs" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, legacy_shell, "env_allowlist" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, legacy_shell, "mode" as &byte, EXPECT_STRING) != 0 ||
+        register_rule_kind_field(ctx, legacy_shell, "always" as &byte, EXPECT_BOOL) != 0 ||
+        register_rule_kind_field(ctx, task_kind, "run" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, task_kind, "always" as &byte, EXPECT_BOOL) != 0 {
+        return phase1_error(ctx,
+                            "UYABUILD_E_MEMORY" as &byte,
+                            "phase1 arena is exhausted" as &byte,
+                            "failed to register built-in rule schemas" as &byte,
+                            ctx.entrypoint_path,
+                            1,
+                            1);
+    }
+
+    if register_rule_kind_required_field(ctx, node_workspace, "root" as &byte) != 0 ||
+        register_rule_kind_required_field(ctx, node_workspace, "lockfile" as &byte) != 0 ||
+        register_rule_kind_required_field(ctx, node_app, "workspace" as &byte) != 0 ||
+        register_rule_kind_required_field(ctx, node_app, "package" as &byte) != 0 ||
+        register_rule_kind_required_field(ctx, oci_image, "dockerfile" as &byte) != 0 ||
+        register_rule_kind_required_field(ctx, oci_image, "context" as &byte) != 0 ||
+        register_rule_kind_required_field(ctx, legacy_shell, "outputs" as &byte) != 0 ||
+        register_rule_kind_required_field(ctx, task_kind, "run" as &byte) != 0 {
+        return phase1_error(ctx,
+                            "UYABUILD_E_MEMORY" as &byte,
+                            "phase1 arena is exhausted" as &byte,
+                            "failed to register required rule fields" as &byte,
+                            ctx.entrypoint_path,
+                            1,
+                            1);
+    }
+
+    legacy_shell.require_one_of_a = "script" as &byte;
+    legacy_shell.require_one_of_b = "run" as &byte;
+    return 0;
 }
 
 fn append_typed_call_arg(value: &TypedValue, item: &TypedValueItem) void {
@@ -2976,48 +3432,23 @@ fn build_label_text(ctx: &Phase1Context, package_path: &byte, name: &byte) &byte
     return arena_copy_cstr(&ctx.arena, &buf[0] as &byte);
 }
 
-fn rule_pack_for_kind(kind: &byte) &byte {
-    if string_has_prefix(kind, "cxx." as &byte) != 0 {
-        return "cxx" as &byte;
+fn rule_pack_for_kind(ctx: &Phase1Context, kind: &byte) &byte {
+    const rule_kind: &RuleKindDef = find_rule_kind_def(ctx, kind);
+    if rule_kind == null {
+        return null;
     }
-    if string_has_prefix(kind, "node." as &byte) != 0 {
-        return "node" as &byte;
-    }
-    if string_has_prefix(kind, "oci." as &byte) != 0 {
-        return "oci" as &byte;
-    }
-    if string_has_prefix(kind, "legacy." as &byte) != 0 {
-        return "legacy" as &byte;
-    }
-    if string_equals(kind, "task" as &byte) != 0 {
-        return "" as &byte;
-    }
-    return null;
+    return rule_kind.pack_name;
 }
 
-fn provider_mask_for_kind(kind: &byte) u32 {
-    if string_equals(kind, "cxx.library" as &byte) != 0 {
-        return PROVIDER_CXX_LINKABLE;
+fn provider_mask_for_kind(ctx: &Phase1Context, kind: &byte) u32 {
+    const rule_kind: &RuleKindDef = find_rule_kind_def(ctx, kind);
+    if rule_kind == null {
+        return 0u32;
     }
-    if string_equals(kind, "node.workspace" as &byte) != 0 {
-        return PROVIDER_NODE_WORKSPACE;
-    }
-    if string_equals(kind, "node.app" as &byte) != 0 {
-        return PROVIDER_NODE_APP;
-    }
-    if string_equals(kind, "oci.image" as &byte) != 0 {
-        return PROVIDER_OCI_IMAGE;
-    }
-    if string_equals(kind, "legacy.shell" as &byte) != 0 {
-        return PROVIDER_LEGACY_ACTION;
-    }
-    if string_equals(kind, "task" as &byte) != 0 {
-        return PROVIDER_TASK;
-    }
-    return 0u32;
+    return rule_kind.provider_mask;
 }
 
-fn field_expected_type(kind: &byte, field_name: &byte) i32 {
+fn field_expected_type(ctx: &Phase1Context, kind: &byte, field_name: &byte) i32 {
     if string_equals(field_name, "deps" as &byte) != 0 {
         return EXPECT_LABEL_LIST;
     }
@@ -3035,81 +3466,16 @@ fn field_expected_type(kind: &byte, field_name: &byte) i32 {
         return EXPECT_STRING;
     }
 
-    if string_equals(kind, "cxx.library" as &byte) != 0 {
-        if string_equals(field_name, "srcs" as &byte) != 0 ||
-            string_equals(field_name, "hdrs" as &byte) != 0 ||
-            string_equals(field_name, "include_dirs" as &byte) != 0 {
-            return EXPECT_STRING_LIST;
-        }
-        if string_equals(field_name, "discover" as &byte) != 0 {
-            return EXPECT_CALL;
-        }
+    const rule_kind: &RuleKindDef = find_rule_kind_def(ctx, kind);
+    if rule_kind == null {
         return -1;
     }
-    if string_equals(kind, "cxx.binary" as &byte) != 0 {
-        if string_equals(field_name, "srcs" as &byte) != 0 {
-            return EXPECT_STRING_LIST;
+    var field: &RuleFieldDef = rule_kind.field_head;
+    while field != null {
+        if string_equals(field.name, field_name) != 0 {
+            return field.expected_type;
         }
-        if string_equals(field_name, "out" as &byte) != 0 ||
-            string_equals(field_name, "toolchain" as &byte) != 0 {
-            return EXPECT_STRING;
-        }
-        return -1;
-    }
-    if string_equals(kind, "node.workspace" as &byte) != 0 {
-        if string_equals(field_name, "root" as &byte) != 0 ||
-            string_equals(field_name, "lockfile" as &byte) != 0 {
-            return EXPECT_STRING;
-        }
-        if string_equals(field_name, "workspaces" as &byte) != 0 {
-            return EXPECT_BOOL;
-        }
-        return -1;
-    }
-    if string_equals(kind, "node.app" as &byte) != 0 {
-        if string_equals(field_name, "workspace" as &byte) != 0 {
-            return EXPECT_LABEL;
-        }
-        if string_equals(field_name, "package" as &byte) != 0 ||
-            string_equals(field_name, "out" as &byte) != 0 {
-            return EXPECT_STRING;
-        }
-        return -1;
-    }
-    if string_equals(kind, "oci.image" as &byte) != 0 {
-        if string_equals(field_name, "dockerfile" as &byte) != 0 ||
-            string_equals(field_name, "context" as &byte) != 0 {
-            return EXPECT_STRING;
-        }
-        if string_equals(field_name, "tags" as &byte) != 0 {
-            return EXPECT_STRING_LIST;
-        }
-        return -1;
-    }
-    if string_equals(kind, "legacy.shell" as &byte) != 0 {
-        if string_equals(field_name, "script" as &byte) != 0 ||
-            string_equals(field_name, "run" as &byte) != 0 ||
-            string_equals(field_name, "inputs" as &byte) != 0 ||
-            string_equals(field_name, "outputs" as &byte) != 0 ||
-            string_equals(field_name, "env_allowlist" as &byte) != 0 {
-            return EXPECT_STRING_LIST;
-        }
-        if string_equals(field_name, "mode" as &byte) != 0 {
-            return EXPECT_STRING;
-        }
-        if string_equals(field_name, "always" as &byte) != 0 {
-            return EXPECT_BOOL;
-        }
-        return -1;
-    }
-    if string_equals(kind, "task" as &byte) != 0 {
-        if string_equals(field_name, "run" as &byte) != 0 {
-            return EXPECT_STRING_LIST;
-        }
-        if string_equals(field_name, "always" as &byte) != 0 {
-            return EXPECT_BOOL;
-        }
-        return -1;
+        field = field.next;
     }
     return -1;
 }
@@ -4444,7 +4810,7 @@ fn label_name_part(ctx: &Phase1Context, canonical: &byte) &byte {
 }
 
 fn analyze_target_decl(ctx: &Phase1Context, decl: &AstDecl) i32 {
-    const pack: &byte = rule_pack_for_kind(decl.name);
+    const pack: &byte = rule_pack_for_kind(ctx, decl.name);
     if pack == null {
         return phase1_error(ctx,
                             "UYABUILD_E_RULE_KIND" as &byte,
@@ -4494,7 +4860,7 @@ fn analyze_target_decl(ctx: &Phase1Context, decl: &AstDecl) i32 {
     target.file = decl.file;
     target.span = decl.span;
     target.attrs = null;
-    target.provider_mask = provider_mask_for_kind(decl.name);
+    target.provider_mask = provider_mask_for_kind(ctx, decl.name);
 
     var field: &AstField = decl.field_head;
     while field != null {
@@ -4507,7 +4873,7 @@ fn analyze_target_decl(ctx: &Phase1Context, decl: &AstDecl) i32 {
                                 field.span.start.line,
                                 field.span.start.column);
         }
-        const expected: i32 = field_expected_type(decl.name, field.name);
+        const expected: i32 = field_expected_type(ctx, decl.name, field.name);
         if expected < 0 {
             return phase1_error(ctx,
                                 "UYABUILD_E_SCHEMA_FIELD" as &byte,
@@ -4645,33 +5011,23 @@ fn is_valid_pool_name(text: &byte) i32 {
     return 1;
 }
 
-fn default_execution_mode_for_kind(kind: &byte) &byte {
-    if kind == null {
+fn default_execution_mode_for_kind(ctx: &Phase1Context, kind: &byte) &byte {
+    const rule_kind: &RuleKindDef = find_rule_kind_def(ctx, kind);
+    if rule_kind == null || rule_kind.default_execution_mode == null {
         return "host" as &byte;
     }
-    if string_equals(kind, "legacy.shell" as &byte) != 0 ||
-        string_equals(kind, "task" as &byte) != 0 ||
-        string_has_prefix(kind, "node." as &byte) != 0 ||
-        string_has_prefix(kind, "oci." as &byte) != 0 {
-        return "host" as &byte;
-    }
-    return "pure" as &byte;
+    return rule_kind.default_execution_mode;
 }
 
-fn default_pool_for_kind(kind: &byte) &byte {
-    if kind == null {
+fn default_pool_for_kind(ctx: &Phase1Context, kind: &byte) &byte {
+    const rule_kind: &RuleKindDef = find_rule_kind_def(ctx, kind);
+    if rule_kind == null || rule_kind.default_pool == null {
         return "cpu" as &byte;
     }
-    if string_equals(kind, "cxx.binary" as &byte) != 0 {
-        return "link" as &byte;
-    }
-    if string_equals(kind, "oci.image" as &byte) != 0 {
-        return "docker" as &byte;
-    }
-    return "cpu" as &byte;
+    return rule_kind.default_pool;
 }
 
-fn target_execution_mode(target: &IRTarget) &byte {
+fn target_execution_mode(ctx: &Phase1Context, target: &IRTarget) &byte {
     if target == null {
         return "host" as &byte;
     }
@@ -4680,10 +5036,10 @@ fn target_execution_mode(target: &IRTarget) &byte {
         is_valid_execution_mode(field.value.text) != 0 {
         return field.value.text;
     }
-    return default_execution_mode_for_kind(target.kind);
+    return default_execution_mode_for_kind(ctx, target.kind);
 }
 
-fn target_pool_name(target: &IRTarget) &byte {
+fn target_pool_name(ctx: &Phase1Context, target: &IRTarget) &byte {
     if target == null {
         return "cpu" as &byte;
     }
@@ -4692,7 +5048,7 @@ fn target_pool_name(target: &IRTarget) &byte {
         is_valid_pool_name(field.value.text) != 0 {
         return field.value.text;
     }
-    return default_pool_for_kind(target.kind);
+    return default_pool_for_kind(ctx, target.kind);
 }
 
 fn target_allows_network(target: &IRTarget) i32 {
@@ -4718,9 +5074,83 @@ fn action_uses_local_cache(action: &PlannedAction) i32 {
     return 1;
 }
 
+fn rule_kind_required_fields_message(rule_kind: &RuleKindDef) &byte {
+    if rule_kind == null || rule_kind.name == null {
+        return "rule kind is missing required fields" as &byte;
+    }
+    if string_equals(rule_kind.name, "legacy.shell" as &byte) != 0 {
+        return "legacy.shell requires outputs" as &byte;
+    }
+    if string_equals(rule_kind.name, "node.workspace" as &byte) != 0 {
+        return "node.workspace requires root and lockfile" as &byte;
+    }
+    if string_equals(rule_kind.name, "node.app" as &byte) != 0 {
+        return "node.app requires workspace and package" as &byte;
+    }
+    if string_equals(rule_kind.name, "oci.image" as &byte) != 0 {
+        return "oci.image requires dockerfile and context" as &byte;
+    }
+    if string_equals(rule_kind.name, "task" as &byte) != 0 {
+        return "task requires run" as &byte;
+    }
+    return "rule kind is missing required fields" as &byte;
+}
+
+fn rule_kind_extra_dep_message(rule_kind: &RuleKindDef) &byte {
+    if rule_kind != null &&
+        rule_kind.name != null &&
+        string_equals(rule_kind.name, "node.app" as &byte) != 0 {
+        return "workspace provider mismatch" as &byte;
+    }
+    return "rule provider mismatch" as &byte;
+}
+
+fn validate_rule_kind_requirements(ctx: &Phase1Context, target: &IRTarget, rule_kind: &RuleKindDef) i32 {
+    if ctx == null || target == null || rule_kind == null {
+        return -1;
+    }
+    if rule_kind.require_one_of_a != null &&
+        rule_kind.require_one_of_b != null &&
+        target_field_exists(target, rule_kind.require_one_of_a) == 0 &&
+        target_field_exists(target, rule_kind.require_one_of_b) == 0 {
+        return phase1_error(ctx,
+                            "UYABUILD_E_SCHEMA_REQUIRED" as &byte,
+                            "legacy.shell requires script or run" as &byte,
+                            target.label,
+                            target.file.rel_path,
+                            target.span.start.line,
+                            target.span.start.column);
+    }
+
+    var required_field: &StringNode = rule_kind.required_field_head;
+    while required_field != null {
+        if target_field_exists(target, required_field.text) == 0 {
+            return phase1_error(ctx,
+                                "UYABUILD_E_SCHEMA_REQUIRED" as &byte,
+                                rule_kind_required_fields_message(rule_kind),
+                                target.label,
+                                target.file.rel_path,
+                                target.span.start.line,
+                                target.span.start.column);
+        }
+        required_field = required_field.next;
+    }
+    return 0;
+}
+
 fn validate_targets(ctx: &Phase1Context) i32 {
     var target: &IRTarget = ctx.targets_head;
     while target != null {
+        const rule_kind: &RuleKindDef = find_rule_kind_def(ctx, target.kind);
+        if rule_kind == null {
+            return phase1_error(ctx,
+                                "UYABUILD_E_RULE_KIND" as &byte,
+                                "unknown rule kind" as &byte,
+                                target.kind,
+                                target.file.rel_path,
+                                target.span.start.line,
+                                target.span.start.column);
+        }
         const execution_mode_field: &IRField = find_ir_field(target.attrs, "execution_mode" as &byte);
         if execution_mode_field != null &&
             (execution_mode_field.value == null ||
@@ -4747,94 +5177,30 @@ fn validate_targets(ctx: &Phase1Context) i32 {
                                 pool_field.value.span.start.line,
                                 pool_field.value.span.start.column);
         }
-        if string_equals(target.kind, "legacy.shell" as &byte) != 0 {
-            if target_field_exists(target, "script" as &byte) == 0 &&
-                target_field_exists(target, "run" as &byte) == 0 {
-                return phase1_error(ctx,
-                                    "UYABUILD_E_SCHEMA_REQUIRED" as &byte,
-                                    "legacy.shell requires script or run" as &byte,
-                                    target.label,
-                                    target.file.rel_path,
-                                    target.span.start.line,
-                                    target.span.start.column);
-            }
-            if target_field_exists(target, "outputs" as &byte) == 0 {
-                return phase1_error(ctx,
-                                    "UYABUILD_E_SCHEMA_REQUIRED" as &byte,
-                                    "legacy.shell requires outputs" as &byte,
-                                    target.label,
-                                    target.file.rel_path,
-                                    target.span.start.line,
-                                    target.span.start.column);
-            }
+        if validate_rule_kind_requirements(ctx, target, rule_kind) != 0 {
+            return -1;
         }
-        if string_equals(target.kind, "node.workspace" as &byte) != 0 {
-            if target_field_exists(target, "root" as &byte) == 0 ||
-                target_field_exists(target, "lockfile" as &byte) == 0 {
-                return phase1_error(ctx,
-                                    "UYABUILD_E_SCHEMA_REQUIRED" as &byte,
-                                    "node.workspace requires root and lockfile" as &byte,
-                                    target.label,
-                                    target.file.rel_path,
-                                    target.span.start.line,
-                                    target.span.start.column);
-            }
-        }
-        if string_equals(target.kind, "node.app" as &byte) != 0 {
-            const workspace_field: &IRField = find_ir_field(target.attrs, "workspace" as &byte);
-            if workspace_field == null || target_field_exists(target, "package" as &byte) == 0 {
-                return phase1_error(ctx,
-                                    "UYABUILD_E_SCHEMA_REQUIRED" as &byte,
-                                    "node.app requires workspace and package" as &byte,
-                                    target.label,
-                                    target.file.rel_path,
-                                    target.span.start.line,
-                                    target.span.start.column);
-            }
-            if typed_value_has_labels(ctx,
-                                      target.file.rel_path,
-                                      target.span,
-                                      workspace_field.value,
-                                      PROVIDER_NODE_WORKSPACE,
-                                      "workspace provider mismatch" as &byte) != 0 {
+
+        if rule_kind.extra_dep_field != null {
+            const extra_field: &IRField = find_ir_field(target.attrs, rule_kind.extra_dep_field);
+            if extra_field != null &&
+                typed_value_has_labels(ctx,
+                                       target.file.rel_path,
+                                       target.span,
+                                       extra_field.value,
+                                       rule_kind.extra_dep_provider_mask,
+                                       rule_kind_extra_dep_message(rule_kind)) != 0 {
                 return -1;
             }
         }
-        if string_equals(target.kind, "oci.image" as &byte) != 0 {
-            if target_field_exists(target, "dockerfile" as &byte) == 0 ||
-                target_field_exists(target, "context" as &byte) == 0 {
-                return phase1_error(ctx,
-                                    "UYABUILD_E_SCHEMA_REQUIRED" as &byte,
-                                    "oci.image requires dockerfile and context" as &byte,
-                                    target.label,
-                                    target.file.rel_path,
-                                    target.span.start.line,
-                                    target.span.start.column);
-            }
-        }
-        if string_equals(target.kind, "task" as &byte) != 0 &&
-            target_field_exists(target, "run" as &byte) == 0 {
-            return phase1_error(ctx,
-                                "UYABUILD_E_SCHEMA_REQUIRED" as &byte,
-                                "task requires run" as &byte,
-                                target.label,
-                                target.file.rel_path,
-                                target.span.start.line,
-                                target.span.start.column);
-        }
 
         const deps_field: &IRField = find_ir_field(target.attrs, "deps" as &byte);
-        if deps_field != null {
-            var required_mask: u32 = 0u32;
-            if string_equals(target.kind, "cxx.binary" as &byte) != 0 ||
-                string_equals(target.kind, "cxx.library" as &byte) != 0 {
-                required_mask = PROVIDER_CXX_LINKABLE;
-            }
+        if deps_field != null && rule_kind.dep_provider_mask != 0u32 {
             if typed_value_has_labels(ctx,
                                       target.file.rel_path,
                                       target.span,
                                       deps_field.value,
-                                      required_mask,
+                                      rule_kind.dep_provider_mask,
                                       "dependency provider mismatch" as &byte) != 0 {
                 return -1;
             }
@@ -6476,12 +6842,12 @@ fn commit_action_outputs(ctx: &Phase2Context, action: &PlannedAction, action_roo
     return 0;
 }
 
-fn action_supports_local_executor(action: &PlannedAction) i32 {
-    if action == null {
+fn action_supports_local_executor(ctx: &Phase2Context, action: &PlannedAction) i32 {
+    if ctx == null || action == null {
         return 0;
     }
-    if string_equals(action.kind, "legacy.shell" as &byte) != 0 ||
-        string_equals(action.kind, "task" as &byte) != 0 {
+    const rule_kind: &RuleKindDef = find_rule_kind_def(ctx.phase1, action.kind);
+    if rule_kind != null && rule_kind.planner_kind == RULE_PLANNER_COMMAND {
         return 1;
     }
     return 0;
@@ -6850,7 +7216,7 @@ fn execute_pending_actions(ctx: &Phase2Context) i32 {
                     action.child_pid == 0 &&
                     action_dependencies_ready(ctx, action) != 0 &&
                     count_running_actions_in_pool(ctx, action.pool_name) < pool_capacity_for_name(ctx, action.pool_name) {
-                    if action_supports_local_executor(action) == 0 {
+                    if action_supports_local_executor(ctx, action) == 0 {
                         _ = fail_pending_action(ctx,
                                                 action,
                                                 127,
@@ -7221,10 +7587,11 @@ fn collect_target_dependencies(ctx: &Phase1Context, target: &IRTarget) &StringNo
     if deps_field != null {
         deps = collect_typed_labels_sorted(ctx, deps_field.value, deps);
     }
-    if string_equals(target.kind, "node.app" as &byte) != 0 {
-        const workspace_field: &IRField = find_ir_field(target.attrs, "workspace" as &byte);
-        if workspace_field != null {
-            deps = collect_typed_labels_sorted(ctx, workspace_field.value, deps);
+    const rule_kind: &RuleKindDef = find_rule_kind_def(ctx, target.kind);
+    if rule_kind != null && rule_kind.extra_dep_field != null {
+        const extra_field: &IRField = find_ir_field(target.attrs, rule_kind.extra_dep_field);
+        if extra_field != null {
+            deps = collect_typed_labels_sorted(ctx, extra_field.value, deps);
         }
     }
     return deps;
@@ -7295,13 +7662,71 @@ fn action_add_placeholder_output(ctx: &Phase1Context, action: &PlannedAction, ta
     return action_add_output_path(ctx, action, target, &raw[0] as &byte);
 }
 
+fn populate_command_action(ctx: &Phase2Context,
+                           action: &PlannedAction,
+                           target: &IRTarget,
+                           rule_kind: &RuleKindDef) i32 {
+    if ctx == null || action == null || target == null || rule_kind == null {
+        return -1;
+    }
+    var effective_field: &IRField = null;
+    if rule_kind.primary_command_field != null {
+        effective_field = find_ir_field(target.attrs, rule_kind.primary_command_field);
+    }
+    if effective_field == null && rule_kind.fallback_command_field != null {
+        effective_field = find_ir_field(target.attrs, rule_kind.fallback_command_field);
+    }
+    if effective_field != null && effective_field.value != null && effective_field.value.kind == TYPED_VALUE_LIST {
+        var arg: &TypedValueItem = effective_field.value.list_head;
+        while arg != null {
+            if arg.value != null && arg.value.text != null {
+                if action_append_command(ctx.phase1, action, arg.value.text) != 0 {
+                    return -1;
+                }
+            }
+            arg = arg.next;
+        }
+    }
+
+    if rule_kind.input_field_name != null {
+        const inputs_field: &IRField = find_ir_field(target.attrs, rule_kind.input_field_name);
+        if inputs_field != null {
+            var inputs: &StringNode = collect_typed_strings_sorted(ctx.phase1, inputs_field.value, null);
+            while inputs != null {
+                if action_add_input_spec(ctx, action, target, inputs.text) != 0 {
+                    return -1;
+                }
+                inputs = inputs.next;
+            }
+        }
+    }
+
+    if rule_kind.output_field_name != null {
+        const outputs_field: &IRField = find_ir_field(target.attrs, rule_kind.output_field_name);
+        if outputs_field != null {
+            var outputs: &StringNode = collect_typed_strings_sorted(ctx.phase1, outputs_field.value, null);
+            while outputs != null {
+                if action_add_output_path(ctx.phase1, action, target, outputs.text) != 0 {
+                    return -1;
+                }
+                outputs = outputs.next;
+            }
+        }
+    }
+    return 0;
+}
+
 fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: &IRTarget) i32 {
+    const rule_kind: &RuleKindDef = find_rule_kind_def(ctx.phase1, target.kind);
+    if rule_kind == null {
+        return -1;
+    }
     action.owner = target;
     action.label = target.label;
     action.kind = target.kind;
     action.mnemonic = target.kind;
-    action.pool_name = target_pool_name(target);
-    action.execution_mode = target_execution_mode(target);
+    action.pool_name = target_pool_name(ctx.phase1, target);
+    action.execution_mode = target_execution_mode(ctx.phase1, target);
     action.allow_network = target_allows_network(target);
     action.cache_status = "pending-execution" as &byte;
     action.pending_execution = 1;
@@ -7312,48 +7737,11 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
         deps = deps.next;
     }
 
-    if string_equals(target.kind, "legacy.shell" as &byte) != 0 ||
-        string_equals(target.kind, "task" as &byte) != 0 {
-        const command_field: &IRField = find_ir_field(target.attrs, "script" as &byte);
-        var effective_field: &IRField = command_field;
-        if effective_field == null {
-            effective_field = find_ir_field(target.attrs, "run" as &byte);
-        }
-        if effective_field != null && effective_field.value != null && effective_field.value.kind == TYPED_VALUE_LIST {
-            var arg: &TypedValueItem = effective_field.value.list_head;
-            while arg != null {
-                if arg.value != null && arg.value.text != null {
-                    if action_append_command(ctx.phase1, action, arg.value.text) != 0 {
-                        return -1;
-                    }
-                }
-                arg = arg.next;
-            }
-        }
-        const inputs_field: &IRField = find_ir_field(target.attrs, "inputs" as &byte);
-        if inputs_field != null {
-            var inputs: &StringNode = collect_typed_strings_sorted(ctx.phase1, inputs_field.value, null);
-            while inputs != null {
-                if action_add_input_spec(ctx, action, target, inputs.text) != 0 {
-                    return -1;
-                }
-                inputs = inputs.next;
-            }
-        }
-        const outputs_field: &IRField = find_ir_field(target.attrs, "outputs" as &byte);
-        if outputs_field != null {
-            var outputs: &StringNode = collect_typed_strings_sorted(ctx.phase1, outputs_field.value, null);
-            while outputs != null {
-                if action_add_output_path(ctx.phase1, action, target, outputs.text) != 0 {
-                    return -1;
-                }
-                outputs = outputs.next;
-            }
-        }
-        return 0;
+    if rule_kind.planner_kind == RULE_PLANNER_COMMAND {
+        return populate_command_action(ctx, action, target, rule_kind);
     }
 
-    if string_equals(target.kind, "cxx.library" as &byte) != 0 {
+    if rule_kind.planner_kind == RULE_PLANNER_CXX_LIBRARY {
         _ = action_append_command(ctx.phase1, action, "uya-cxx-archive" as &byte);
         _ = action_append_command(ctx.phase1, action, target.label);
         const srcs_field: &IRField = find_ir_field(target.attrs, "srcs" as &byte);
@@ -7370,7 +7758,7 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
         return action_add_placeholder_output(ctx.phase1, action, target, ".a" as &byte);
     }
 
-    if string_equals(target.kind, "cxx.binary" as &byte) != 0 {
+    if rule_kind.planner_kind == RULE_PLANNER_CXX_BINARY {
         _ = action_append_command(ctx.phase1, action, "uya-cxx-link" as &byte);
         _ = action_append_command(ctx.phase1, action, target.label);
         const srcs_field: &IRField = find_ir_field(target.attrs, "srcs" as &byte);
@@ -7390,7 +7778,7 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
         return action_add_placeholder_output(ctx.phase1, action, target, "" as &byte);
     }
 
-    if string_equals(target.kind, "node.workspace" as &byte) != 0 {
+    if rule_kind.planner_kind == RULE_PLANNER_NODE_WORKSPACE {
         _ = action_append_command(ctx.phase1, action, "npm" as &byte);
         _ = action_append_command(ctx.phase1, action, "ci" as &byte);
         const root_field: &IRField = find_ir_field(target.attrs, "root" as &byte);
@@ -7408,7 +7796,7 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
         return action_add_placeholder_output(ctx.phase1, action, target, ".workspace.json" as &byte);
     }
 
-    if string_equals(target.kind, "node.app" as &byte) != 0 {
+    if rule_kind.planner_kind == RULE_PLANNER_NODE_APP {
         _ = action_append_command(ctx.phase1, action, "npm" as &byte);
         _ = action_append_command(ctx.phase1, action, "run" as &byte);
         _ = action_append_command(ctx.phase1, action, "build" as &byte);
@@ -7425,7 +7813,7 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
         return action_add_placeholder_output(ctx.phase1, action, target, ".app" as &byte);
     }
 
-    if string_equals(target.kind, "oci.image" as &byte) != 0 {
+    if rule_kind.planner_kind == RULE_PLANNER_OCI_IMAGE {
         _ = action_append_command(ctx.phase1, action, "docker" as &byte);
         _ = action_append_command(ctx.phase1, action, "buildx" as &byte);
         _ = action_append_command(ctx.phase1, action, "build" as &byte);
@@ -9058,6 +9446,9 @@ fn emit_build_text(ctx: &Phase1Context, phase2: &Phase2Context, matched: &String
 
 fn load_phase1_model(options: &Options, workspace: &Workspace, ctx: &Phase1Context) i32 {
     phase1_ctx_init(ctx, &workspace.root[0] as &byte, &workspace.entrypoint[0] as &byte);
+    if register_builtin_rule_packs(ctx) != 0 {
+        return emit_diagnostic(options.output_mode, &ctx.diagnostic);
+    }
     if load_active_config_selection(ctx, options.config_selector) != 0 {
         return emit_diagnostic(options.output_mode, &ctx.diagnostic);
     }
@@ -9673,6 +10064,10 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
         entrypoint_path: null,
         files_head: null,
         files_tail: null,
+        rule_packs_head: null,
+        rule_packs_tail: null,
+        rule_kinds_head: null,
+        rule_kinds_tail: null,
         uses_head: null,
         uses_tail: null,
         active_configs: null,
@@ -9894,6 +10289,10 @@ fn run_query(start_index: i32, base_options: &Options) i32 {
         entrypoint_path: null,
         files_head: null,
         files_tail: null,
+        rule_packs_head: null,
+        rule_packs_tail: null,
+        rule_kinds_head: null,
+        rule_kinds_tail: null,
         uses_head: null,
         uses_tail: null,
         active_configs: null,
@@ -10039,6 +10438,10 @@ fn run_plan(start_index: i32, base_options: &Options) i32 {
         entrypoint_path: null,
         files_head: null,
         files_tail: null,
+        rule_packs_head: null,
+        rule_packs_tail: null,
+        rule_kinds_head: null,
+        rule_kinds_tail: null,
         uses_head: null,
         uses_tail: null,
         active_configs: null,
@@ -10224,6 +10627,10 @@ fn run_why(start_index: i32, base_options: &Options) i32 {
         entrypoint_path: null,
         files_head: null,
         files_tail: null,
+        rule_packs_head: null,
+        rule_packs_tail: null,
+        rule_kinds_head: null,
+        rule_kinds_tail: null,
         uses_head: null,
         uses_tail: null,
         active_configs: null,
