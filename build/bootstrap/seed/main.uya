@@ -337,6 +337,10 @@ struct PlannedAction {
     output_tail: &StringNode,
     dep_head: &StringNode,
     dep_tail: &StringNode,
+    tracked_read_head: &StringNode,
+    tracked_write_head: &StringNode,
+    hidden_input_head: &StringNode,
+    undeclared_output_head: &StringNode,
     input_root_digest: &byte,
     output_root_digest: &byte,
     action_key: &byte,
@@ -4723,6 +4727,169 @@ fn action_insert_dep(ctx: &Phase1Context, action: &PlannedAction, text: &byte) v
     _ = inserted;
 }
 
+fn action_track_read(ctx: &Phase1Context, action: &PlannedAction, text: &byte) void {
+    var inserted: i32 = 0;
+    action.tracked_read_head = sorted_string_insert(ctx, action.tracked_read_head, text, &inserted);
+    _ = inserted;
+}
+
+fn action_track_write(ctx: &Phase1Context, action: &PlannedAction, text: &byte) void {
+    var inserted: i32 = 0;
+    action.tracked_write_head = sorted_string_insert(ctx, action.tracked_write_head, text, &inserted);
+    _ = inserted;
+}
+
+fn action_track_hidden_input(ctx: &Phase1Context, action: &PlannedAction, text: &byte) void {
+    var inserted: i32 = 0;
+    action.hidden_input_head = sorted_string_insert(ctx, action.hidden_input_head, text, &inserted);
+    _ = inserted;
+}
+
+fn action_track_undeclared_output(ctx: &Phase1Context, action: &PlannedAction, text: &byte) void {
+    var inserted: i32 = 0;
+    action.undeclared_output_head = sorted_string_insert(ctx, action.undeclared_output_head, text, &inserted);
+    _ = inserted;
+}
+
+fn string_contains_text(haystack: &byte, needle: &byte) i32 {
+    if haystack == null || needle == null || needle[0] == 0 as byte {
+        return 0;
+    }
+    const needle_len: usize = strlen(needle);
+    var pos: usize = 0usize;
+    while haystack[pos] != 0 as byte {
+        var matched: i32 = 1;
+        var i: usize = 0usize;
+        while i < needle_len {
+            if haystack[pos + i] == 0 as byte || haystack[pos + i] != needle[i] {
+                matched = 0;
+                break;
+            }
+            i = i + 1usize;
+        }
+        if matched != 0 {
+            return 1;
+        }
+        pos = pos + 1usize;
+    }
+    return 0;
+}
+
+fn path_text_matches_or_contains(contract_path: &byte, observed_path: &byte) i32 {
+    if contract_path == null || observed_path == null {
+        return 0;
+    }
+    if string_equals(contract_path, observed_path) != 0 {
+        return 1;
+    }
+    const contract_len: usize = strlen(contract_path);
+    if string_has_prefix(observed_path, contract_path) != 0 && observed_path[contract_len] == 47 as byte {
+        return 1;
+    }
+    const observed_len: usize = strlen(observed_path);
+    if string_has_prefix(contract_path, observed_path) != 0 && contract_path[observed_len] == 47 as byte {
+        return 1;
+    }
+    return 0;
+}
+
+fn string_node_matches_path(head: &StringNode, observed_path: &byte) i32 {
+    var node: &StringNode = head;
+    while node != null {
+        if path_text_matches_or_contains(node.text, observed_path) != 0 {
+            return 1;
+        }
+        node = node.next;
+    }
+    return 0;
+}
+
+fn action_read_path_allowed(ctx: &Phase2Context, action: &PlannedAction, observed_path: &byte) i32 {
+    if ctx == null || action == null || observed_path == null {
+        return 0;
+    }
+    if string_node_matches_path(action.input_head, observed_path) != 0 ||
+        string_node_matches_path(action.output_head, observed_path) != 0 {
+        return 1;
+    }
+    var dep: &StringNode = action.dep_head;
+    while dep != null {
+        const dep_action: &PlannedAction = find_planned_action_by_label(ctx, dep.text);
+        if dep_action != null && string_node_matches_path(dep_action.output_head, observed_path) != 0 {
+            return 1;
+        }
+        dep = dep.next;
+    }
+    return 0;
+}
+
+fn action_write_path_allowed(action: &PlannedAction, observed_path: &byte) i32 {
+    if action == null || observed_path == null {
+        return 0;
+    }
+    return string_node_matches_path(action.output_head, observed_path);
+}
+
+fn refresh_single_action_dependency_findings(ctx: &Phase2Context, action: &PlannedAction) void {
+    if ctx == null || action == null {
+        return;
+    }
+    action.hidden_input_head = null;
+    action.undeclared_output_head = null;
+
+    var read_path: &StringNode = action.tracked_read_head;
+    while read_path != null {
+        if action_read_path_allowed(ctx, action, read_path.text) == 0 {
+            action_track_hidden_input(ctx.phase1, action, read_path.text);
+        }
+        read_path = read_path.next;
+    }
+
+    var write_path: &StringNode = action.tracked_write_head;
+    while write_path != null {
+        if action_write_path_allowed(action, write_path.text) == 0 {
+            action_track_undeclared_output(ctx.phase1, action, write_path.text);
+        }
+        write_path = write_path.next;
+    }
+}
+
+fn refresh_action_dependency_findings(ctx: &Phase2Context) void {
+    if ctx == null {
+        return;
+    }
+    var action: &PlannedAction = ctx.action_head;
+    while action != null {
+        refresh_single_action_dependency_findings(ctx, action);
+        action = action.next;
+    }
+}
+
+fn enforce_action_strict_findings(ctx: &Phase2Context, action: &PlannedAction) i32 {
+    if ctx == null || action == null || ctx.phase1 == null || ctx.phase1.workspace_ir.strict == 0 {
+        return 0;
+    }
+    if action.hidden_input_head != null {
+        action.cache_status = "execution-failed" as &byte;
+        return set_action_diagnostic(ctx,
+                                     action,
+                                     EXIT_ACTION,
+                                     "UYABUILD_E_STRICT_HIDDEN_INPUT" as &byte,
+                                     "strict mode blocked a hidden input" as &byte,
+                                     action.hidden_input_head.text);
+    }
+    if action.undeclared_output_head != null {
+        action.cache_status = "execution-failed" as &byte;
+        return set_action_diagnostic(ctx,
+                                     action,
+                                     EXIT_ACTION,
+                                     "UYABUILD_E_STRICT_UNDECLARED_OUTPUT" as &byte,
+                                     "strict mode blocked an undeclared output" as &byte,
+                                     action.undeclared_output_head.text);
+    }
+    return 0;
+}
+
 fn collect_typed_labels_sorted(ctx: &Phase1Context, value: &TypedValue, head: &StringNode) &StringNode {
     var result: &StringNode = head;
     if value == null {
@@ -5214,6 +5381,275 @@ fn build_action_log_paths(ctx: &Phase2Context,
     return 0;
 }
 
+fn build_action_trace_prefix(stdout_path: &byte, out: &byte, out_cap: usize) i32 {
+    if stdout_path == null || out == null {
+        return -1;
+    }
+    var dir_path: [byte: PATH_MAX] = [];
+    if path_dirname_text(stdout_path, &dir_path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    return join_path(&dir_path[0] as &byte, "trace" as &byte, out, out_cap);
+}
+
+fn dependency_tracer_path() &byte {
+    if path_is_file("/usr/bin/strace" as &byte) != 0 {
+        return "/usr/bin/strace" as &byte;
+    }
+    if path_is_file("/bin/strace" as &byte) != 0 {
+        return "/bin/strace" as &byte;
+    }
+    return null;
+}
+
+fn normalize_traced_action_path(ctx: &Phase2Context,
+                                action_root: &byte,
+                                raw_path: &byte,
+                                is_write: i32,
+                                out: &byte,
+                                out_cap: usize) i32 {
+    if ctx == null || action_root == null || raw_path == null || out == null {
+        return -1;
+    }
+    if raw_path[0] == 0 as byte {
+        return 1;
+    }
+
+    var normalized_abs: [byte: PATH_MAX] = [];
+    if path_is_absolute(raw_path) != 0 {
+        if normalize_path_text(raw_path, &normalized_abs[0] as &byte, PATH_MAX) != 0 {
+            return -1;
+        }
+    } else if join_and_normalize_path(action_root, raw_path, &normalized_abs[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+
+    if string_has_prefix(&normalized_abs[0] as &byte, &ctx.state_layout.root[0] as &byte) != 0 {
+        return 1;
+    }
+    if string_has_prefix(&normalized_abs[0] as &byte, action_root) != 0 {
+        if path_relative_to_root(action_root, &normalized_abs[0] as &byte, out, out_cap) != 0 {
+            return -1;
+        }
+        if out[0] == 0 as byte || string_equals(out, "." as &byte) != 0 {
+            return 1;
+        }
+        return 0;
+    }
+    if string_has_prefix(&normalized_abs[0] as &byte, ctx.phase1.workspace_root) != 0 {
+        if path_relative_to_root(ctx.phase1.workspace_root, &normalized_abs[0] as &byte, out, out_cap) != 0 {
+            return -1;
+        }
+        if out[0] == 0 as byte || string_equals(out, "." as &byte) != 0 {
+            return 1;
+        }
+        return 0;
+    }
+    if is_write != 0 {
+        return copy_string(out, out_cap, &normalized_abs[0] as &byte);
+    }
+    return 1;
+}
+
+fn trace_extract_quoted_arg(ctx: &Phase2Context, line: &byte, arg_index: i32) &byte {
+    if ctx == null || line == null || arg_index < 0 {
+        return null;
+    }
+    var current_index: i32 = 0;
+    var pos: usize = 0usize;
+    while line[pos] != 0 as byte {
+        if line[pos] != 34 as byte {
+            pos = pos + 1usize;
+            continue;
+        }
+        if current_index != arg_index {
+            pos = pos + 1usize;
+            while line[pos] != 0 as byte {
+                if line[pos] == 92 as byte && line[pos + 1usize] != 0 as byte {
+                    pos = pos + 2usize;
+                    continue;
+                }
+                if line[pos] == 34 as byte {
+                    pos = pos + 1usize;
+                    break;
+                }
+                pos = pos + 1usize;
+            }
+            current_index = current_index + 1;
+            continue;
+        }
+
+        var buffer: [byte: PATH_MAX] = [];
+        var used: usize = 0usize;
+        pos = pos + 1usize;
+        while line[pos] != 0 as byte {
+            var ch: byte = line[pos];
+            if ch == 92 as byte && line[pos + 1usize] != 0 as byte {
+                pos = pos + 1usize;
+                ch = line[pos];
+            } else if ch == 34 as byte {
+                buffer[used] = 0 as byte;
+                return arena_copy_cstr(&ctx.phase1.arena, &buffer[0] as &byte);
+            }
+            if used + 1usize >= PATH_MAX {
+                break;
+            }
+            buffer[used] = ch;
+            used = used + 1usize;
+            pos = pos + 1usize;
+        }
+        return null;
+    }
+    return null;
+}
+
+fn record_traced_action_path(ctx: &Phase2Context,
+                             action: &PlannedAction,
+                             action_root: &byte,
+                             raw_path: &byte,
+                             is_write: i32) void {
+    if ctx == null || action == null || action_root == null || raw_path == null {
+        return;
+    }
+    var normalized_path: [byte: PATH_MAX] = [];
+    const normalized_status: i32 = normalize_traced_action_path(ctx,
+                                                                action_root,
+                                                                raw_path,
+                                                                is_write,
+                                                                &normalized_path[0] as &byte,
+                                                                PATH_MAX);
+    if normalized_status != 0 {
+        return;
+    }
+    if is_write != 0 {
+        action_track_write(ctx.phase1, action, &normalized_path[0] as &byte);
+    } else {
+        action_track_read(ctx.phase1, action, &normalized_path[0] as &byte);
+    }
+}
+
+fn process_dependency_trace_line(ctx: &Phase2Context,
+                                 action: &PlannedAction,
+                                 action_root: &byte,
+                                 line: &byte) void {
+    if ctx == null || action == null || action_root == null || line == null {
+        return;
+    }
+
+    if string_has_prefix(line, "open(" as &byte) != 0 ||
+        string_has_prefix(line, "openat(" as &byte) != 0 {
+        const path_arg: &byte = trace_extract_quoted_arg(ctx, line, 0);
+        var is_write: i32 = 0;
+        if string_contains_text(line, "O_WRONLY" as &byte) != 0 ||
+            string_contains_text(line, "O_RDWR" as &byte) != 0 ||
+            string_contains_text(line, "O_CREAT" as &byte) != 0 ||
+            string_contains_text(line, "O_TRUNC" as &byte) != 0 ||
+            string_contains_text(line, "O_APPEND" as &byte) != 0 {
+            is_write = 1;
+        }
+        record_traced_action_path(ctx, action, action_root, path_arg, is_write);
+        return;
+    }
+
+    if string_has_prefix(line, "creat(" as &byte) != 0 ||
+        string_has_prefix(line, "mkdir(" as &byte) != 0 ||
+        string_has_prefix(line, "mkdirat(" as &byte) != 0 ||
+        string_has_prefix(line, "truncate(" as &byte) != 0 ||
+        string_has_prefix(line, "unlink(" as &byte) != 0 ||
+        string_has_prefix(line, "unlinkat(" as &byte) != 0 {
+        record_traced_action_path(ctx, action, action_root, trace_extract_quoted_arg(ctx, line, 0), 1);
+        return;
+    }
+
+    if string_has_prefix(line, "rename(" as &byte) != 0 ||
+        string_has_prefix(line, "renameat(" as &byte) != 0 ||
+        string_has_prefix(line, "renameat2(" as &byte) != 0 ||
+        string_has_prefix(line, "link(" as &byte) != 0 ||
+        string_has_prefix(line, "linkat(" as &byte) != 0 ||
+        string_has_prefix(line, "symlink(" as &byte) != 0 ||
+        string_has_prefix(line, "symlinkat(" as &byte) != 0 {
+        record_traced_action_path(ctx, action, action_root, trace_extract_quoted_arg(ctx, line, 1), 1);
+        return;
+    }
+
+    if string_has_prefix(line, "access(" as &byte) != 0 ||
+        string_has_prefix(line, "execve(" as &byte) != 0 ||
+        string_has_prefix(line, "faccessat(" as &byte) != 0 ||
+        string_has_prefix(line, "newfstatat(" as &byte) != 0 ||
+        string_has_prefix(line, "readlink(" as &byte) != 0 ||
+        string_has_prefix(line, "stat(" as &byte) != 0 ||
+        string_has_prefix(line, "statx(" as &byte) != 0 ||
+        string_has_prefix(line, "lstat(" as &byte) != 0 ||
+        string_has_prefix(line, "chdir(" as &byte) != 0 {
+        record_traced_action_path(ctx, action, action_root, trace_extract_quoted_arg(ctx, line, 0), 0);
+        return;
+    }
+}
+
+fn process_dependency_trace_file(ctx: &Phase2Context,
+                                 action: &PlannedAction,
+                                 action_root: &byte,
+                                 trace_path: &byte) void {
+    if ctx == null || action == null || action_root == null || trace_path == null {
+        return;
+    }
+    var size_out: usize = 0usize;
+    const content: &byte = read_file_into_arena(ctx.phase1, trace_path, &size_out);
+    _ = size_out;
+    if content == null {
+        return;
+    }
+    var pos: usize = 0usize;
+    while content[pos] != 0 as byte {
+        const line_start: usize = pos;
+        while content[pos] != 0 as byte && content[pos] != 10 as byte {
+            pos = pos + 1usize;
+        }
+        const line_text: &byte = arena_copy_range(&ctx.phase1.arena, content, line_start, pos - line_start);
+        if line_text != null {
+            process_dependency_trace_line(ctx, action, action_root, line_text);
+        }
+        if content[pos] == 10 as byte {
+            pos = pos + 1usize;
+        }
+    }
+}
+
+fn collect_action_dependency_trace(ctx: &Phase2Context,
+                                   action: &PlannedAction,
+                                   action_root: &byte,
+                                   trace_prefix: &byte) void {
+    if ctx == null || action == null || action_root == null || trace_prefix == null {
+        return;
+    }
+    var trace_dir: [byte: PATH_MAX] = [];
+    var trace_base: [byte: PATH_MAX] = [];
+    if path_dirname_text(trace_prefix, &trace_dir[0] as &byte, PATH_MAX) != 0 ||
+        path_basename_text(trace_prefix, &trace_base[0] as &byte, PATH_MAX) != 0 {
+        return;
+    }
+    const dir: &DIR = opendir(&trace_dir[0] as &const byte);
+    if dir == null {
+        return;
+    }
+    const base_len: usize = strlen(&trace_base[0] as &byte);
+    var entry_dir: &Dirent = readdir(dir);
+    while entry_dir != null {
+        const name: &byte = &entry_dir.d_name[0] as &byte;
+        if is_dirent_dot(name) == 0 &&
+            string_has_prefix(name, &trace_base[0] as &byte) != 0 &&
+            (name[base_len] == 0 as byte || name[base_len] == 46 as byte) {
+            var trace_path: [byte: PATH_MAX] = [];
+            if join_path(&trace_dir[0] as &byte, name, &trace_path[0] as &byte, PATH_MAX) == 0 &&
+                path_is_file(&trace_path[0] as &byte) != 0 {
+                process_dependency_trace_file(ctx, action, action_root, &trace_path[0] as &byte);
+            }
+        }
+        entry_dir = readdir(dir);
+    }
+    _ = closedir(dir);
+}
+
 fn materialize_workspace_rel_path(ctx: &Phase2Context,
                                   rel_path: &byte,
                                   action_root: &byte,
@@ -5291,6 +5727,7 @@ fn materialize_action_workspace(ctx: &Phase2Context, action: &PlannedAction, act
         if materialize_workspace_rel_path(ctx, input.text, action_root, 1) != 0 {
             return -1;
         }
+        action_track_read(ctx.phase1, action, input.text);
         input = input.next;
     }
     var dep: &StringNode = action.dep_head;
@@ -5302,6 +5739,7 @@ fn materialize_action_workspace(ctx: &Phase2Context, action: &PlannedAction, act
                 if materialize_workspace_rel_path(ctx, dep_output.text, action_root, 0) != 0 {
                     return -1;
                 }
+                action_track_read(ctx.phase1, action, dep_output.text);
                 dep_output = dep_output.next;
             }
         }
@@ -5505,6 +5943,7 @@ fn commit_action_outputs(ctx: &Phase2Context, action: &PlannedAction, action_roo
         if path_is_file(&staged_abs[0] as &byte) == 0 && path_is_dir(&staged_abs[0] as &byte) == 0 {
             return -1;
         }
+        action_track_write(ctx.phase1, action, output.text);
         output = output.next;
     }
 
@@ -5553,13 +5992,15 @@ fn execute_local_action(ctx: &Phase2Context, action: &PlannedAction) i32 {
     var action_root: [byte: PATH_MAX] = [];
     var stdout_path: [byte: PATH_MAX] = [];
     var stderr_path: [byte: PATH_MAX] = [];
+    var trace_prefix: [byte: PATH_MAX] = [];
     if build_action_workspace_root(ctx, action, &action_root[0] as &byte, PATH_MAX) != 0 ||
         build_action_log_paths(ctx,
                                action,
                                &stdout_path[0] as &byte,
                                &stderr_path[0] as &byte,
                                PATH_MAX,
-                               PATH_MAX) != 0 {
+                               PATH_MAX) != 0 ||
+        build_action_trace_prefix(&stdout_path[0] as &byte, &trace_prefix[0] as &byte, PATH_MAX) != 0 {
         return set_action_diagnostic(ctx,
                                      action,
                                      EXIT_IO,
@@ -5612,6 +6053,7 @@ fn execute_local_action(ctx: &Phase2Context, action: &PlannedAction) i32 {
 
     const shell_path: &byte = "/bin/sh" as &byte;
     var exec_args: [&byte: 4] = [shell_path, "-c" as &byte, command_text, null];
+    const tracer_path: &byte = dependency_tracer_path();
     const child_pid: i32 = fork();
     if child_pid < 0 {
         return set_action_diagnostic(ctx,
@@ -5624,6 +6066,22 @@ fn execute_local_action(ctx: &Phase2Context, action: &PlannedAction) i32 {
     if child_pid == 0 {
         if chdir(&action_root[0] as &const byte) != 0 {
             _exit(127);
+        }
+        if tracer_path != null {
+            var trace_exec_args: [&byte: 13] = [tracer_path,
+                                                "-ff" as &byte,
+                                                "-qq" as &byte,
+                                                "-s" as &byte,
+                                                "4096" as &byte,
+                                                "-e" as &byte,
+                                                "trace=%file" as &byte,
+                                                "-o" as &byte,
+                                                &trace_prefix[0] as &byte,
+                                                shell_path,
+                                                "-c" as &byte,
+                                                command_text,
+                                                null];
+            execve(tracer_path as &const byte, &trace_exec_args[0] as & &byte, &envp[0] as & &byte);
         }
         execve(shell_path as &const byte, &exec_args[0] as & &byte, &envp[0] as & &byte);
         _exit(127);
@@ -5677,6 +6135,8 @@ fn execute_local_action(ctx: &Phase2Context, action: &PlannedAction) i32 {
                                          &stderr_path[0] as &byte);
         }
     }
+    collect_action_dependency_trace(ctx, action, &action_root[0] as &byte, &trace_prefix[0] as &byte);
+    refresh_single_action_dependency_findings(ctx, action);
     if action.exit_code != 0 {
         action.cache_status = "execution-failed" as &byte;
         var detail_buf: [byte: PATH_MAX] = [];
@@ -5692,6 +6152,9 @@ fn execute_local_action(ctx: &Phase2Context, action: &PlannedAction) i32 {
                                      "UYABUILD_E_ACTION_FAILED" as &byte,
                                      "build action exited with a non-zero status" as &byte,
                                      arena_copy_cstr(&ctx.phase1.arena, &detail_buf[0] as &byte));
+    }
+    if enforce_action_strict_findings(ctx, action) != 0 {
+        return -1;
     }
 
     if commit_action_outputs(ctx, action, &action_root[0] as &byte) != 0 {
@@ -7010,6 +7473,7 @@ fn read_cache_output_digest(ctx: &Phase2Context, action_key: &byte, out: &byte, 
 }
 
 fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &StringNode) i32 {
+    refresh_action_dependency_findings(ctx);
     var build_run_path: [byte: PATH_MAX] = [];
     if join_path(&ctx.state_layout.meta_build_runs[0] as &byte, &ctx.manifest.run_id[0] as &byte, &build_run_path[0] as &byte, PATH_MAX) != 0 {
         return -1;
@@ -7138,6 +7602,14 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
         } else {
             fputs("null" as *byte, action_file);
         }
+        fputs(",\"tracked_reads\":" as *byte, action_file);
+        emit_string_node_array_json(action_file, action.tracked_read_head);
+        fputs(",\"tracked_writes\":" as *byte, action_file);
+        emit_string_node_array_json(action_file, action.tracked_write_head);
+        fputs(",\"hidden_inputs\":" as *byte, action_file);
+        emit_string_node_array_json(action_file, action.hidden_input_head);
+        fputs(",\"undeclared_outputs\":" as *byte, action_file);
+        emit_string_node_array_json(action_file, action.undeclared_output_head);
         fputs("}\n" as *byte, action_file);
         _ = fflush(action_file);
         if fclose(action_file) != 0 {
@@ -7329,6 +7801,14 @@ fn emit_action_json(stream: &FILE, action: &PlannedAction) void {
     emit_string_node_array_json(stream, action.input_head);
     fputs(",\"outputs\":" as *byte, stream);
     emit_string_node_array_json(stream, action.output_head);
+    fputs(",\"tracked_reads\":" as *byte, stream);
+    emit_string_node_array_json(stream, action.tracked_read_head);
+    fputs(",\"tracked_writes\":" as *byte, stream);
+    emit_string_node_array_json(stream, action.tracked_write_head);
+    fputs(",\"hidden_inputs\":" as *byte, stream);
+    emit_string_node_array_json(stream, action.hidden_input_head);
+    fputs(",\"undeclared_outputs\":" as *byte, stream);
+    emit_string_node_array_json(stream, action.undeclared_output_head);
     fputs("}" as *byte, stream);
 }
 

@@ -1,0 +1,1 @@
+fixture-copy:undeclared-output

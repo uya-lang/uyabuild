@@ -1,0 +1,11 @@
+workspace: undeclared-output
+phase: 3
+matched_targets: 1
+planned_actions: 1
+cache_hits: 0
+seeded_outputs: 0
+success_no_change: 0
+pending_execution: 0
+root_digest: 2da747e4ca6435595cd55059586454305a440f2e4abf5d891643dacc01e844f2
+matched:
+  //demo:write

@@ -1,0 +1,13 @@
+workspace {
+  name = "undeclared-output"
+  default = ["//demo:write"]
+  strict = false
+}
+
+use legacy
+
+legacy.shell "//demo:write" {
+  script = ["sh", "build.sh"]
+  inputs = ["build.sh", "input.txt"]
+  outputs = ["out/result.txt"]
+}

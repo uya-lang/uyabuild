@@ -141,12 +141,13 @@
 
 ### 8.2 TODO
 
-当前状态（2026-05-22）：
+当前状态（2026-05-26）：
 
 - `bin/uyabuild build` 已进入 Phase 3 本地执行路径：待执行的 `legacy.shell` / `task` 动作会在私有临时工作区中运行，并把 `stdout` / `stderr` 分离采集到 `.uya-build/tmp/actions/<run-id>/<action-key>/`。
 - 已完成的首批闭环：本地 Executor 骨架、动作临时工作区、日志采集、原子输出提交、环境变量白名单、`pure/host/volatile` 执行模式，以及 `executed-local` / `execution-failed` 元数据落盘。
 - `execution_mode` 现已生效：`pure` 仅物化声明输入与依赖输出，`host` 会额外物化兼容所需的工作区内容，`volatile` 会跳过本地缓存与 `success-no-change` 复用路径。
-- 当前仍受限于兼容执行路径：`cxx` / `node` / `oci` 等动作尚未接入本地执行器，命中待执行动作时会返回 `UYABUILD_E_EXECUTOR_UNSUPPORTED`；依赖追踪、严格模式、资源池与网络策略仍待后续收口。
+- Linux 兼容执行路径现已接入 `strace` 依赖追踪：动作元数据会记录 `tracked_reads` / `tracked_writes`、`hidden_inputs`、`undeclared_outputs`；`workspace.strict = true` 时，隐藏输入和未声明输出会在输出提交前直接失败。
+- 当前仍受限于兼容执行路径：`cxx` / `node` / `oci` 等动作尚未接入本地执行器，命中待执行动作时会返回 `UYABUILD_E_EXECUTOR_UNSUPPORTED`；macOS 依赖追踪后端、资源池与网络策略仍待后续收口。
 
 | ID | 优先级 | 任务 | 依赖 | 验收标准 |
 |---|---|---|---|---|
@@ -156,9 +157,9 @@
 | `P3-4` | `P0` | 实现原子输出提交 | `P3-2` | 失败动作不污染正式输出 |
 | `P3-5` | `P0` | 实现环境变量白名单机制 | `P3-1` | 未放行变量默认不可见 |
 | `P3-6` | `P0` | 已完成：实现 `pure/host/volatile` 执行模式 | `P3-1` | 不同模式的缓存和权限策略生效 |
-| `P3-7` | `P0` | 实现基础依赖追踪接口 | `P3-1` | 动作可记录读写路径 |
-| `P3-8` | `P1` | 接入 Linux/macOS 依赖追踪实现 | `P3-7` | 隐藏输入与越权写出可被捕获 |
-| `P3-9` | `P0` | 实现 strict/compat 模式开关 | `P3-7` | 严格模式下隐藏依赖会失败 |
+| `P3-7` | `P0` | 已完成：实现基础依赖追踪接口 | `P3-1` | 动作可记录读写路径 |
+| `P3-8` | `P1` | 部分完成：已接入 Linux 依赖追踪实现，macOS 待补 | `P3-7` | 隐藏输入与越权写出可被捕获 |
+| `P3-9` | `P0` | 已完成：实现 strict/compat 模式开关 | `P3-7` | 严格模式下隐藏依赖会失败 |
 | `P3-10` | `P1` | 实现资源池与并行调度 | `P3-1`, `P2-6` | `link/docker/network` 池生效 |
 | `P3-11` | `P1` | 实现网络默认关闭策略 | `P3-6` | 未显式声明的动作不可访问网络 |
 | `P3-12` | `P1` | 把 ActionRecord 写入 NoSQLite 和 CAS | `P3-3`, `P2-4` | 可查询历史执行记录 |

@@ -1,2 +1,4 @@
 .uya-build/meta/actions/7e9db7a416970096735ee4e242ddac09a7538d75c0fbd53d621d5ff69054affd|"stdout_digest":"1675c119d3d257479cd7c49204b31caae94c93de4afdb202797194fdb01fee6d"
 .uya-build/meta/actions/7e9db7a416970096735ee4e242ddac09a7538d75c0fbd53d621d5ff69054affd|"stderr_digest":"d8de0617b7c8c3da5302f9ad0f34e283e66d77e6533f6e4e42ff07c400f752a5"
+.uya-build/meta/actions/7e9db7a416970096735ee4e242ddac09a7538d75c0fbd53d621d5ff69054affd|"tracked_reads":["build.sh","input.txt"]
+.uya-build/meta/actions/7e9db7a416970096735ee4e242ddac09a7538d75c0fbd53d621d5ff69054affd|"tracked_writes":["out","out/result.txt"]
