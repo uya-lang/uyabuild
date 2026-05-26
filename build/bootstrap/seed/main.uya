@@ -58,6 +58,7 @@ const S_IFDIR: u32 = 16384u32;
 const S_IFREG: u32 = 32768u32;
 
 const MAX_ARGS: i32 = 256;
+const DEFAULT_BUILD_JOBS: i32 = 4;
 const PLAN_PHASE_NUMBER: i32 = 2;
 const BUILD_PHASE_NUMBER: i32 = 3;
 const PHASE1_ARENA_SIZE: i32 = 16 * 1024 * 1024;
@@ -78,6 +79,7 @@ struct Options {
     workspace_override: &byte,
     state_dir_override: &byte,
     output_mode: i32,
+    jobs: i32,
 }
 
 struct Workspace {
@@ -324,7 +326,10 @@ struct PlannedAction {
     label: &byte,
     kind: &byte,
     mnemonic: &byte,
+    pool_name: &byte,
     execution_mode: &byte,
+    action_root_path: &byte,
+    trace_prefix_path: &byte,
     stdout_path: &byte,
     stderr_path: &byte,
     stdout_digest: &byte,
@@ -347,6 +352,7 @@ struct PlannedAction {
     cache_status: &byte,
     exit_code: i32,
     pending_execution: i32,
+    child_pid: i32,
     order_index: i32,
     next: &PlannedAction,
 }
@@ -367,6 +373,7 @@ struct Phase2Context {
     seeded_count: i32,
     no_change_count: i32,
     pending_count: i32,
+    max_jobs: i32,
     root_digest: &byte,
 }
 
@@ -483,6 +490,31 @@ fn copy_string(out: &byte, out_cap: usize, text: &byte) i32 {
     if written < 0 || written >= out_cap as i32 {
         return -1;
     }
+    return 0;
+}
+
+fn parse_positive_i32_text(text: &byte, out: &i32) i32 {
+    if text == null || out == null || text[0] == 0 as byte {
+        return -1;
+    }
+    var value: i32 = 0;
+    var i: usize = 0usize;
+    while text[i] != 0 as byte {
+        const ch: i32 = text[i] as i32;
+        if ch < 48 || ch > 57 {
+            return -1;
+        }
+        const digit: i32 = ch - 48;
+        if value > 214748364 || (value == 214748364 && digit > 7) {
+            return -1;
+        }
+        value = value * 10 + digit;
+        i = i + 1usize;
+    }
+    if value <= 0 {
+        return -1;
+    }
+    out[0] = value;
     return 0;
 }
 
@@ -1276,7 +1308,8 @@ fn phase2_ctx_init(ctx: &Phase2Context,
                    state_layout: &StateLayout,
                    manifest: &RunManifest,
                    requested_count: i32,
-                   matched_count: i32) void {
+                   matched_count: i32,
+                   max_jobs: i32) void {
     ctx.phase1 = phase1;
     ctx.state_layout = state_layout;
     ctx.manifest = manifest;
@@ -1290,7 +1323,13 @@ fn phase2_ctx_init(ctx: &Phase2Context,
     ctx.action_count = 0;
     ctx.cache_hit_count = 0;
     ctx.seeded_count = 0;
+    ctx.no_change_count = 0;
     ctx.pending_count = 0;
+    if max_jobs > 0 {
+        ctx.max_jobs = max_jobs;
+    } else {
+        ctx.max_jobs = 1;
+    }
     ctx.root_digest = null;
 }
 
@@ -2982,6 +3021,9 @@ fn field_expected_type(kind: &byte, field_name: &byte) i32 {
     if string_equals(field_name, "execution_mode" as &byte) != 0 {
         return EXPECT_STRING;
     }
+    if string_equals(field_name, "pool" as &byte) != 0 {
+        return EXPECT_STRING;
+    }
 
     if string_equals(kind, "cxx.library" as &byte) != 0 {
         if string_equals(field_name, "srcs" as &byte) != 0 ||
@@ -4210,6 +4252,31 @@ fn is_valid_execution_mode(text: &byte) i32 {
     return 0;
 }
 
+fn is_valid_pool_name(text: &byte) i32 {
+    if text == null || text[0] == 0 as byte {
+        return 0;
+    }
+    var i: usize = 0usize;
+    while text[i] != 0 as byte {
+        const ch: i32 = text[i] as i32;
+        var valid: i32 = 0;
+        if (ch >= 48 && ch <= 57) ||
+            (ch >= 65 && ch <= 90) ||
+            (ch >= 97 && ch <= 122) ||
+            ch == 45 ||
+            ch == 46 ||
+            ch == 58 ||
+            ch == 95 {
+            valid = 1;
+        }
+        if valid == 0 {
+            return 0;
+        }
+        i = i + 1usize;
+    }
+    return 1;
+}
+
 fn default_execution_mode_for_kind(kind: &byte) &byte {
     if kind == null {
         return "host" as &byte;
@@ -4223,6 +4290,19 @@ fn default_execution_mode_for_kind(kind: &byte) &byte {
     return "pure" as &byte;
 }
 
+fn default_pool_for_kind(kind: &byte) &byte {
+    if kind == null {
+        return "cpu" as &byte;
+    }
+    if string_equals(kind, "cxx.binary" as &byte) != 0 {
+        return "link" as &byte;
+    }
+    if string_equals(kind, "oci.image" as &byte) != 0 {
+        return "docker" as &byte;
+    }
+    return "cpu" as &byte;
+}
+
 fn target_execution_mode(target: &IRTarget) &byte {
     if target == null {
         return "host" as &byte;
@@ -4233,6 +4313,18 @@ fn target_execution_mode(target: &IRTarget) &byte {
         return field.value.text;
     }
     return default_execution_mode_for_kind(target.kind);
+}
+
+fn target_pool_name(target: &IRTarget) &byte {
+    if target == null {
+        return "cpu" as &byte;
+    }
+    const field: &IRField = find_ir_field(target.attrs, "pool" as &byte);
+    if field != null && field.value != null && field.value.text != null &&
+        is_valid_pool_name(field.value.text) != 0 {
+        return field.value.text;
+    }
+    return default_pool_for_kind(target.kind);
 }
 
 fn action_uses_local_cache(action: &PlannedAction) i32 {
@@ -4261,6 +4353,19 @@ fn validate_targets(ctx: &Phase1Context) i32 {
                                 target.file.rel_path,
                                 execution_mode_field.value.span.start.line,
                                 execution_mode_field.value.span.start.column);
+        }
+        const pool_field: &IRField = find_ir_field(target.attrs, "pool" as &byte);
+        if pool_field != null &&
+            (pool_field.value == null ||
+             pool_field.value.text == null ||
+             is_valid_pool_name(pool_field.value.text) == 0) {
+            return phase1_error(ctx,
+                                "UYABUILD_E_POOL" as &byte,
+                                "pool must be a non-empty identifier using letters, digits, ., _, -, or :" as &byte,
+                                target.label,
+                                target.file.rel_path,
+                                pool_field.value.span.start.line,
+                                pool_field.value.span.start.column);
         }
         if string_equals(target.kind, "legacy.shell" as &byte) != 0 {
             if target_field_exists(target, "script" as &byte) == 0 &&
@@ -5985,7 +6090,33 @@ fn action_supports_local_executor(action: &PlannedAction) i32 {
     return 0;
 }
 
-fn execute_local_action(ctx: &Phase2Context, action: &PlannedAction) i32 {
+fn finish_pending_action(ctx: &Phase2Context, action: &PlannedAction, cache_status: &byte, exit_code: i32) void {
+    if action == null {
+        return;
+    }
+    action.cache_status = cache_status;
+    action.exit_code = exit_code;
+    action.child_pid = 0;
+    if action.pending_execution != 0 {
+        action.pending_execution = 0;
+        if ctx != null && ctx.pending_count > 0 {
+            ctx.pending_count = ctx.pending_count - 1;
+        }
+    }
+}
+
+fn fail_pending_action(ctx: &Phase2Context,
+                       action: &PlannedAction,
+                       action_exit_code: i32,
+                       diagnostic_exit_code: i32,
+                       code: &byte,
+                       message: &byte,
+                       detail: &byte) i32 {
+    finish_pending_action(ctx, action, "execution-failed" as &byte, action_exit_code);
+    return set_action_diagnostic(ctx, action, diagnostic_exit_code, code, message, detail);
+}
+
+fn start_local_action(ctx: &Phase2Context, action: &PlannedAction) i32 {
     if ctx == null || action == null {
         return -1;
     }
@@ -6001,54 +6132,63 @@ fn execute_local_action(ctx: &Phase2Context, action: &PlannedAction) i32 {
                                PATH_MAX,
                                PATH_MAX) != 0 ||
         build_action_trace_prefix(&stdout_path[0] as &byte, &trace_prefix[0] as &byte, PATH_MAX) != 0 {
-        return set_action_diagnostic(ctx,
-                                     action,
-                                     EXIT_IO,
-                                     "UYABUILD_E_EXECUTOR_SETUP" as &byte,
-                                     "failed to prepare local executor directories" as &byte,
-                                     "check temporary directory permissions and path lengths" as &byte);
+        return fail_pending_action(ctx,
+                                   action,
+                                   127,
+                                   EXIT_IO,
+                                   "UYABUILD_E_EXECUTOR_SETUP" as &byte,
+                                   "failed to prepare local executor directories" as &byte,
+                                   "check temporary directory permissions and path lengths" as &byte);
     }
+    action.action_root_path = arena_copy_cstr(&ctx.phase1.arena, &action_root[0] as &byte);
+    action.stdout_path = arena_copy_cstr(&ctx.phase1.arena, &stdout_path[0] as &byte);
+    action.stderr_path = arena_copy_cstr(&ctx.phase1.arena, &stderr_path[0] as &byte);
+    action.trace_prefix_path = arena_copy_cstr(&ctx.phase1.arena, &trace_prefix[0] as &byte);
     if path_is_file(&action_root[0] as &byte) != 0 || path_is_dir(&action_root[0] as &byte) != 0 {
         if recursive_remove_path(&action_root[0] as &byte) != 0 {
-            return set_action_diagnostic(ctx,
-                                         action,
-                                         EXIT_IO,
-                                         "UYABUILD_E_EXECUTOR_SETUP" as &byte,
-                                         "failed to clear a stale local executor workspace" as &byte,
-                                         &action_root[0] as &byte);
+            return fail_pending_action(ctx,
+                                       action,
+                                       127,
+                                       EXIT_IO,
+                                       "UYABUILD_E_EXECUTOR_SETUP" as &byte,
+                                       "failed to clear a stale local executor workspace" as &byte,
+                                       &action_root[0] as &byte);
         }
     }
     if ensure_dir_recursive(&action_root[0] as &byte) != 0 ||
         materialize_action_workspace(ctx, action, &action_root[0] as &byte) != 0 {
-        return set_action_diagnostic(ctx,
-                                     action,
-                                     EXIT_IO,
-                                     "UYABUILD_E_ACTION_MATERIALIZE" as &byte,
-                                     "failed to materialize the action workspace" as &byte,
-                                     action.label);
+        return fail_pending_action(ctx,
+                                   action,
+                                   127,
+                                   EXIT_IO,
+                                   "UYABUILD_E_ACTION_MATERIALIZE" as &byte,
+                                   "failed to materialize the action workspace" as &byte,
+                                   action.label);
     }
     const command_text: &byte = build_action_shell_command(ctx.phase1,
                                                            action,
                                                            &stdout_path[0] as &byte,
                                                            &stderr_path[0] as &byte);
     if command_text == null {
-        return set_action_diagnostic(ctx,
-                                     action,
-                                     EXIT_CONFIG,
-                                     "UYABUILD_E_ACTION_COMMAND" as &byte,
-                                     "failed to serialize the action command line" as &byte,
-                                     action.label);
+        return fail_pending_action(ctx,
+                                   action,
+                                   127,
+                                   EXIT_CONFIG,
+                                   "UYABUILD_E_ACTION_COMMAND" as &byte,
+                                   "failed to serialize the action command line" as &byte,
+                                   action.label);
     }
 
     var envp: [&byte: MAX_ARGS] = [];
     var env_count: i32 = 0;
     if build_action_exec_env(ctx, action, &action_root[0] as &byte, envp, &env_count) != 0 {
-        return set_action_diagnostic(ctx,
-                                     action,
-                                     EXIT_IO,
-                                     "UYABUILD_E_EXECUTOR_ENV" as &byte,
-                                     "failed to build the action environment whitelist" as &byte,
-                                     action.label);
+        return fail_pending_action(ctx,
+                                   action,
+                                   127,
+                                   EXIT_IO,
+                                   "UYABUILD_E_EXECUTOR_ENV" as &byte,
+                                   "failed to build the action environment whitelist" as &byte,
+                                   action.label);
     }
 
     const shell_path: &byte = "/bin/sh" as &byte;
@@ -6056,12 +6196,13 @@ fn execute_local_action(ctx: &Phase2Context, action: &PlannedAction) i32 {
     const tracer_path: &byte = dependency_tracer_path();
     const child_pid: i32 = fork();
     if child_pid < 0 {
-        return set_action_diagnostic(ctx,
-                                     action,
-                                     EXIT_IO,
-                                     "UYABUILD_E_EXECUTOR_FORK" as &byte,
-                                     "failed to fork the local executor child" as &byte,
-                                     action.label);
+        return fail_pending_action(ctx,
+                                   action,
+                                   127,
+                                   EXIT_IO,
+                                   "UYABUILD_E_EXECUTOR_FORK" as &byte,
+                                   "failed to fork the local executor child" as &byte,
+                                   action.label);
     }
     if child_pid == 0 {
         if chdir(&action_root[0] as &const byte) != 0 {
@@ -6086,123 +6227,268 @@ fn execute_local_action(ctx: &Phase2Context, action: &PlannedAction) i32 {
         execve(shell_path as &const byte, &exec_args[0] as & &byte, &envp[0] as & &byte);
         _exit(127);
     }
+    action.child_pid = child_pid;
+    return 0;
+}
 
-    action.stdout_path = arena_copy_cstr(&ctx.phase1.arena, &stdout_path[0] as &byte);
-    action.stderr_path = arena_copy_cstr(&ctx.phase1.arena, &stderr_path[0] as &byte);
-
-    var wait_status: i32 = 0;
-    if waitpid(child_pid, &wait_status, 0) < 0 {
-        action.cache_status = "execution-failed" as &byte;
-        action.pending_execution = 0;
-        action.exit_code = 127;
-        if ctx.pending_count > 0 {
-            ctx.pending_count = ctx.pending_count - 1;
-        }
-        return set_action_diagnostic(ctx,
-                                     action,
-                                     EXIT_IO,
-                                     "UYABUILD_E_EXECUTOR_WAIT" as &byte,
-                                     "failed to collect the local executor result" as &byte,
-                                     action.label);
+fn complete_local_action(ctx: &Phase2Context, action: &PlannedAction, wait_status: i32) i32 {
+    if ctx == null || action == null {
+        return -1;
     }
-
-    action.exit_code = wait_status_exit_code(wait_status);
-    action.pending_execution = 0;
-    if ctx.pending_count > 0 {
-        ctx.pending_count = ctx.pending_count - 1;
-    }
-    if path_is_file(&stdout_path[0] as &byte) != 0 {
-        action.stdout_digest = persist_action_log_digest(ctx, &stdout_path[0] as &byte);
+    finish_pending_action(ctx, action, action.cache_status, wait_status_exit_code(wait_status));
+    if action.stdout_path != null && path_is_file(action.stdout_path) != 0 {
+        action.stdout_digest = persist_action_log_digest(ctx, action.stdout_path);
         if action.stdout_digest == null {
-            action.cache_status = "execution-failed" as &byte;
-            return set_action_diagnostic(ctx,
-                                         action,
-                                         EXIT_IO,
-                                         "UYABUILD_E_LOG_CAS_WRITE" as &byte,
-                                         "failed to persist stdout log into CAS" as &byte,
-                                         &stdout_path[0] as &byte);
+            return fail_pending_action(ctx,
+                                       action,
+                                       action.exit_code,
+                                       EXIT_IO,
+                                       "UYABUILD_E_LOG_CAS_WRITE" as &byte,
+                                       "failed to persist stdout log into CAS" as &byte,
+                                       action.stdout_path);
         }
     }
-    if path_is_file(&stderr_path[0] as &byte) != 0 {
-        action.stderr_digest = persist_action_log_digest(ctx, &stderr_path[0] as &byte);
+    if action.stderr_path != null && path_is_file(action.stderr_path) != 0 {
+        action.stderr_digest = persist_action_log_digest(ctx, action.stderr_path);
         if action.stderr_digest == null {
-            action.cache_status = "execution-failed" as &byte;
-            return set_action_diagnostic(ctx,
-                                         action,
-                                         EXIT_IO,
-                                         "UYABUILD_E_LOG_CAS_WRITE" as &byte,
-                                         "failed to persist stderr log into CAS" as &byte,
-                                         &stderr_path[0] as &byte);
+            return fail_pending_action(ctx,
+                                       action,
+                                       action.exit_code,
+                                       EXIT_IO,
+                                       "UYABUILD_E_LOG_CAS_WRITE" as &byte,
+                                       "failed to persist stderr log into CAS" as &byte,
+                                       action.stderr_path);
         }
     }
-    collect_action_dependency_trace(ctx, action, &action_root[0] as &byte, &trace_prefix[0] as &byte);
+    collect_action_dependency_trace(ctx, action, action.action_root_path, action.trace_prefix_path);
     refresh_single_action_dependency_findings(ctx, action);
     if action.exit_code != 0 {
-        action.cache_status = "execution-failed" as &byte;
         var detail_buf: [byte: PATH_MAX] = [];
         _ = snprintf(&detail_buf[0] as *byte,
                      PATH_MAX,
                      "%s exited with status %d; see %s" as *byte,
                      action.label as *byte,
                      action.exit_code,
-                     &stderr_path[0] as *byte);
-        return set_action_diagnostic(ctx,
-                                     action,
-                                     EXIT_ACTION,
-                                     "UYABUILD_E_ACTION_FAILED" as &byte,
-                                     "build action exited with a non-zero status" as &byte,
-                                     arena_copy_cstr(&ctx.phase1.arena, &detail_buf[0] as &byte));
+                     action.stderr_path as *byte);
+        return fail_pending_action(ctx,
+                                   action,
+                                   action.exit_code,
+                                   EXIT_ACTION,
+                                   "UYABUILD_E_ACTION_FAILED" as &byte,
+                                   "build action exited with a non-zero status" as &byte,
+                                   arena_copy_cstr(&ctx.phase1.arena, &detail_buf[0] as &byte));
     }
     if enforce_action_strict_findings(ctx, action) != 0 {
         return -1;
     }
 
-    if commit_action_outputs(ctx, action, &action_root[0] as &byte) != 0 {
-        action.cache_status = "execution-failed" as &byte;
-        return set_action_diagnostic(ctx,
-                                     action,
-                                     EXIT_ACTION,
-                                     "UYABUILD_E_OUTPUT_COMMIT" as &byte,
-                                     "action completed but declared outputs could not be committed" as &byte,
-                                     action.label);
+    if commit_action_outputs(ctx, action, action.action_root_path) != 0 {
+        return fail_pending_action(ctx,
+                                   action,
+                                   action.exit_code,
+                                   EXIT_ACTION,
+                                   "UYABUILD_E_OUTPUT_COMMIT" as &byte,
+                                   "action completed but declared outputs could not be committed" as &byte,
+                                   action.label);
     }
     action.output_root_digest = action_collect_observed_outputs(ctx, action);
     if action.output_head != null && action.output_root_digest == null {
-        action.cache_status = "execution-failed" as &byte;
-        return set_action_diagnostic(ctx,
-                                     action,
-                                     EXIT_ACTION,
-                                     "UYABUILD_E_OUTPUT_MISSING" as &byte,
-                                     "action completed without producing every declared output" as &byte,
-                                     action.label);
+        return fail_pending_action(ctx,
+                                   action,
+                                   action.exit_code,
+                                   EXIT_ACTION,
+                                   "UYABUILD_E_OUTPUT_MISSING" as &byte,
+                                   "action completed without producing every declared output" as &byte,
+                                   action.label);
     }
     action.cache_status = "executed-local" as &byte;
-    _ = recursive_remove_path(&action_root[0] as &byte);
+    if action.action_root_path != null {
+        _ = recursive_remove_path(action.action_root_path);
+    }
     return 0;
+}
+
+fn count_running_actions(ctx: &Phase2Context) i32 {
+    if ctx == null {
+        return 0;
+    }
+    var count: i32 = 0;
+    var action: &PlannedAction = ctx.action_head;
+    while action != null {
+        if action.child_pid > 0 {
+            count = count + 1;
+        }
+        action = action.next;
+    }
+    return count;
+}
+
+fn count_running_actions_in_pool(ctx: &Phase2Context, pool_name: &byte) i32 {
+    if ctx == null || pool_name == null {
+        return 0;
+    }
+    var count: i32 = 0;
+    var action: &PlannedAction = ctx.action_head;
+    while action != null {
+        if action.child_pid > 0 &&
+            action.pool_name != null &&
+            string_equals(action.pool_name, pool_name) != 0 {
+            count = count + 1;
+        }
+        action = action.next;
+    }
+    return count;
+}
+
+fn pool_capacity_for_name(ctx: &Phase2Context, pool_name: &byte) i32 {
+    if ctx == null || pool_name == null {
+        return 1;
+    }
+    if string_equals(pool_name, "cpu" as &byte) != 0 {
+        if ctx.max_jobs > 0 {
+            return ctx.max_jobs;
+        }
+        return 1;
+    }
+    return 1;
+}
+
+fn action_dependencies_ready(ctx: &Phase2Context, action: &PlannedAction) i32 {
+    if ctx == null || action == null {
+        return 0;
+    }
+    var dep: &StringNode = action.dep_head;
+    while dep != null {
+        const dep_action: &PlannedAction = find_planned_action_by_label(ctx, dep.text);
+        if dep_action == null ||
+            dep_action.pending_execution != 0 ||
+            dep_action.child_pid > 0 {
+            return 0;
+        }
+        dep = dep.next;
+    }
+    return 1;
+}
+
+fn find_running_action_by_pid(ctx: &Phase2Context, child_pid: i32) &PlannedAction {
+    if ctx == null || child_pid <= 0 {
+        return null;
+    }
+    var action: &PlannedAction = ctx.action_head;
+    while action != null {
+        if action.child_pid == child_pid {
+            return action;
+        }
+        action = action.next;
+    }
+    return null;
+}
+
+fn first_pending_action(ctx: &Phase2Context) &PlannedAction {
+    if ctx == null {
+        return null;
+    }
+    var action: &PlannedAction = ctx.action_head;
+    while action != null {
+        if action.pending_execution != 0 {
+            return action;
+        }
+        action = action.next;
+    }
+    return null;
 }
 
 fn execute_pending_actions(ctx: &Phase2Context) i32 {
     if ctx == null {
         return -1;
     }
-    var action: &PlannedAction = ctx.action_head;
-    while action != null {
-        if action.pending_execution != 0 {
-            if action_supports_local_executor(action) == 0 {
-                return set_action_diagnostic(ctx,
-                                             action,
-                                             EXIT_NOT_IMPLEMENTED,
-                                             "UYABUILD_E_EXECUTOR_UNSUPPORTED" as &byte,
-                                             "the local executor does not yet support this action kind" as &byte,
-                                             action.kind);
-            }
-            if execute_local_action(ctx, action) != 0 {
-                return -1;
+    var saw_failure: i32 = 0;
+    while true {
+        if saw_failure == 0 {
+            var action: &PlannedAction = ctx.action_head;
+            while action != null {
+                if count_running_actions(ctx) >= ctx.max_jobs {
+                    break;
+                }
+                if action.pending_execution != 0 &&
+                    action.child_pid == 0 &&
+                    action_dependencies_ready(ctx, action) != 0 &&
+                    count_running_actions_in_pool(ctx, action.pool_name) < pool_capacity_for_name(ctx, action.pool_name) {
+                    if action_supports_local_executor(action) == 0 {
+                        _ = fail_pending_action(ctx,
+                                                action,
+                                                127,
+                                                EXIT_NOT_IMPLEMENTED,
+                                                "UYABUILD_E_EXECUTOR_UNSUPPORTED" as &byte,
+                                                "the local executor does not yet support this action kind" as &byte,
+                                                action.kind);
+                        saw_failure = 1;
+                        break;
+                    }
+                    if start_local_action(ctx, action) != 0 {
+                        saw_failure = 1;
+                        break;
+                    }
+                }
+                action = action.next;
             }
         }
-        action = action.next;
+
+        const running_count: i32 = count_running_actions(ctx);
+        if running_count == 0 {
+            if saw_failure != 0 {
+                return -1;
+            }
+            const stalled_action: &PlannedAction = first_pending_action(ctx);
+            if stalled_action == null {
+                return 0;
+            }
+            return fail_pending_action(ctx,
+                                       stalled_action,
+                                       127,
+                                       EXIT_ACTION,
+                                       "UYABUILD_E_SCHEDULER_STALL" as &byte,
+                                       "the local scheduler stalled before every pending action could start" as &byte,
+                                       stalled_action.label);
+        }
+
+        var wait_status: i32 = 0;
+        const finished_pid: i32 = waitpid(-1, &wait_status, 0);
+        if finished_pid < 0 {
+            const blocked_action: &PlannedAction = first_pending_action(ctx);
+            if blocked_action != null {
+                return fail_pending_action(ctx,
+                                           blocked_action,
+                                           127,
+                                           EXIT_IO,
+                                           "UYABUILD_E_EXECUTOR_WAIT" as &byte,
+                                           "failed to collect the local executor result" as &byte,
+                                           blocked_action.label);
+            }
+            return set_diagnostic(ctx.phase1,
+                                  EXIT_IO,
+                                  "UYABUILD_E_EXECUTOR_WAIT" as &byte,
+                                  "failed to collect the local executor result" as &byte,
+                                  "waitpid returned an error while actions were still running" as &byte,
+                                  "uya.build" as &byte,
+                                  1,
+                                  1);
+        }
+        const finished_action: &PlannedAction = find_running_action_by_pid(ctx, finished_pid);
+        if finished_action == null {
+            return set_diagnostic(ctx.phase1,
+                                  EXIT_IO,
+                                  "UYABUILD_E_EXECUTOR_WAIT" as &byte,
+                                  "failed to map a finished child process back to its action" as &byte,
+                                  "check action bookkeeping for parallel execution" as &byte,
+                                  "uya.build" as &byte,
+                                  1,
+                                  1);
+        }
+        if complete_local_action(ctx, finished_action, wait_status) != 0 {
+            saw_failure = 1;
+        }
     }
-    return 0;
 }
 
 fn snapshot_store_blob(ctx: &Phase2Context, digest_hex: &byte, data: &byte, data_len: usize) i32 {
@@ -6551,6 +6837,7 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
     action.label = target.label;
     action.kind = target.kind;
     action.mnemonic = target.kind;
+    action.pool_name = target_pool_name(target);
     action.execution_mode = target_execution_mode(target);
     action.cache_status = "pending-execution" as &byte;
     action.pending_execution = 1;
@@ -7548,6 +7835,8 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
         write_json_escape(action_file, action.label);
         fputs("\",\"kind\":\"" as *byte, action_file);
         write_json_escape(action_file, action.kind);
+        fputs("\",\"pool\":\"" as *byte, action_file);
+        write_json_escape(action_file, action.pool_name);
         fputs("\",\"execution_mode\":\"" as *byte, action_file);
         write_json_escape(action_file, action.execution_mode);
         fputs("\",\"cache_status\":\"" as *byte, action_file);
@@ -7753,6 +8042,8 @@ fn emit_action_json(stream: &FILE, action: &PlannedAction) void {
     write_json_escape(stream, action.label);
     fputs("\",\"kind\":\"" as *byte, stream);
     write_json_escape(stream, action.kind);
+    fputs("\",\"pool\":\"" as *byte, stream);
+    write_json_escape(stream, action.pool_name);
     fputs("\",\"order\":" as *byte, stream);
     fprintf(stream, "%d" as *byte, action.order_index);
     fputs(",\"action_key\":\"" as *byte, stream);
@@ -8108,6 +8399,7 @@ fn print_build_help() void {
     fputs("  uyabuild build [options] <target> [<target> ...]\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
     fputs("Options:\n" as *byte, libc.stdout);
+    fputs("  -j, --jobs <n>        limit concurrent local actions (default: 4 or UYABUILD_JOBS)\n" as *byte, libc.stdout);
     fputs("  --workspace <path>    override workspace root discovery\n" as *byte, libc.stdout);
     fputs("  --state-dir <path>    override state directory\n" as *byte, libc.stdout);
     fputs("  --json                emit diagnostics as JSON\n" as *byte, libc.stdout);
@@ -8116,6 +8408,8 @@ fn print_build_help() void {
     fputs("Notes:\n" as *byte, libc.stdout);
     fputs("  Build runs Phase 2 analysis/planning first, then executes pending\n" as *byte, libc.stdout);
     fputs("  legacy.shell and task actions through the local executor.\n" as *byte, libc.stdout);
+    fputs("  Resource pools default to cpu, with link/docker/network held to one\n" as *byte, libc.stdout);
+    fputs("  concurrent action per pool name while cpu actions use the job limit.\n" as *byte, libc.stdout);
     fputs("  Existing outputs may still resolve as local-hit, seeded-output, or\n" as *byte, libc.stdout);
     fputs("  success-no-change without launching a child action.\n" as *byte, libc.stdout);
     _ = fflush(libc.stdout);
@@ -8485,11 +8779,21 @@ fn apply_shared_option(argument: &byte, next_argument: &byte, options: &Options)
     return 0;
 }
 
+fn default_parallel_jobs() i32 {
+    const raw_jobs: &byte = getenv("UYABUILD_JOBS" as &const byte);
+    var parsed_jobs: i32 = 0;
+    if raw_jobs != null && parse_positive_i32_text(raw_jobs, &parsed_jobs) == 0 {
+        return parsed_jobs;
+    }
+    return DEFAULT_BUILD_JOBS;
+}
+
 fn run_build(start_index: i32, base_options: &Options) i32 {
     var options: Options = Options {
         workspace_override: base_options.workspace_override,
         state_dir_override: base_options.state_dir_override,
         output_mode: base_options.output_mode,
+        jobs: base_options.jobs,
     };
     var targets: [&byte: MAX_ARGS] = [];
     var target_count: i32 = 0;
@@ -8509,6 +8813,28 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
         }
 
         if argument[0] == 45 as byte {
+            if string_equals(argument, "-j" as &byte) != 0 ||
+                string_equals(argument, "--jobs" as &byte) != 0 {
+                if index + 1 >= argc {
+                    return emit_error(options.output_mode,
+                                      EXIT_USAGE,
+                                      "UYABUILD_E_USAGE" as &byte,
+                                      "option requires a value" as &byte,
+                                      argument);
+                }
+                var parsed_jobs: i32 = 0;
+                const next_jobs: &byte = get_argv(index + 1);
+                if next_jobs == null || parse_positive_i32_text(next_jobs, &parsed_jobs) != 0 {
+                    return emit_error(options.output_mode,
+                                      EXIT_USAGE,
+                                      "UYABUILD_E_USAGE" as &byte,
+                                      "jobs must be a positive integer" as &byte,
+                                      argument);
+                }
+                options.jobs = parsed_jobs;
+                index = index + 2;
+                continue;
+            }
             if string_equals(argument, "--json" as &byte) != 0 {
                 options.output_mode = OUTPUT_JSON;
                 index = index + 1;
@@ -8645,9 +8971,10 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
         seeded_count: 0,
         no_change_count: 0,
         pending_count: 0,
+        max_jobs: options.jobs,
         root_digest: null,
     };
-    phase2_ctx_init(&phase2, &phase1, &state_layout, &manifest, target_count, matched_count);
+    phase2_ctx_init(&phase2, &phase1, &state_layout, &manifest, target_count, matched_count, options.jobs);
     if build_phase2_plan(&phase2, matched) != 0 {
         if phase1.diagnostic.code != null {
             return emit_diagnostic(options.output_mode, &phase1.diagnostic);
@@ -8689,6 +9016,7 @@ fn run_query(start_index: i32, base_options: &Options) i32 {
         workspace_override: base_options.workspace_override,
         state_dir_override: base_options.state_dir_override,
         output_mode: base_options.output_mode,
+        jobs: base_options.jobs,
     };
     var args: [&byte: MAX_ARGS] = [];
     const argc: i32 = get_argc();
@@ -8845,6 +9173,7 @@ fn run_plan(start_index: i32, base_options: &Options) i32 {
         workspace_override: base_options.workspace_override,
         state_dir_override: base_options.state_dir_override,
         output_mode: base_options.output_mode,
+        jobs: base_options.jobs,
     };
     var targets: [&byte: MAX_ARGS] = [];
     var target_count: i32 = 0;
@@ -8983,9 +9312,10 @@ fn run_plan(start_index: i32, base_options: &Options) i32 {
         seeded_count: 0,
         no_change_count: 0,
         pending_count: 0,
+        max_jobs: options.jobs,
         root_digest: null,
     };
-    phase2_ctx_init(&phase2, &phase1, &state_layout, &manifest, target_count, matched_count);
+    phase2_ctx_init(&phase2, &phase1, &state_layout, &manifest, target_count, matched_count, options.jobs);
     if build_phase2_plan(&phase2, matched) != 0 {
         if phase1.diagnostic.code != null {
             return emit_diagnostic(options.output_mode, &phase1.diagnostic);
@@ -9013,7 +9343,12 @@ fn run_plan(start_index: i32, base_options: &Options) i32 {
 
 export fn main() i32 {
     const argc: i32 = get_argc();
-    var options: Options = Options { workspace_override: null, state_dir_override: null, output_mode: OUTPUT_TEXT };
+    var options: Options = Options {
+        workspace_override: null,
+        state_dir_override: null,
+        output_mode: OUTPUT_TEXT,
+        jobs: default_parallel_jobs(),
+    };
     var command_index: i32 = 1;
 
     if argc <= 1 {

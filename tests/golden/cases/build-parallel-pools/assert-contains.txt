@@ -1,0 +1,4 @@
+out/summary.txt|parallel-a=parallel
+out/summary.txt|parallel-b=parallel
+out/summary.txt|lock-a=exclusive
+out/summary.txt|lock-b=exclusive

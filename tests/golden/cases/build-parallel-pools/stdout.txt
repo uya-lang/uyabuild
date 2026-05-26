@@ -1,0 +1,11 @@
+workspace: parallel-pools
+phase: 3
+matched_targets: 1
+planned_actions: 5
+cache_hits: 0
+seeded_outputs: 0
+success_no_change: 0
+pending_execution: 0
+root_digest: 694f44a206472dd66c39309b224a9fb9b4d15a375902458aaf5881176cc499e9
+matched:
+  //demo:check

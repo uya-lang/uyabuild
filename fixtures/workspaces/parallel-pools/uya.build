@@ -1,0 +1,42 @@
+workspace {
+  name = "parallel-pools"
+  default = ["//demo:check"]
+  strict = false
+}
+
+use legacy
+
+legacy.shell "//demo:parallel-a" {
+  script = ["sh", "scripts/run-worker.sh", "parallel", "a", "b", "out/parallel-a.txt"]
+  inputs = ["scripts/run-worker.sh"]
+  outputs = ["out/parallel-a.txt"]
+  pool = "link"
+}
+
+legacy.shell "//demo:parallel-b" {
+  script = ["sh", "scripts/run-worker.sh", "parallel", "b", "a", "out/parallel-b.txt"]
+  inputs = ["scripts/run-worker.sh"]
+  outputs = ["out/parallel-b.txt"]
+  pool = "docker"
+}
+
+legacy.shell "//demo:lock-a" {
+  script = ["sh", "scripts/run-worker.sh", "lock", "lock-a", "shared", "out/lock-a.txt"]
+  inputs = ["scripts/run-worker.sh"]
+  outputs = ["out/lock-a.txt"]
+  pool = "link"
+}
+
+legacy.shell "//demo:lock-b" {
+  script = ["sh", "scripts/run-worker.sh", "lock", "lock-b", "shared", "out/lock-b.txt"]
+  inputs = ["scripts/run-worker.sh"]
+  outputs = ["out/lock-b.txt"]
+  pool = "link"
+}
+
+legacy.shell "//demo:check" {
+  script = ["sh", "scripts/check-results.sh", "out/summary.txt"]
+  inputs = ["scripts/check-results.sh"]
+  deps = ["//demo:parallel-a", "//demo:parallel-b", "//demo:lock-a", "//demo:lock-b"]
+  outputs = ["out/summary.txt"]
+}
