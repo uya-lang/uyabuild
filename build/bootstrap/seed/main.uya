@@ -1948,7 +1948,7 @@ fn register_builtin_rule_packs(ctx: &Phase1Context) i32 {
                                                             "cxx.binary" as &byte,
                                                             0u32,
                                                             RULE_PLANNER_CXX_BINARY,
-                                                            RULE_SCANNER_NONE,
+                                                            RULE_SCANNER_CPP_HEADERS,
                                                             "pure" as &byte,
                                                             "link" as &byte,
                                                             PROVIDER_CXX_LINKABLE,
@@ -2049,6 +2049,7 @@ fn register_builtin_rule_packs(ctx: &Phase1Context) i32 {
         register_rule_kind_field(ctx, cxx_library, "include_dirs" as &byte, EXPECT_STRING_LIST) != 0 ||
         register_rule_kind_field(ctx, cxx_library, "discover" as &byte, EXPECT_CALL) != 0 ||
         register_rule_kind_field(ctx, cxx_binary, "srcs" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, cxx_binary, "discover" as &byte, EXPECT_CALL) != 0 ||
         register_rule_kind_field(ctx, cxx_binary, "out" as &byte, EXPECT_STRING) != 0 ||
         register_rule_kind_field(ctx, cxx_binary, "toolchain" as &byte, EXPECT_STRING) != 0 ||
         register_rule_kind_field(ctx, node_workspace, "root" as &byte, EXPECT_STRING) != 0 ||
@@ -5139,6 +5140,38 @@ fn validate_rule_kind_requirements(ctx: &Phase1Context, target: &IRTarget, rule_
     return 0;
 }
 
+fn validate_target_scanner_config(ctx: &Phase1Context, target: &IRTarget, rule_kind: &RuleKindDef) i32 {
+    if ctx == null || target == null || rule_kind == null {
+        return -1;
+    }
+    const discover_field: &IRField = find_ir_field(target.attrs, "discover" as &byte);
+    if discover_field == null {
+        return 0;
+    }
+
+    if rule_kind.scanner_kind != RULE_SCANNER_CPP_HEADERS ||
+        discover_field.value == null ||
+        discover_field.value.kind != TYPED_VALUE_CALL ||
+        discover_field.value.call_name == null ||
+        string_equals(discover_field.value.call_name, "cpp.headers" as &byte) == 0 ||
+        discover_field.value.arg_head != null {
+        var line: i32 = target.span.start.line;
+        var column: i32 = target.span.start.column;
+        if discover_field.value != null {
+            line = discover_field.value.span.start.line;
+            column = discover_field.value.span.start.column;
+        }
+        return phase1_error(ctx,
+                            "UYABUILD_E_DISCOVER" as &byte,
+                            "discover must be cpp.headers()" as &byte,
+                            "use discover = cpp.headers() on cxx targets that need header scanning" as &byte,
+                            target.file.rel_path,
+                            line,
+                            column);
+    }
+    return 0;
+}
+
 fn validate_targets(ctx: &Phase1Context) i32 {
     var target: &IRTarget = ctx.targets_head;
     while target != null {
@@ -5179,6 +5212,9 @@ fn validate_targets(ctx: &Phase1Context) i32 {
                                 pool_field.value.span.start.column);
         }
         if validate_rule_kind_requirements(ctx, target, rule_kind) != 0 {
+            return -1;
+        }
+        if validate_target_scanner_config(ctx, target, rule_kind) != 0 {
             return -1;
         }
 
@@ -8062,6 +8098,225 @@ fn add_cxx_dependency_inputs(ctx: &Phase2Context, action: &PlannedAction) i32 {
     return 0;
 }
 
+fn target_uses_cpp_header_scanner(target: &IRTarget, rule_kind: &RuleKindDef) i32 {
+    if target == null || rule_kind == null || rule_kind.scanner_kind != RULE_SCANNER_CPP_HEADERS {
+        return 0;
+    }
+    const discover_field: &IRField = find_ir_field(target.attrs, "discover" as &byte);
+    if discover_field == null || discover_field.value == null {
+        return 0;
+    }
+    if discover_field.value.kind != TYPED_VALUE_CALL ||
+        discover_field.value.call_name == null ||
+        string_equals(discover_field.value.call_name, "cpp.headers" as &byte) == 0 ||
+        discover_field.value.arg_head != null {
+        return 0;
+    }
+    return 1;
+}
+
+fn cpp_scan_path_supported(path: &byte) i32 {
+    if path == null {
+        return 0;
+    }
+    if string_has_suffix(path, ".c" as &byte) != 0 ||
+        string_has_suffix(path, ".cc" as &byte) != 0 ||
+        string_has_suffix(path, ".cpp" as &byte) != 0 ||
+        string_has_suffix(path, ".cxx" as &byte) != 0 ||
+        string_has_suffix(path, ".h" as &byte) != 0 ||
+        string_has_suffix(path, ".hh" as &byte) != 0 ||
+        string_has_suffix(path, ".hpp" as &byte) != 0 ||
+        string_has_suffix(path, ".hxx" as &byte) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn resolve_cpp_scanned_include(ctx: &Phase2Context,
+                               source_rel_path: &byte,
+                               include_text: &byte,
+                               out: &byte,
+                               out_cap: usize) i32 {
+    if ctx == null || source_rel_path == null || include_text == null || out == null {
+        return -1;
+    }
+    var source_dir_rel: [byte: PATH_MAX] = [];
+    var source_dir_abs: [byte: PATH_MAX] = [];
+    var candidate_abs: [byte: PATH_MAX] = [];
+    if path_dirname_text(source_rel_path, &source_dir_rel[0] as &byte, PATH_MAX) != 0 ||
+        join_and_normalize_path(ctx.phase1.workspace_root,
+                                &source_dir_rel[0] as &byte,
+                                &source_dir_abs[0] as &byte,
+                                PATH_MAX) != 0 ||
+        join_and_normalize_path(&source_dir_abs[0] as &byte,
+                                include_text,
+                                &candidate_abs[0] as &byte,
+                                PATH_MAX) != 0 {
+        return -1;
+    }
+    if string_has_prefix(&candidate_abs[0] as &byte, ctx.phase1.workspace_root) == 0 ||
+        path_is_file(&candidate_abs[0] as &byte) == 0 {
+        return 1;
+    }
+    return path_relative_to_root(ctx.phase1.workspace_root, &candidate_abs[0] as &byte, out, out_cap);
+}
+
+fn scan_cpp_header_inputs(ctx: &Phase2Context,
+                          action: &PlannedAction,
+                          rel_path: &byte,
+                          visited: &StringNode,
+                          status_out: &i32) &StringNode {
+    if ctx == null || action == null || rel_path == null || status_out == null {
+        if status_out != null {
+            status_out[0] = -1;
+        }
+        return visited;
+    }
+
+    var inserted: i32 = 0;
+    var visited_mut: &StringNode = sorted_string_insert(ctx.phase1, visited, rel_path, &inserted);
+    if inserted == 0 || cpp_scan_path_supported(rel_path) == 0 {
+        status_out[0] = 0;
+        return visited_mut;
+    }
+
+    var abs_path: [byte: PATH_MAX] = [];
+    if join_and_normalize_path(ctx.phase1.workspace_root, rel_path, &abs_path[0] as &byte, PATH_MAX) != 0 {
+        status_out[0] = -1;
+        return visited_mut;
+    }
+    if path_is_file(&abs_path[0] as &byte) == 0 {
+        status_out[0] = 0;
+        return visited_mut;
+    }
+
+    var content_size: usize = 0usize;
+    const content: &byte = read_file_into_arena(ctx.phase1, &abs_path[0] as &byte, &content_size);
+    if content == null {
+        status_out[0] = -1;
+        return visited_mut;
+    }
+
+    var line_start: usize = 0usize;
+    while line_start < content_size {
+        var line_end: usize = line_start;
+        while line_end < content_size &&
+            content[line_end] != 10 as byte &&
+            content[line_end] != 13 as byte {
+            line_end = line_end + 1usize;
+        }
+
+        var pos: usize = line_start;
+        while pos < line_end &&
+            (content[pos] == 32 as byte || content[pos] == 9 as byte) {
+            pos = pos + 1usize;
+        }
+        if pos < line_end && content[pos] == 35 as byte {
+            pos = pos + 1usize;
+            while pos < line_end &&
+                (content[pos] == 32 as byte || content[pos] == 9 as byte) {
+                pos = pos + 1usize;
+            }
+
+            var include_index: usize = 0usize;
+            var matched_include: i32 = 1;
+            const include_word: &byte = "include" as &byte;
+            while include_word[include_index] != 0 as byte {
+                if pos + include_index >= line_end ||
+                    content[pos + include_index] != include_word[include_index] {
+                    matched_include = 0;
+                    break;
+                }
+                include_index = include_index + 1usize;
+            }
+            pos = pos + include_index;
+            if matched_include != 0 {
+                while pos < line_end &&
+                    (content[pos] == 32 as byte || content[pos] == 9 as byte) {
+                    pos = pos + 1usize;
+                }
+                if pos < line_end &&
+                    (content[pos] == 34 as byte || content[pos] == 60 as byte) {
+                    var closing: byte = 62 as byte;
+                    if content[pos] == 34 as byte {
+                        closing = 34 as byte;
+                    }
+                    var include_path: [byte: PATH_MAX] = [];
+                    var include_used: usize = 0usize;
+                    pos = pos + 1usize;
+                    while pos < line_end && content[pos] != closing {
+                        if include_used + 1usize >= PATH_MAX {
+                            status_out[0] = -1;
+                            return visited_mut;
+                        }
+                        include_path[include_used] = content[pos];
+                        include_used = include_used + 1usize;
+                        pos = pos + 1usize;
+                    }
+                    if pos < line_end && include_used > 0usize {
+                        include_path[include_used] = 0 as byte;
+                        var include_rel: [byte: PATH_MAX] = [];
+                        const resolve_status: i32 = resolve_cpp_scanned_include(ctx,
+                                                                                rel_path,
+                                                                                &include_path[0] as &byte,
+                                                                                &include_rel[0] as &byte,
+                                                                                PATH_MAX);
+                        if resolve_status == 0 {
+                            action_insert_input(ctx.phase1, action, &include_rel[0] as &byte);
+                            visited_mut = scan_cpp_header_inputs(ctx,
+                                                                 action,
+                                                                 &include_rel[0] as &byte,
+                                                                 visited_mut,
+                                                                 status_out);
+                            if status_out[0] != 0 {
+                                return visited_mut;
+                            }
+                        } else if resolve_status < 0 {
+                            status_out[0] = -1;
+                            return visited_mut;
+                        }
+                    }
+                }
+            }
+        }
+
+        line_start = line_end;
+        while line_start < content_size &&
+            (content[line_start] == 10 as byte || content[line_start] == 13 as byte) {
+            line_start = line_start + 1usize;
+        }
+    }
+
+    status_out[0] = 0;
+    return visited_mut;
+}
+
+fn add_cpp_scanned_inputs(ctx: &Phase2Context,
+                          action: &PlannedAction,
+                          target: &IRTarget,
+                          rule_kind: &RuleKindDef) i32 {
+    if ctx == null || action == null || target == null || rule_kind == null {
+        return -1;
+    }
+    if target_uses_cpp_header_scanner(target, rule_kind) == 0 {
+        return 0;
+    }
+
+    var visited: &StringNode = null;
+    var input: &StringNode = action.input_head;
+    while input != null {
+        if cpp_scan_path_supported(input.text) != 0 {
+            var status: i32 = 0;
+            visited = scan_cpp_header_inputs(ctx, action, input.text, visited, &status);
+            if status != 0 {
+                return -1;
+            }
+        }
+        input = input.next;
+    }
+    return 0;
+}
+
 fn populate_command_action(ctx: &Phase2Context,
                            action: &PlannedAction,
                            target: &IRTarget,
@@ -8158,6 +8413,9 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
         if add_cxx_dependency_inputs(ctx, action) != 0 {
             return -1;
         }
+        if add_cpp_scanned_inputs(ctx, action, target, rule_kind) != 0 {
+            return -1;
+        }
         return action_add_placeholder_output(ctx.phase1, action, target, ".a" as &byte);
     }
 
@@ -8175,6 +8433,9 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
             }
         }
         if add_cxx_dependency_inputs(ctx, action) != 0 {
+            return -1;
+        }
+        if add_cpp_scanned_inputs(ctx, action, target, rule_kind) != 0 {
             return -1;
         }
         const out_field: &IRField = find_ir_field(target.attrs, "out" as &byte);

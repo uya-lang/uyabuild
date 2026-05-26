@@ -123,6 +123,50 @@ run_executable_build_case() {
   printf 'PASS %s\n' "$case_name"
 }
 
+run_cxx_header_rebuild_case() {
+  case_name=$1
+  fixture_name=$2
+  target_label=$3
+  header_path=$4
+  executable_path=$5
+  expected_workspace=$6
+  expected_action_count=$7
+
+  workdir=$(mktemp -d "$TMP_ROOT/$case_name.XXXXXX")
+  cp -R "$ROOT_DIR/fixtures/workspaces/$fixture_name/." "$workdir"
+
+  first_stdout="$workdir/first-stdout.txt"
+  first_stderr="$workdir/first-stderr.txt"
+  second_stdout="$workdir/second-stdout.txt"
+  second_stderr="$workdir/second-stderr.txt"
+
+  (
+    cd "$workdir"
+    "$BIN" build "$target_label"
+  ) >"$first_stdout" 2>"$first_stderr"
+
+  assert_file_exists "$workdir/$executable_path" "$case_name"
+  assert_executable_runs "$workdir/$executable_path" "$case_name"
+  assert_output_contains "$first_stdout" "workspace: $expected_workspace" "$case_name"
+  assert_output_contains "$first_stdout" "planned_actions: $expected_action_count" "$case_name"
+
+  printf '\n// scanner regression touch\n' >>"$workdir/$header_path"
+
+  (
+    cd "$workdir"
+    "$BIN" build "$target_label"
+  ) >"$second_stdout" 2>"$second_stderr"
+
+  assert_executable_runs "$workdir/$executable_path" "$case_name"
+  assert_output_contains "$second_stdout" "workspace: $expected_workspace" "$case_name"
+  assert_output_contains "$second_stdout" "success_no_change: $expected_action_count" "$case_name"
+  assert_dir_exists "$workdir/.uya-build/cas" "$case_name"
+  assert_dir_exists "$workdir/.uya-build/meta" "$case_name"
+  assert_dir_exists "$workdir/.uya-build/tmp" "$case_name"
+
+  printf 'PASS %s\n' "$case_name"
+}
+
 run_build_case() {
   case_name=$1
   fixture_name=$2
@@ -171,6 +215,16 @@ run_executable_build_case \
   "2"
 pass_count=$((pass_count + 1))
 
+run_cxx_header_rebuild_case \
+  "sample-cxx-header-scan" \
+  "cxx-header-scan" \
+  "//app:hello" \
+  "src/detail.h" \
+  "out/bin/hello" \
+  "cxx-header-scan" \
+  "2"
+pass_count=$((pass_count + 1))
+
 run_plan_case \
   "sample-node-workspace" \
   "node-workspace" \
@@ -199,4 +253,4 @@ run_build_case \
   "legacy fixture"
 pass_count=$((pass_count + 1))
 
-printf 'e2e tests: %s/%s passed\n' "$pass_count" 4
+printf 'e2e tests: %s/%s passed\n' "$pass_count" 5

@@ -1,1 +1,1 @@
-fixture:cxx-minimal
+fixture-copy:cxx-minimal

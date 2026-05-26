@@ -1,0 +1,6 @@
+#ifndef HEADER_SCAN_DETAIL_H
+#define HEADER_SCAN_DETAIL_H
+
+#define HELLO_VALUE 7
+
+#endif

@@ -1,0 +1,3 @@
+plan
+--json
+//app:hello

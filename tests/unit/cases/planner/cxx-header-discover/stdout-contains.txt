@@ -1,0 +1,4 @@
+"label":"//lib:hello"
+"inputs":["src/detail.h","src/lib.cc","src/lib.h"]
+"label":"//app:hello"
+"inputs":["src/detail.h","src/lib.h","src/main.cc"]

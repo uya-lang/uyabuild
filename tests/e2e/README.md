@@ -8,6 +8,7 @@ Each scenario copies a fixture workspace into `tests/.tmp/`, runs the primary
 signals:
 
 - `cxx-minimal`: `build` executes the two-action C++ chain and emits a runnable binary
+- `cxx-header-scan`: `build` discovers recursive `#include` inputs and rebuilds when a scanned header changes
 - `node-workspace`: `plan --json` preserves the workspace/app action chain
 - `oci-multistage`: `plan --json` preserves the Docker action shape
 - `legacy-shell`: `build` executes locally and commits the declared output
