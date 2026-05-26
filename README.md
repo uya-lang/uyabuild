@@ -11,6 +11,7 @@ make test
 ./bin/uyabuild query //...
 ./bin/uyabuild plan //bootstrap:uyabuild --json
 ./bin/uyabuild why //bootstrap:uyabuild
+./bin/uyabuild test //tests:smoke
 ```
 
 Test entrypoints:
@@ -31,6 +32,7 @@ Phase 2 currently provides:
 Phase 3 now provides an initial local executor for `legacy.shell`, `task`, and the minimal `cxx` rule path:
 
 - `uyabuild build` materializes a per-action temporary workspace, runs supported actions locally, captures `stdout`/`stderr`, and atomically commits declared outputs
+- `uyabuild test` now builds `cxx.test` targets and executes the produced test binaries from the workspace root
 - `uyabuild why` now explains whether planned targets are `local-hit`, `seeded-output`, `success-no-change`, or still `pending-execution`
 - `uyabuild build --jobs <n>` now schedules supported local actions in parallel, with `pool = "link" | "docker" | "network"` and other non-`cpu` pool names serialized one at a time
 - supported actions now honor `execution_mode = "pure" | "host" | "volatile"`: `pure` keeps undeclared workspace files out of the action root, `host` materializes the broader workspace for compatibility, and `volatile` always re-executes instead of reusing local cache decisions

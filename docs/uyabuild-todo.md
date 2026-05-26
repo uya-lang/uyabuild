@@ -78,7 +78,7 @@
 
 ### 6.2 TODO
 
-当前状态（2026-05-26）：
+当前状态（2026-05-27）：
 
 - `P1-8` 已完成：`bin/uyabuild` 的 Phase 1 分析现已支持 `glob()` 展开、`config "..."` 声明驱动的 `select()` 配置展开，以及 `build/query/plan --config <name[,name...]>` 共享入口。
 - 已补充配置矩阵样例仓与回归：`fixtures/workspaces/config-matrix/`、`plan-config-matrix-json`、`build-config-matrix`、`plan-unknown-config`，用于验证分支展开和错误诊断。
@@ -146,7 +146,7 @@
 
 ### 8.2 TODO
 
-当前状态（2026-05-26）：
+当前状态（2026-05-27）：
 
 - `bin/uyabuild build` 已进入 Phase 3 本地执行路径：待执行的 `legacy.shell` / `task` 动作会在私有临时工作区中运行，并把 `stdout` / `stderr` 分离采集到 `.uya-build/tmp/actions/<run-id>/<action-key>/`。
 - 已完成的首批闭环：本地 Executor 骨架、动作临时工作区、日志采集、原子输出提交、环境变量白名单、`pure/host/volatile` 执行模式，以及 `executed-local` / `execution-failed` 元数据落盘。
@@ -186,13 +186,15 @@
 
 ### 9.2 TODO
 
-当前状态（2026-05-26）：
+当前状态（2026-05-27）：
 
 - `P4-1` 已完成：`bin/uyabuild` 现已通过统一的 Rule Pack / Rule Kind 注册表声明 schema、provider、planner、scanner 元数据；`legacy.shell`、`task`、`cxx.*`、`node.*`、`oci.image` 都改为经由注册表接线，后续新增规则包无需再把映射散落进多处条件分支。
 - `P4-2` 已完成：`legacy.shell` 规则已具备 schema 校验、planner 接线、本地执行、输入输出声明、严格模式依赖追踪和错误诊断；相关 unit、golden、e2e 回归已稳定覆盖。
 - `P4-3` 已完成：`cxx.library` / `cxx.binary` 现已可在 `pure` 本地执行器里完成最小 C++ 构建闭环；`cxx-minimal` 样例仓已可通过 `uyabuild build //app:hello` 产出并运行 `out/bin/hello`，`custom-state-dir`、e2e 和全量回归已覆盖该路径。
 - `P4-4` 已完成：`cxx.library` / `cxx.binary` 现已支持显式 `discover = cpp.headers()` 触发的递归 `#include` 扫描；新补充的 `cxx-header-scan` 样例仓和 `planner/cxx-header-discover`、e2e 回归可验证扫描到的私有头文件会进入 action inputs，并在头文件改动后触发正确重建。
-- 现有回归已覆盖注册表接线后的四类内建规则：`legacy.shell` 与最小 `cxx` 执行路径已接入本地执行器，`node` / `oci` 的执行后端继续留在后续条目推进。
+- `P4-5` 已完成：`cxx.test` 规则现已复用最小 `cxx` 本地执行路径接入 `uyabuild test`；新增 `cxx-test` 样例仓、golden 与 e2e 回归可验证测试二进制会被构建并实际执行。
+- `P4-10` 已完成：`artifact` / `service` / `bundle` 现已作为聚合规则接入统一注册表、planner 和本地执行器；新增 `aggregate-bundle` 样例仓与 golden 回归可验证上游产物与 manifests 会被聚合进声明输出。
+- 现有回归已覆盖注册表接线后的六类内建规则：`legacy.shell`、`cxx.*`、`artifact/service/bundle` 已具备稳定闭环；`node` / `oci` 的执行后端继续留在后续条目推进。
 
 | ID | 优先级 | 任务 | 依赖 | 验收标准 |
 |---|---|---|---|---|
@@ -200,12 +202,12 @@
 | `P4-2` | `P0` | 已完成：实现 `legacy.shell` 规则 | `P4-1`, `P3-9` | 可包装 shell 脚本并追踪输入输出 |
 | `P4-3` | `P0` | 已完成：实现 `cxx.library` / `cxx.binary` schema 与 planner | `P4-1` | 最小 C++ 项目可构建 |
 | `P4-4` | `P0` | 已完成：接入头文件 include 扫描 | `P4-3`, `P3-7` | 修改头文件会触发正确增量重建 |
-| `P4-5` | `P1` | 实现 `cxx.test` 规则 | `P4-3` | `uya test` 可执行 C/C++ 测试 |
+| `P4-5` | `P1` | 已完成：实现 `cxx.test` 规则 | `P4-3` | `uya test` 可执行 C/C++ 测试 |
 | `P4-6` | `P0` | 实现 `node.workspace` / `node.app` 规则 | `P4-1` | Node workspace 项目可安装与构建 |
 | `P4-7` | `P1` | 实现 lockfile 和 workspace 图扫描 | `P4-6` | 修改相关 package 会触发正确构建 |
 | `P4-8` | `P0` | 实现 `oci.image` 规则，后端对接 Buildx | `P4-1`, `P3-6` | Docker 多阶段镜像可构建并产出 metadata |
 | `P4-9` | `P1` | 支持 `cache-from/cache-to/provenance` | `P4-8` | 镜像规则可配置缓存与 provenance |
-| `P4-10` | `P1` | 实现 `artifact/service/bundle` 聚合规则 | `P4-1` | 前端产物、镜像和清单可被聚合发布 |
+| `P4-10` | `P1` | 已完成：实现 `artifact/service/bundle` 聚合规则 | `P4-1` | 前端产物、镜像和清单可被聚合发布 |
 
 ### 9.3 退出条件
 

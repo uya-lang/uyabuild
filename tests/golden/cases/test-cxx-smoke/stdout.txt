@@ -1,0 +1,15 @@
+workspace: cxx-test
+phase: 3
+matched_targets: 1
+planned_actions: 2
+cache_hits: 0
+seeded_outputs: 0
+success_no_change: 0
+pending_execution: 0
+root_digest: edaf4cfacd141447a82b066cc8fa1911ff3e2b98b7072d2f3df02e6296333b62
+matched:
+  //tests:smoke
+tests:
+smoke test passed
+  PASS //tests:smoke
+summary: 1 passed, 0 failed

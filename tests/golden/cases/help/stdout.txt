@@ -8,6 +8,7 @@ Bootstrap:
 
 Commands:
   build                 analyze, snapshot, and execute supported local actions
+  test                  build and execute supported cxx.test targets
   query                 inspect the typed target graph
   plan                  emit the typed IR plus Phase 2 action graph
   why                   explain why targets are clean or pending
@@ -24,6 +25,7 @@ Global options:
 
 Examples:
   uyabuild build //bootstrap:uyabuild
+  uyabuild test //tests:smoke
   uyabuild query //...
   uyabuild plan //app:hello --json
   uyabuild why //app:hello

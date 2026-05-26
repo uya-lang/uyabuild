@@ -94,6 +94,10 @@ Phase 1 validates the following built-in kinds:
 
 - `cxx.library`
 - `cxx.binary`
+- `cxx.test`
+- `artifact`
+- `service`
+- `bundle`
 - `node.workspace`
 - `node.app`
 - `oci.image`

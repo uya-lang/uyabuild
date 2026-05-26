@@ -9,6 +9,7 @@ signals:
 
 - `cxx-minimal`: `build` executes the two-action C++ chain and emits a runnable binary
 - `cxx-header-scan`: `build` discovers recursive `#include` inputs and rebuilds when a scanned header changes
+- `cxx-test`: `test` builds a `cxx.test` target, executes the resulting binary, and reports a passing test
 - `node-workspace`: `plan --json` preserves the workspace/app action chain
 - `oci-multistage`: `plan --json` preserves the Docker action shape
 - `legacy-shell`: `build` executes locally and commits the declared output

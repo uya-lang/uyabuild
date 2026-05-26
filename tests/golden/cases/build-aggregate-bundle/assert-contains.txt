@@ -1,0 +1,7 @@
+final.bundle|dep_output=svc.bundle
+final.bundle|manifest=manifests/final.yaml
+svc.bundle|dep_output=image.json
+svc.bundle|dep_output=web.artifact
+svc.bundle|manifest=manifests/service.yaml
+web.artifact|dep_output=web.txt
+web.artifact|manifest=manifests/web.yaml

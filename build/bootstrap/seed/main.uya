@@ -495,6 +495,7 @@ const RULE_PLANNER_CXX_BINARY: i32 = 3;
 const RULE_PLANNER_NODE_WORKSPACE: i32 = 4;
 const RULE_PLANNER_NODE_APP: i32 = 5;
 const RULE_PLANNER_OCI_IMAGE: i32 = 6;
+const RULE_PLANNER_AGGREGATE: i32 = 7;
 
 const RULE_SCANNER_NONE: i32 = 0;
 const RULE_SCANNER_CPP_HEADERS: i32 = 1;
@@ -1958,6 +1959,66 @@ fn register_builtin_rule_packs(ctx: &Phase1Context) i32 {
                                                             null,
                                                             null,
                                                             null);
+    const cxx_test: &RuleKindDef = register_rule_kind_def(ctx,
+                                                          "cxx" as &byte,
+                                                          "cxx.test" as &byte,
+                                                          0u32,
+                                                          RULE_PLANNER_CXX_BINARY,
+                                                          RULE_SCANNER_CPP_HEADERS,
+                                                          "pure" as &byte,
+                                                          "link" as &byte,
+                                                          PROVIDER_CXX_LINKABLE,
+                                                          null,
+                                                          0u32,
+                                                          null,
+                                                          null,
+                                                          null,
+                                                          null);
+    const artifact_kind: &RuleKindDef = register_rule_kind_def(ctx,
+                                                               "" as &byte,
+                                                               "artifact" as &byte,
+                                                               0u32,
+                                                               RULE_PLANNER_AGGREGATE,
+                                                               RULE_SCANNER_NONE,
+                                                               "pure" as &byte,
+                                                               "cpu" as &byte,
+                                                               0u32,
+                                                               null,
+                                                               0u32,
+                                                               null,
+                                                               null,
+                                                               null,
+                                                               "outputs" as &byte);
+    const service_kind: &RuleKindDef = register_rule_kind_def(ctx,
+                                                              "" as &byte,
+                                                              "service" as &byte,
+                                                              0u32,
+                                                              RULE_PLANNER_AGGREGATE,
+                                                              RULE_SCANNER_NONE,
+                                                              "pure" as &byte,
+                                                              "cpu" as &byte,
+                                                              0u32,
+                                                              null,
+                                                              0u32,
+                                                              null,
+                                                              null,
+                                                              null,
+                                                              "outputs" as &byte);
+    const bundle_kind: &RuleKindDef = register_rule_kind_def(ctx,
+                                                             "" as &byte,
+                                                             "bundle" as &byte,
+                                                             0u32,
+                                                             RULE_PLANNER_AGGREGATE,
+                                                             RULE_SCANNER_NONE,
+                                                             "pure" as &byte,
+                                                             "cpu" as &byte,
+                                                             0u32,
+                                                             null,
+                                                             0u32,
+                                                             null,
+                                                             null,
+                                                             null,
+                                                             "outputs" as &byte);
     const node_workspace: &RuleKindDef = register_rule_kind_def(ctx,
                                                                 "node" as &byte,
                                                                 "node.workspace" as &byte,
@@ -2033,8 +2094,9 @@ fn register_builtin_rule_packs(ctx: &Phase1Context) i32 {
                                                            null,
                                                            null,
                                                            null);
-    if cxx_library == null || cxx_binary == null || node_workspace == null ||
-        node_app == null || oci_image == null || legacy_shell == null || task_kind == null {
+    if cxx_library == null || cxx_binary == null || cxx_test == null || artifact_kind == null ||
+        service_kind == null || bundle_kind == null || node_workspace == null || node_app == null ||
+        oci_image == null || legacy_shell == null || task_kind == null {
         return phase1_error(ctx,
                             "UYABUILD_E_MEMORY" as &byte,
                             "phase1 arena is exhausted" as &byte,
@@ -2052,6 +2114,16 @@ fn register_builtin_rule_packs(ctx: &Phase1Context) i32 {
         register_rule_kind_field(ctx, cxx_binary, "discover" as &byte, EXPECT_CALL) != 0 ||
         register_rule_kind_field(ctx, cxx_binary, "out" as &byte, EXPECT_STRING) != 0 ||
         register_rule_kind_field(ctx, cxx_binary, "toolchain" as &byte, EXPECT_STRING) != 0 ||
+        register_rule_kind_field(ctx, cxx_test, "srcs" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, cxx_test, "discover" as &byte, EXPECT_CALL) != 0 ||
+        register_rule_kind_field(ctx, cxx_test, "out" as &byte, EXPECT_STRING) != 0 ||
+        register_rule_kind_field(ctx, cxx_test, "toolchain" as &byte, EXPECT_STRING) != 0 ||
+        register_rule_kind_field(ctx, artifact_kind, "manifests" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, artifact_kind, "outputs" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, service_kind, "manifests" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, service_kind, "outputs" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, bundle_kind, "manifests" as &byte, EXPECT_STRING_LIST) != 0 ||
+        register_rule_kind_field(ctx, bundle_kind, "outputs" as &byte, EXPECT_STRING_LIST) != 0 ||
         register_rule_kind_field(ctx, node_workspace, "root" as &byte, EXPECT_STRING) != 0 ||
         register_rule_kind_field(ctx, node_workspace, "lockfile" as &byte, EXPECT_STRING) != 0 ||
         register_rule_kind_field(ctx, node_workspace, "workspaces" as &byte, EXPECT_BOOL) != 0 ||
@@ -2079,7 +2151,10 @@ fn register_builtin_rule_packs(ctx: &Phase1Context) i32 {
                             1);
     }
 
-    if register_rule_kind_required_field(ctx, node_workspace, "root" as &byte) != 0 ||
+    if register_rule_kind_required_field(ctx, artifact_kind, "outputs" as &byte) != 0 ||
+        register_rule_kind_required_field(ctx, service_kind, "outputs" as &byte) != 0 ||
+        register_rule_kind_required_field(ctx, bundle_kind, "outputs" as &byte) != 0 ||
+        register_rule_kind_required_field(ctx, node_workspace, "root" as &byte) != 0 ||
         register_rule_kind_required_field(ctx, node_workspace, "lockfile" as &byte) != 0 ||
         register_rule_kind_required_field(ctx, node_app, "workspace" as &byte) != 0 ||
         register_rule_kind_required_field(ctx, node_app, "package" as &byte) != 0 ||
@@ -5089,6 +5164,15 @@ fn rule_kind_required_fields_message(rule_kind: &RuleKindDef) &byte {
     if string_equals(rule_kind.name, "node.app" as &byte) != 0 {
         return "node.app requires workspace and package" as &byte;
     }
+    if string_equals(rule_kind.name, "artifact" as &byte) != 0 {
+        return "artifact requires outputs" as &byte;
+    }
+    if string_equals(rule_kind.name, "service" as &byte) != 0 {
+        return "service requires outputs" as &byte;
+    }
+    if string_equals(rule_kind.name, "bundle" as &byte) != 0 {
+        return "bundle requires outputs" as &byte;
+    }
     if string_equals(rule_kind.name, "oci.image" as &byte) != 0 {
         return "oci.image requires dockerfile and context" as &byte;
     }
@@ -6147,6 +6231,36 @@ fn shell_append_spaced_quoted(buffer: &byte,
     return 0;
 }
 
+fn shell_append_chain_prefix(buffer: &byte, used: &usize, cap: usize, first: &i32) i32 {
+    if buffer == null || used == null || first == null {
+        return -1;
+    }
+    if first[0] == 0 {
+        return append_buffer_text(buffer, used, cap, " && " as &byte);
+    }
+    first[0] = 0;
+    return 0;
+}
+
+fn aggregate_append_file_line(buffer: &byte,
+                              used: &usize,
+                              cap: usize,
+                              output_path: &byte,
+                              line_text: &byte,
+                              first: &i32) i32 {
+    if buffer == null || used == null || output_path == null || line_text == null || first == null {
+        return -1;
+    }
+    if shell_append_chain_prefix(buffer, used, cap, first) != 0 ||
+        append_buffer_text(buffer, used, cap, "printf '%s\\n' " as &byte) != 0 ||
+        shell_append_quoted(buffer, used, cap, line_text) != 0 ||
+        append_buffer_text(buffer, used, cap, " >> " as &byte) != 0 ||
+        shell_append_quoted(buffer, used, cap, output_path) != 0 {
+        return -1;
+    }
+    return 0;
+}
+
 fn cxx_target_output_path(ctx: &Phase1Context,
                           target: &IRTarget,
                           out: &byte,
@@ -6154,7 +6268,8 @@ fn cxx_target_output_path(ctx: &Phase1Context,
     if ctx == null || target == null || out == null {
         return -1;
     }
-    if string_equals(target.kind, "cxx.binary" as &byte) != 0 {
+    if string_equals(target.kind, "cxx.binary" as &byte) != 0 ||
+        string_equals(target.kind, "cxx.test" as &byte) != 0 {
         const out_field: &IRField = find_ir_field(target.attrs, "out" as &byte);
         if out_field != null && out_field.value != null && out_field.value.text != null {
             var rel_out: [byte: PATH_MAX] = [];
@@ -6208,6 +6323,44 @@ fn cxx_target_output_path(ctx: &Phase1Context,
     return -1;
 }
 
+fn collect_target_output_paths(ctx: &Phase1Context, target: &IRTarget, head: &StringNode) &StringNode {
+    var outputs: &StringNode = head;
+    if ctx == null || target == null {
+        return outputs;
+    }
+
+    var cxx_output: [byte: PATH_MAX] = [];
+    if cxx_target_output_path(ctx, target, &cxx_output[0] as &byte, PATH_MAX) == 0 {
+        var inserted: i32 = 0;
+        return sorted_string_insert(ctx, outputs, &cxx_output[0] as &byte, &inserted);
+    }
+
+    const rule_kind: &RuleKindDef = find_rule_kind_def(ctx, target.kind);
+    if rule_kind == null || rule_kind.output_field_name == null {
+        return outputs;
+    }
+    const outputs_field: &IRField = find_ir_field(target.attrs, rule_kind.output_field_name);
+    if outputs_field == null || outputs_field.value == null {
+        return outputs;
+    }
+
+    var raw_outputs: &StringNode = collect_typed_strings_sorted(ctx, outputs_field.value, null);
+    while raw_outputs != null {
+        var rel_output: [byte: PATH_MAX] = [];
+        var abs_output: [byte: PATH_MAX] = [];
+        if resolve_target_path(ctx,
+                               target,
+                               raw_outputs.text,
+                               &rel_output[0] as &byte,
+                               &abs_output[0] as &byte) == 0 {
+            var inserted: i32 = 0;
+            outputs = sorted_string_insert(ctx, outputs, &rel_output[0] as &byte, &inserted);
+        }
+        raw_outputs = raw_outputs.next;
+    }
+    return outputs;
+}
+
 fn cxx_compiler_path() &byte {
     if path_is_file("/usr/bin/c++" as &byte) != 0 {
         return "/usr/bin/c++" as &byte;
@@ -6234,6 +6387,176 @@ fn cxx_tool_path_env() &byte {
 
 fn cxx_compiler_path_env() &byte {
     return "/usr/bin:/bin:/usr/local/bin:/usr/sbin:/sbin" as &byte;
+}
+
+fn build_aggregate_shell_command(ctx: &Phase1Context,
+                                 action: &PlannedAction,
+                                 stdout_path: &byte,
+                                 stderr_path: &byte) &byte {
+    if ctx == null || action == null || action.owner == null || action.output_head == null {
+        return null;
+    }
+
+    var buffer: [byte: MAX_STRING_BUILD] = [];
+    var used: usize = 0usize;
+    var first_step: i32 = 1;
+    if shell_append_chain_prefix(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first_step) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, "set -eu" as &byte) != 0 {
+        return null;
+    }
+
+    var output: &StringNode = action.output_head;
+    while output != null {
+        var output_parent: [byte: PATH_MAX] = [];
+        if path_dirname_text(output.text, &output_parent[0] as &byte, PATH_MAX) != 0 {
+            return null;
+        }
+
+        if shell_append_chain_prefix(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first_step) != 0 ||
+            shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, mkdir_tool_path()) != 0 ||
+            append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " -p " as &byte) != 0 ||
+            shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &output_parent[0] as &byte) != 0 {
+            return null;
+        }
+        if shell_append_chain_prefix(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first_step) != 0 ||
+            append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, ": > " as &byte) != 0 ||
+            shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, output.text) != 0 {
+            return null;
+        }
+
+        var label_line: [byte: PATH_MAX] = [];
+        var kind_line: [byte: PATH_MAX] = [];
+        if snprintf(&label_line[0] as *byte,
+                    PATH_MAX,
+                    "label=%s" as *byte,
+                    action.label as *byte) < 0 ||
+            snprintf(&kind_line[0] as *byte,
+                     PATH_MAX,
+                     "kind=%s" as *byte,
+                     action.kind as *byte) < 0 {
+            return null;
+        }
+
+        if aggregate_append_file_line(&buffer[0] as &byte,
+                                      &used,
+                                      MAX_STRING_BUILD,
+                                      output.text,
+                                      &label_line[0] as &byte,
+                                      &first_step) != 0 ||
+            aggregate_append_file_line(&buffer[0] as &byte,
+                                      &used,
+                                      MAX_STRING_BUILD,
+                                      output.text,
+                                      &kind_line[0] as &byte,
+                                      &first_step) != 0 ||
+            aggregate_append_file_line(&buffer[0] as &byte,
+                                      &used,
+                                      MAX_STRING_BUILD,
+                                      output.text,
+                                      "deps:" as &byte,
+                                      &first_step) != 0 {
+            return null;
+        }
+
+        var dep: &StringNode = action.dep_head;
+        while dep != null {
+            const dep_target: &IRTarget = find_target_by_label(ctx, dep.text);
+            if dep_target != null {
+                var dep_outputs: &StringNode = collect_target_output_paths(ctx, dep_target, null);
+                if dep_outputs == null {
+                    var dep_label_line: [byte: PATH_MAX] = [];
+                    if snprintf(&dep_label_line[0] as *byte,
+                                PATH_MAX,
+                                "dep=%s" as *byte,
+                                dep.text as *byte) < 0 ||
+                        aggregate_append_file_line(&buffer[0] as &byte,
+                                                  &used,
+                                                  MAX_STRING_BUILD,
+                                                  output.text,
+                                                  &dep_label_line[0] as &byte,
+                                                  &first_step) != 0 {
+                        return null;
+                    }
+                } else {
+                    while dep_outputs != null {
+                        var dep_line: [byte: PATH_MAX] = [];
+                        if snprintf(&dep_line[0] as *byte,
+                                    PATH_MAX,
+                                    "dep_output=%s" as *byte,
+                                    dep_outputs.text as *byte) < 0 ||
+                            aggregate_append_file_line(&buffer[0] as &byte,
+                                                      &used,
+                                                      MAX_STRING_BUILD,
+                                                      output.text,
+                                                      &dep_line[0] as &byte,
+                                                      &first_step) != 0 {
+                            return null;
+                        }
+                        dep_outputs = dep_outputs.next;
+                    }
+                }
+            }
+            dep = dep.next;
+        }
+
+        if aggregate_append_file_line(&buffer[0] as &byte,
+                                      &used,
+                                      MAX_STRING_BUILD,
+                                      output.text,
+                                      "manifests:" as &byte,
+                                      &first_step) != 0 {
+            return null;
+        }
+        const manifests_field: &IRField = find_ir_field(action.owner.attrs, "manifests" as &byte);
+        if manifests_field != null && manifests_field.value != null {
+            var manifests: &StringNode = collect_typed_strings_sorted(ctx, manifests_field.value, null);
+            while manifests != null {
+                var rel_manifest: [byte: PATH_MAX] = [];
+                var abs_manifest: [byte: PATH_MAX] = [];
+                if resolve_target_path(ctx,
+                                       action.owner,
+                                       manifests.text,
+                                       &rel_manifest[0] as &byte,
+                                       &abs_manifest[0] as &byte) != 0 {
+                    return null;
+                }
+                var manifest_line: [byte: PATH_MAX] = [];
+                if snprintf(&manifest_line[0] as *byte,
+                            PATH_MAX,
+                            "manifest=%s" as *byte,
+                            &rel_manifest[0] as *byte) < 0 ||
+                    aggregate_append_file_line(&buffer[0] as &byte,
+                                              &used,
+                                              MAX_STRING_BUILD,
+                                              output.text,
+                                              &manifest_line[0] as &byte,
+                                              &first_step) != 0 {
+                    return null;
+                }
+                manifests = manifests.next;
+            }
+        }
+
+        output = output.next;
+    }
+
+    if shell_append_chain_prefix(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first_step) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, ":" as &byte) != 0 {
+        return null;
+    }
+    if stdout_path != null {
+        if append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " > " as &byte) != 0 ||
+            shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, stdout_path) != 0 {
+            return null;
+        }
+    }
+    if stderr_path != null {
+        if append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " 2> " as &byte) != 0 ||
+            shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, stderr_path) != 0 {
+            return null;
+        }
+    }
+    return arena_copy_cstr(&ctx.arena, &buffer[0] as &byte);
 }
 
 fn build_cxx_library_shell_command(ctx: &Phase1Context,
@@ -6390,8 +6713,14 @@ fn build_action_shell_command(ctx: &Phase1Context,
     if string_equals(action.kind, "cxx.library" as &byte) != 0 {
         return build_cxx_library_shell_command(ctx, action, stdout_path, stderr_path);
     }
-    if string_equals(action.kind, "cxx.binary" as &byte) != 0 {
+    if string_equals(action.kind, "cxx.binary" as &byte) != 0 ||
+        string_equals(action.kind, "cxx.test" as &byte) != 0 {
         return build_cxx_binary_shell_command(ctx, action, stdout_path, stderr_path);
+    }
+    if string_equals(action.kind, "artifact" as &byte) != 0 ||
+        string_equals(action.kind, "service" as &byte) != 0 ||
+        string_equals(action.kind, "bundle" as &byte) != 0 {
+        return build_aggregate_shell_command(ctx, action, stdout_path, stderr_path);
     }
     if action.command_head == null {
         return null;
@@ -7248,7 +7577,8 @@ fn action_supports_local_executor(ctx: &Phase2Context, action: &PlannedAction) i
     if rule_kind != null &&
         (rule_kind.planner_kind == RULE_PLANNER_COMMAND ||
          rule_kind.planner_kind == RULE_PLANNER_CXX_LIBRARY ||
-         rule_kind.planner_kind == RULE_PLANNER_CXX_BINARY) {
+         rule_kind.planner_kind == RULE_PLANNER_CXX_BINARY ||
+         rule_kind.planner_kind == RULE_PLANNER_AGGREGATE) {
         return 1;
     }
     return 0;
@@ -8443,6 +8773,30 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
             return action_add_output_path(ctx.phase1, action, target, out_field.value.text);
         }
         return action_add_placeholder_output(ctx.phase1, action, target, "" as &byte);
+    }
+
+    if rule_kind.planner_kind == RULE_PLANNER_AGGREGATE {
+        const manifests_field: &IRField = find_ir_field(target.attrs, "manifests" as &byte);
+        if manifests_field != null && manifests_field.value != null {
+            var manifests: &StringNode = collect_typed_strings_sorted(ctx.phase1, manifests_field.value, null);
+            while manifests != null {
+                if action_add_input_spec(ctx, action, target, manifests.text) != 0 {
+                    return -1;
+                }
+                manifests = manifests.next;
+            }
+        }
+        const outputs_field: &IRField = find_ir_field(target.attrs, "outputs" as &byte);
+        if outputs_field != null && outputs_field.value != null {
+            var outputs: &StringNode = collect_typed_strings_sorted(ctx.phase1, outputs_field.value, null);
+            while outputs != null {
+                if action_add_output_path(ctx.phase1, action, target, outputs.text) != 0 {
+                    return -1;
+                }
+                outputs = outputs.next;
+            }
+        }
+        return 0;
     }
 
     if rule_kind.planner_kind == RULE_PLANNER_NODE_WORKSPACE {
@@ -10111,6 +10465,110 @@ fn emit_build_text(ctx: &Phase1Context, phase2: &Phase2Context, matched: &String
     _ = fflush(libc.stdout);
 }
 
+fn validate_test_targets(ctx: &Phase1Context, matched: &StringNode) i32 {
+    if ctx == null {
+        return -1;
+    }
+    var node: &StringNode = matched;
+    while node != null {
+        const target: &IRTarget = find_target_by_label(ctx, node.text);
+        if target == null || string_equals(target.kind, "cxx.test" as &byte) == 0 {
+            var file_text: &byte = "uya.build" as &byte;
+            var line: i32 = 1;
+            var column: i32 = 1;
+            if target != null && target.file != null {
+                file_text = target.file.rel_path;
+                line = target.span.start.line;
+                column = target.span.start.column;
+            }
+            return phase1_error(ctx,
+                                "UYABUILD_E_TEST_TARGET" as &byte,
+                                "uyabuild test only supports cxx.test targets" as &byte,
+                                node.text,
+                                file_text,
+                                line,
+                                column);
+        }
+        node = node.next;
+    }
+    return 0;
+}
+
+fn build_test_exec_env(ctx: &Phase1Context,
+                       workspace_root: &byte,
+                       env_out: [&byte: MAX_ARGS],
+                       env_count: &i32) i32 {
+    if ctx == null || workspace_root == null || env_count == null {
+        return -1;
+    }
+    env_count[0] = 0;
+
+    var path_value: &byte = read_process_env_value(ctx, "PATH" as &byte);
+    if path_value == null {
+        path_value = cxx_tool_path_env();
+    }
+    if append_env_entry(ctx, env_out, env_count, "PATH" as &byte, path_value) != 0 {
+        return -1;
+    }
+
+    const lang_value: &byte = read_process_env_value(ctx, "LANG" as &byte);
+    if lang_value != null && append_env_entry(ctx, env_out, env_count, "LANG" as &byte, lang_value) != 0 {
+        return -1;
+    }
+    const lc_all_value: &byte = read_process_env_value(ctx, "LC_ALL" as &byte);
+    if lc_all_value != null && append_env_entry(ctx, env_out, env_count, "LC_ALL" as &byte, lc_all_value) != 0 {
+        return -1;
+    }
+    if append_env_entry(ctx, env_out, env_count, "PWD" as &byte, workspace_root) != 0 {
+        return -1;
+    }
+
+    const tail_index: usize = i32_to_usize_checked(env_count[0]);
+    if tail_index >= MAX_ARGS as usize {
+        return -1;
+    }
+    env_out[tail_index] = null;
+    return 0;
+}
+
+fn execute_test_binary(ctx: &Phase1Context, action: &PlannedAction) i32 {
+    if ctx == null || action == null || action.output_head == null || action.output_head.text == null {
+        return -1;
+    }
+
+    var executable_path: [byte: PATH_MAX] = [];
+    if join_and_normalize_path(ctx.workspace_root, action.output_head.text, &executable_path[0] as &byte, PATH_MAX) != 0 ||
+        path_is_file(&executable_path[0] as &byte) == 0 {
+        return 127;
+    }
+
+    var envp: [&byte: MAX_ARGS] = [];
+    var env_count: i32 = 0;
+    if build_test_exec_env(ctx, ctx.workspace_root, envp, &env_count) != 0 {
+        return 127;
+    }
+
+    const child_pid: i32 = fork();
+    if child_pid < 0 {
+        return 127;
+    }
+    if child_pid == 0 {
+        if chdir(ctx.workspace_root as &const byte) != 0 {
+            _exit(127);
+        }
+        var exec_args: [&byte: 2] = [&executable_path[0] as &byte, null];
+        execve(&executable_path[0] as &const byte, &exec_args[0] as & &byte, &envp[0] as & &byte);
+        _exit(127);
+    }
+
+    var wait_status: i32 = 0;
+    const finished_pid: i32 = waitpid(child_pid, &wait_status, 0);
+    if finished_pid != child_pid {
+        return 127;
+    }
+    return wait_status_exit_code(wait_status);
+}
+
 fn load_phase1_model(options: &Options, workspace: &Workspace, ctx: &Phase1Context) i32 {
     phase1_ctx_init(ctx, &workspace.root[0] as &byte, &workspace.entrypoint[0] as &byte);
     if register_builtin_rule_packs(ctx) != 0 {
@@ -10139,6 +10597,7 @@ fn print_root_help() void {
     fputs("\n" as *byte, libc.stdout);
     fputs("Commands:\n" as *byte, libc.stdout);
     fputs("  build                 analyze, snapshot, and execute supported local actions\n" as *byte, libc.stdout);
+    fputs("  test                  build and execute supported cxx.test targets\n" as *byte, libc.stdout);
     fputs("  query                 inspect the typed target graph\n" as *byte, libc.stdout);
     fputs("  plan                  emit the typed IR plus Phase 2 action graph\n" as *byte, libc.stdout);
     fputs("  why                   explain why targets are clean or pending\n" as *byte, libc.stdout);
@@ -10155,6 +10614,7 @@ fn print_root_help() void {
     fputs("\n" as *byte, libc.stdout);
     fputs("Examples:\n" as *byte, libc.stdout);
     fputs("  uyabuild build //bootstrap:uyabuild\n" as *byte, libc.stdout);
+    fputs("  uyabuild test //tests:smoke\n" as *byte, libc.stdout);
     fputs("  uyabuild query //...\n" as *byte, libc.stdout);
     fputs("  uyabuild plan //app:hello --json\n" as *byte, libc.stdout);
     fputs("  uyabuild why //app:hello\n" as *byte, libc.stdout);
@@ -10180,6 +10640,24 @@ fn print_build_help() void {
     fputs("  concurrent action per pool name while cpu actions use the job limit.\n" as *byte, libc.stdout);
     fputs("  Existing outputs may still resolve as local-hit, seeded-output, or\n" as *byte, libc.stdout);
     fputs("  success-no-change without launching a child action.\n" as *byte, libc.stdout);
+    _ = fflush(libc.stdout);
+}
+
+fn print_test_help() void {
+    fputs("Usage:\n" as *byte, libc.stdout);
+    fputs("  uyabuild test [options] [<target> ...]\n" as *byte, libc.stdout);
+    fputs("\n" as *byte, libc.stdout);
+    fputs("Options:\n" as *byte, libc.stdout);
+    fputs("  -j, --jobs <n>        limit concurrent local actions during the build phase\n" as *byte, libc.stdout);
+    fputs("  --workspace <path>    override workspace root discovery\n" as *byte, libc.stdout);
+    fputs("  --state-dir <path>    override state directory\n" as *byte, libc.stdout);
+    fputs("  --config <list>       activate config names for select() expansion\n" as *byte, libc.stdout);
+    fputs("  -h, --help            show test help\n" as *byte, libc.stdout);
+    fputs("\n" as *byte, libc.stdout);
+    fputs("Notes:\n" as *byte, libc.stdout);
+    fputs("  Test currently accepts only cxx.test targets and reuses the local\n" as *byte, libc.stdout);
+    fputs("  C++ build path before executing each produced test binary.\n" as *byte, libc.stdout);
+    fputs("  --json is not yet supported for uyabuild test.\n" as *byte, libc.stdout);
     _ = fflush(libc.stdout);
 }
 
@@ -10824,6 +11302,294 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
     return EXIT_OK;
 }
 
+fn run_test(start_index: i32, base_options: &Options) i32 {
+    var options: Options = Options {
+        workspace_override: base_options.workspace_override,
+        state_dir_override: base_options.state_dir_override,
+        config_selector: base_options.config_selector,
+        output_mode: base_options.output_mode,
+        jobs: base_options.jobs,
+    };
+    var targets: [&byte: MAX_ARGS] = [];
+    var target_count: i32 = 0;
+    const argc: i32 = get_argc();
+
+    var index: i32 = start_index;
+    while index < argc {
+        const argument: &byte = get_argv(index);
+        if argument == null {
+            index = index + 1;
+            continue;
+        }
+
+        if string_equals(argument, "-h" as &byte) != 0 || string_equals(argument, "--help" as &byte) != 0 {
+            print_test_help();
+            return EXIT_OK;
+        }
+
+        if argument[0] == 45 as byte {
+            if string_equals(argument, "-j" as &byte) != 0 || string_equals(argument, "--jobs" as &byte) != 0 {
+                if index + 1 >= argc {
+                    return emit_error(options.output_mode,
+                                      EXIT_USAGE,
+                                      "UYABUILD_E_USAGE" as &byte,
+                                      "option requires a value" as &byte,
+                                      argument);
+                }
+                var parsed_jobs: i32 = 0;
+                const next_jobs: &byte = get_argv(index + 1);
+                if next_jobs == null || parse_positive_i32_text(next_jobs, &parsed_jobs) != 0 {
+                    return emit_error(options.output_mode,
+                                      EXIT_USAGE,
+                                      "UYABUILD_E_USAGE" as &byte,
+                                      "jobs must be a positive integer" as &byte,
+                                      argument);
+                }
+                options.jobs = parsed_jobs;
+                index = index + 2;
+                continue;
+            }
+            if string_equals(argument, "--json" as &byte) != 0 {
+                return emit_error(OUTPUT_TEXT,
+                                  EXIT_NOT_IMPLEMENTED,
+                                  "UYABUILD_E_TEST_JSON" as &byte,
+                                  "uyabuild test does not yet support --json" as &byte,
+                                  "rerun without --json to execute cxx.test targets" as &byte);
+            }
+
+            if index + 1 >= argc {
+                return emit_error(options.output_mode,
+                                  EXIT_USAGE,
+                                  "UYABUILD_E_USAGE" as &byte,
+                                  "option requires a value" as &byte,
+                                  argument);
+            }
+
+            const next_argument: &byte = get_argv(index + 1);
+            const shared_status: i32 = apply_shared_option(argument, next_argument, &options);
+            if shared_status > 0 {
+                index = index + 2;
+                continue;
+            }
+            if shared_status < 0 {
+                return emit_error(options.output_mode,
+                                  EXIT_USAGE,
+                                  "UYABUILD_E_USAGE" as &byte,
+                                  "--config may only be passed once" as &byte,
+                                  "use --config name[,name...] to activate multiple configs" as &byte);
+            }
+
+            return emit_error(options.output_mode,
+                              EXIT_USAGE,
+                              "UYABUILD_E_USAGE" as &byte,
+                              "unknown test option" as &byte,
+                              argument);
+        }
+
+        if is_target_pattern(argument) == 0 {
+            return emit_error(options.output_mode,
+                              EXIT_USAGE,
+                              "UYABUILD_E_TARGET_SYNTAX" as &byte,
+                              "test targets must use //pkg:name or //pkg/... syntax" as &byte,
+                              argument);
+        }
+
+        if target_count >= MAX_ARGS {
+            return emit_error(options.output_mode,
+                              EXIT_USAGE,
+                              "UYABUILD_E_USAGE" as &byte,
+                              "too many test targets were provided" as &byte,
+                              "Phase 0 bootstrap limits a single invocation to 256 targets" as &byte);
+        }
+
+        targets[target_count as usize] = argument;
+        target_count = target_count + 1;
+        index = index + 1;
+    }
+
+    if options.output_mode == OUTPUT_JSON {
+        return emit_error(OUTPUT_TEXT,
+                          EXIT_NOT_IMPLEMENTED,
+                          "UYABUILD_E_TEST_JSON" as &byte,
+                          "uyabuild test does not yet support --json" as &byte,
+                          "rerun without --json to execute cxx.test targets" as &byte);
+    }
+
+    var workspace: Workspace = Workspace { root: [], entrypoint: [] };
+    var state_layout: StateLayout = StateLayout {
+        root: [],
+        cas: [],
+        cas_blobs: [],
+        cas_trees: [],
+        cas_manifests: [],
+        cas_logs: [],
+        cas_action_records: [],
+        meta: [],
+        meta_build_runs: [],
+        meta_actions: [],
+        meta_artifacts: [],
+        meta_events: [],
+        meta_cache_entries: [],
+        meta_indexes: [],
+        runs: [],
+        tmp: [],
+        locks: [],
+        gc: [],
+    };
+    var manifest: RunManifest = RunManifest { run_id: [], run_dir: [], manifest_path: [] };
+
+    const status: i32 = resolve_runtime_context(&options,
+                                                &workspace,
+                                                &state_layout,
+                                                &manifest,
+                                                "test" as &byte,
+                                                targets,
+                                                target_count);
+    if status != 0 {
+        return status;
+    }
+
+    var phase1: Phase1Context = Phase1Context {
+        arena: Arena { buffer: null, size: 0usize, used: 0usize, has_last: false, last_start: 0usize, last_aligned: 0usize },
+        workspace_root: null,
+        root_build_path: null,
+        root_toml_path: null,
+        entrypoint_path: null,
+        files_head: null,
+        files_tail: null,
+        rule_packs_head: null,
+        rule_packs_tail: null,
+        rule_kinds_head: null,
+        rule_kinds_tail: null,
+        uses_head: null,
+        uses_tail: null,
+        active_configs: null,
+        configs_head: null,
+        configs_tail: null,
+        targets_head: null,
+        workspace_ir: IRWorkspace { source_file: null, span: zero_span(), name: null, defaults: null, strict: 0, has_name: 0, has_defaults: 0, has_strict: 0 },
+        toml_meta: TomlWorkspaceMeta { has_name: 0, has_default: 0, has_strict: 0, name: null, defaults: null, strict: 0 },
+        file_count: 0,
+        use_count: 0,
+        active_config_count: 0,
+        config_count: 0,
+        target_count: 0,
+        diagnostic: Diagnostic { exit_code: EXIT_CONFIG, code: null, message: null, detail: null, file: null, line: 0, column: 0 },
+    };
+    const load_status: i32 = load_phase1_model(&options, &workspace, &phase1);
+    if load_status != 0 {
+        return load_status;
+    }
+
+    var matched_count: i32 = 0;
+    const matched: &StringNode = resolve_requested_targets(&phase1, targets, target_count, &matched_count);
+    if matched == null && phase1.diagnostic.code != null {
+        return emit_diagnostic(OUTPUT_TEXT, &phase1.diagnostic);
+    }
+    if matched_count == 0 {
+        return emit_error(OUTPUT_TEXT,
+                          EXIT_CONFIG,
+                          "UYABUILD_E_TARGET_NOT_FOUND" as &byte,
+                          "no default test targets are configured" as &byte,
+                          "declare workspace.default or pass at least one cxx.test target" as &byte);
+    }
+    if validate_test_targets(&phase1, matched) != 0 {
+        return emit_diagnostic(OUTPUT_TEXT, &phase1.diagnostic);
+    }
+
+    var phase2: Phase2Context = Phase2Context {
+        phase1: null,
+        state_layout: null,
+        manifest: null,
+        snapshot_head: null,
+        action_head: null,
+        action_tail: null,
+        visit_head: null,
+        requested_count: 0,
+        matched_count: 0,
+        snapshot_count: 0,
+        action_count: 0,
+        cache_hit_count: 0,
+        seeded_count: 0,
+        no_change_count: 0,
+        pending_count: 0,
+        max_jobs: options.jobs,
+        root_digest: null,
+    };
+    phase2_ctx_init(&phase2, &phase1, &state_layout, &manifest, target_count, matched_count, options.jobs);
+    if build_phase2_plan(&phase2, matched) != 0 {
+        if phase1.diagnostic.code != null {
+            return emit_diagnostic(OUTPUT_TEXT, &phase1.diagnostic);
+        }
+        return emit_error(OUTPUT_TEXT,
+                          EXIT_IO,
+                          "UYABUILD_E_PLAN_FAILED" as &byte,
+                          "failed to build the Phase 2 action graph" as &byte,
+                          "check declared inputs, target cycles, and CAS paths" as &byte);
+    }
+    if phase2.pending_count > 0 && execute_pending_actions(&phase2) != 0 {
+        _ = persist_phase2_metadata(&phase2, "test" as &byte, matched);
+        if phase1.diagnostic.code != null {
+            return emit_diagnostic(OUTPUT_TEXT, &phase1.diagnostic);
+        }
+        return emit_error(OUTPUT_TEXT,
+                          EXIT_ACTION,
+                          "UYABUILD_E_EXECUTOR_FAILED" as &byte,
+                          "the local executor failed before tests could run" as &byte,
+                          "check action stderr logs under .uya-build/tmp/actions/" as &byte);
+    }
+    if persist_phase2_metadata(&phase2, "test" as &byte, matched) != 0 {
+        return emit_error(OUTPUT_TEXT,
+                          EXIT_IO,
+                          "UYABUILD_E_META_WRITE" as &byte,
+                          "failed to persist Phase 2 metadata" as &byte,
+                          "check .uya-build/meta permissions and path lengths" as &byte);
+    }
+
+    emit_build_text(&phase1, &phase2, matched);
+    fputs("tests:\n" as *byte, libc.stdout);
+    _ = fflush(libc.stdout);
+
+    var passed_count: i32 = 0;
+    var failed_count: i32 = 0;
+    var node: &StringNode = matched;
+    while node != null {
+        const action: &PlannedAction = find_planned_action_by_label(&phase2, node.text);
+        if action == null {
+            return emit_error(OUTPUT_TEXT,
+                              EXIT_ACTION,
+                              "UYABUILD_E_TEST_ACTION" as &byte,
+                              "matched cxx.test target has no planned executable action" as &byte,
+                              node.text);
+        }
+        const exit_code: i32 = execute_test_binary(&phase1, action);
+        if exit_code == 0 {
+            fprintf(libc.stdout, "  PASS %s\n" as *byte, node.text as *byte);
+            passed_count = passed_count + 1;
+        } else {
+            fprintf(libc.stdout, "  FAIL %s (exit %d)\n" as *byte, node.text as *byte, exit_code);
+            failed_count = failed_count + 1;
+        }
+        _ = fflush(libc.stdout);
+        node = node.next;
+    }
+
+    fprintf(libc.stdout,
+            "summary: %d passed, %d failed\n" as *byte,
+            passed_count,
+            failed_count);
+    _ = fflush(libc.stdout);
+
+    if failed_count != 0 {
+        return emit_error(OUTPUT_TEXT,
+                          EXIT_ACTION,
+                          "UYABUILD_E_TEST_FAILED" as &byte,
+                          "one or more cxx.test targets failed" as &byte,
+                          "see PASS/FAIL lines above" as &byte);
+    }
+    return EXIT_OK;
+}
+
 fn run_query(start_index: i32, base_options: &Options) i32 {
     var options: Options = Options {
         workspace_override: base_options.workspace_override,
@@ -11464,6 +12230,10 @@ export fn main() i32 {
                 print_build_help();
                 return EXIT_OK;
             }
+            if topic != null && string_equals(topic, "test" as &byte) != 0 {
+                print_test_help();
+                return EXIT_OK;
+            }
             if topic != null && string_equals(topic, "query" as &byte) != 0 {
                 print_query_help();
                 return EXIT_OK;
@@ -11487,6 +12257,9 @@ export fn main() i32 {
     }
     if string_equals(command, "build" as &byte) != 0 {
         return run_build(command_index + 1, &options);
+    }
+    if string_equals(command, "test" as &byte) != 0 {
+        return run_test(command_index + 1, &options);
     }
     if string_equals(command, "query" as &byte) != 0 {
         return run_query(command_index + 1, &options);

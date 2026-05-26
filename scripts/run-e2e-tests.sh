@@ -123,6 +123,38 @@ run_executable_build_case() {
   printf 'PASS %s\n' "$case_name"
 }
 
+run_test_case() {
+  case_name=$1
+  fixture_name=$2
+  target_label=$3
+  executable_path=$4
+  expected_workspace=$5
+  expected_action_count=$6
+  expected_stdout=$7
+
+  workdir=$(mktemp -d "$TMP_ROOT/$case_name.XXXXXX")
+  cp -R "$ROOT_DIR/fixtures/workspaces/$fixture_name/." "$workdir"
+
+  stdout_file="$workdir/stdout.txt"
+  stderr_file="$workdir/stderr.txt"
+
+  (
+    cd "$workdir"
+    "$BIN" test "$target_label"
+  ) >"$stdout_file" 2>"$stderr_file"
+
+  assert_file_exists "$workdir/$executable_path" "$case_name"
+  assert_output_contains "$stdout_file" "workspace: $expected_workspace" "$case_name"
+  assert_output_contains "$stdout_file" "planned_actions: $expected_action_count" "$case_name"
+  assert_output_contains "$stdout_file" "$expected_stdout" "$case_name"
+  assert_output_contains "$stdout_file" "PASS $target_label" "$case_name"
+  assert_dir_exists "$workdir/.uya-build/cas" "$case_name"
+  assert_dir_exists "$workdir/.uya-build/meta" "$case_name"
+  assert_dir_exists "$workdir/.uya-build/tmp" "$case_name"
+
+  printf 'PASS %s\n' "$case_name"
+}
+
 run_cxx_header_rebuild_case() {
   case_name=$1
   fixture_name=$2
@@ -225,6 +257,16 @@ run_cxx_header_rebuild_case \
   "2"
 pass_count=$((pass_count + 1))
 
+run_test_case \
+  "sample-cxx-test" \
+  "cxx-test" \
+  "//tests:smoke" \
+  "out/tests/smoke" \
+  "cxx-test" \
+  "2" \
+  "smoke test passed"
+pass_count=$((pass_count + 1))
+
 run_plan_case \
   "sample-node-workspace" \
   "node-workspace" \
@@ -253,4 +295,4 @@ run_build_case \
   "legacy fixture"
 pass_count=$((pass_count + 1))
 
-printf 'e2e tests: %s/%s passed\n' "$pass_count" 5
+printf 'e2e tests: %s/%s passed\n' "$pass_count" 6

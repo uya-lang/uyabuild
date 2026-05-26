@@ -1,0 +1,18 @@
+workspace {
+  name = "cxx-test"
+  default = ["//tests:smoke"]
+  strict = true
+}
+
+use cxx
+
+cxx.library "//lib:answer" {
+  srcs = ["src/lib.cc"]
+  hdrs = ["src/lib.h"]
+}
+
+cxx.test "//tests:smoke" {
+  srcs = ["src/smoke.cc"]
+  deps = ["//lib:answer"]
+  out = "out/tests/smoke"
+}

@@ -1,0 +1,35 @@
+workspace {
+  name = "aggregate-bundle"
+  default = ["//release:bundle"]
+  strict = true
+}
+
+use legacy
+
+legacy.shell "//:web" {
+  script = ["sh", "-c", "printf 'index asset\\n' > web.txt"]
+  outputs = ["web.txt"]
+}
+
+legacy.shell "//:meta" {
+  script = ["sh", "-c", "printf '{\"image\":\"demo\"}\\n' > image.json"]
+  outputs = ["image.json"]
+}
+
+artifact "//:web_artifact" {
+  deps = ["//:web"]
+  manifests = ["manifests/web.yaml"]
+  outputs = ["web.artifact"]
+}
+
+service "//:svc" {
+  deps = ["//:web_artifact", "//:meta"]
+  manifests = ["manifests/service.yaml"]
+  outputs = ["svc.bundle"]
+}
+
+bundle "//release:bundle" {
+  deps = ["//:svc"]
+  manifests = ["manifests/final.yaml"]
+  outputs = ["final.bundle"]
+}

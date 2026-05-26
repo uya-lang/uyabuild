@@ -1,0 +1,5 @@
+final.bundle
+svc.bundle
+web.artifact
+web.txt
+image.json
