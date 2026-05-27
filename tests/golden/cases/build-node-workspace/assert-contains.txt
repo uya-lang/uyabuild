@@ -1,0 +1,2 @@
+dist/app/message.txt|hello from workspace
+out/web/workspace.workspace.json|"workspaceCount": 2

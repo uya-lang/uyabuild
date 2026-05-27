@@ -1,0 +1,2 @@
+dist/app/message.txt
+out/web/workspace.workspace.json

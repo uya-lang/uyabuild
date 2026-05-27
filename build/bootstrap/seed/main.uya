@@ -5790,6 +5790,16 @@ fn action_is_cxx_kind(action: &PlannedAction) i32 {
     return 0;
 }
 
+fn action_is_node_kind(action: &PlannedAction) i32 {
+    if action == null || action.kind == null {
+        return 0;
+    }
+    if string_has_prefix(action.kind, "node." as &byte) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
 fn action_cxx_temp_path_allowed(action: &PlannedAction, observed_path: &byte) i32 {
     if action == null || observed_path == null || action_is_cxx_kind(action) == 0 {
         return 0;
@@ -5808,13 +5818,58 @@ fn action_cxx_temp_path_allowed(action: &PlannedAction, observed_path: &byte) i3
     return 0;
 }
 
+fn action_node_temp_path_allowed(ctx: &Phase2Context, action: &PlannedAction, observed_path: &byte) i32 {
+    if ctx == null ||
+        action == null ||
+        observed_path == null ||
+        action.owner == null ||
+        action_is_node_kind(action) == 0 {
+        return 0;
+    }
+    const workspace_target: &IRTarget = find_node_workspace_target(ctx.phase1, action.owner);
+    const root_text: &byte = node_workspace_root_text(workspace_target);
+    if root_text == null {
+        return 0;
+    }
+    var node_modules_path: [byte: PATH_MAX] = [];
+    if string_equals(root_text, "." as &byte) != 0 {
+        if copy_string(&node_modules_path[0] as &byte, PATH_MAX, "node_modules" as &byte) != 0 {
+            return 0;
+        }
+    } else {
+        const written: i32 = snprintf(&node_modules_path[0] as *byte,
+                                      PATH_MAX,
+                                      "%s/node_modules" as *byte,
+                                      root_text as *byte);
+        if written < 0 || written >= PATH_MAX {
+            return 0;
+        }
+    }
+    if path_text_matches_or_contains(&node_modules_path[0] as &byte, observed_path) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
+fn action_special_path_allowed(observed_path: &byte) i32 {
+    if observed_path == null {
+        return 0;
+    }
+    if string_equals(observed_path, "/dev/null" as &byte) != 0 {
+        return 1;
+    }
+    return 0;
+}
+
 fn action_read_path_allowed(ctx: &Phase2Context, action: &PlannedAction, observed_path: &byte) i32 {
     if ctx == null || action == null || observed_path == null {
         return 0;
     }
     if string_node_matches_path(action.input_head, observed_path) != 0 ||
         string_node_matches_path(action.output_head, observed_path) != 0 ||
-        action_cxx_temp_path_allowed(action, observed_path) != 0 {
+        action_cxx_temp_path_allowed(action, observed_path) != 0 ||
+        action_node_temp_path_allowed(ctx, action, observed_path) != 0 ||
+        action_special_path_allowed(observed_path) != 0 {
         return 1;
     }
     var dep: &StringNode = action.dep_head;
@@ -5828,14 +5883,16 @@ fn action_read_path_allowed(ctx: &Phase2Context, action: &PlannedAction, observe
     return 0;
 }
 
-fn action_write_path_allowed(action: &PlannedAction, observed_path: &byte) i32 {
-    if action == null || observed_path == null {
+fn action_write_path_allowed(ctx: &Phase2Context, action: &PlannedAction, observed_path: &byte) i32 {
+    if ctx == null || action == null || observed_path == null {
         return 0;
     }
     if string_node_matches_path(action.output_head, observed_path) != 0 {
         return 1;
     }
-    if action_cxx_temp_path_allowed(action, observed_path) != 0 {
+    if action_cxx_temp_path_allowed(action, observed_path) != 0 ||
+        action_node_temp_path_allowed(ctx, action, observed_path) != 0 ||
+        action_special_path_allowed(observed_path) != 0 {
         return 1;
     }
     return 0;
@@ -5858,7 +5915,7 @@ fn refresh_single_action_dependency_findings(ctx: &Phase2Context, action: &Plann
 
     var write_path: &StringNode = action.tracked_write_head;
     while write_path != null {
-        if action_write_path_allowed(action, write_path.text) == 0 {
+        if action_write_path_allowed(ctx, action, write_path.text) == 0 {
             action_track_undeclared_output(ctx.phase1, action, write_path.text);
         }
         write_path = write_path.next;
@@ -6389,6 +6446,214 @@ fn cxx_compiler_path_env() &byte {
     return "/usr/bin:/bin:/usr/local/bin:/usr/sbin:/sbin" as &byte;
 }
 
+fn node_runtime_path() &byte {
+    if path_is_file("/usr/bin/node" as &byte) != 0 {
+        return "/usr/bin/node" as &byte;
+    }
+    if path_is_file("/bin/node" as &byte) != 0 {
+        return "/bin/node" as &byte;
+    }
+    return "node" as &byte;
+}
+
+fn find_node_workspace_target(ctx: &Phase1Context, target: &IRTarget) &IRTarget {
+    if ctx == null || target == null {
+        return null;
+    }
+    if string_equals(target.kind, "node.workspace" as &byte) != 0 {
+        return target;
+    }
+    const workspace_field: &IRField = find_ir_field(target.attrs, "workspace" as &byte);
+    if workspace_field == null ||
+        workspace_field.value == null ||
+        workspace_field.value.text == null {
+        return null;
+    }
+    return find_target_by_label(ctx, workspace_field.value.text);
+}
+
+fn node_workspace_root_text(target: &IRTarget) &byte {
+    if target == null {
+        return null;
+    }
+    const root_field: &IRField = find_ir_field(target.attrs, "root" as &byte);
+    if root_field != null && root_field.value != null && root_field.value.text != null {
+        return root_field.value.text;
+    }
+    return "." as &byte;
+}
+
+fn node_workspace_lockfile_text(target: &IRTarget) &byte {
+    if target == null {
+        return null;
+    }
+    const lockfile_field: &IRField = find_ir_field(target.attrs, "lockfile" as &byte);
+    if lockfile_field != null && lockfile_field.value != null && lockfile_field.value.text != null {
+        return lockfile_field.value.text;
+    }
+    return null;
+}
+
+fn build_node_root_manifest_raw(root_text: &byte, out: &byte, out_cap: usize) i32 {
+    if root_text == null || out == null {
+        return -1;
+    }
+    if string_equals(root_text, "." as &byte) != 0 {
+        return copy_string(out, out_cap, "package.json" as &byte);
+    }
+    const written: i32 = snprintf(out as *byte, out_cap, "%s/package.json" as *byte, root_text as *byte);
+    if written < 0 || written >= out_cap as i32 {
+        return -1;
+    }
+    return 0;
+}
+
+fn build_node_root_glob(root_text: &byte, suffix: &byte, out: &byte, out_cap: usize) i32 {
+    if root_text == null || suffix == null || out == null {
+        return -1;
+    }
+    if string_equals(root_text, "." as &byte) != 0 {
+        return copy_string(out, out_cap, suffix);
+    }
+    const written: i32 = snprintf(out as *byte, out_cap, "%s/%s" as *byte, root_text as *byte, suffix as *byte);
+    if written < 0 || written >= out_cap as i32 {
+        return -1;
+    }
+    return 0;
+}
+
+fn build_node_workspace_shell_command(ctx: &Phase1Context,
+                                      action: &PlannedAction,
+                                      stdout_path: &byte,
+                                      stderr_path: &byte) &byte {
+    if ctx == null || action == null || action.owner == null || action.output_head == null {
+        return null;
+    }
+    const workspace_target: &IRTarget = find_node_workspace_target(ctx, action.owner);
+    const root_text: &byte = node_workspace_root_text(workspace_target);
+    const lockfile_text: &byte = node_workspace_lockfile_text(workspace_target);
+    if root_text == null || lockfile_text == null {
+        return null;
+    }
+
+    const fallback_install_script: &byte =
+        "const fs=require(\"fs\"),path=require(\"path\");const root=process.argv[1];const pkg=JSON.parse(fs.readFileSync(path.join(root,\"package.json\"),\"utf8\"));const workspaces=Array.isArray(pkg.workspaces)?pkg.workspaces:[];const nodeModules=path.join(root,\"node_modules\");fs.mkdirSync(nodeModules,{recursive:true});for(const workspaceDir of workspaces){const manifestPath=path.join(root,workspaceDir,\"package.json\");if(!fs.existsSync(manifestPath))continue;const workspacePkg=JSON.parse(fs.readFileSync(manifestPath,\"utf8\"));if(!workspacePkg.name)continue;const parts=workspacePkg.name.split(\"/\");let scopeDir=nodeModules;for(let i=0;i<parts.length-1;i++){scopeDir=path.join(scopeDir,parts[i]);fs.mkdirSync(scopeDir,{recursive:true});}const linkPath=path.join(scopeDir,parts[parts.length-1]);fs.rmSync(linkPath,{recursive:true,force:true});fs.symlinkSync(path.relative(scopeDir,path.join(root,workspaceDir)),linkPath,\"dir\");}" as &byte;
+    const metadata_script: &byte =
+        "const fs=require(\"fs\"),path=require(\"path\");const root=process.argv[1],lockfile=process.argv[2],out=process.argv[3];const pkg=JSON.parse(fs.readFileSync(path.join(root,\"package.json\"),\"utf8\"));const workspaces=Array.isArray(pkg.workspaces)?pkg.workspaces:[];const meta={root,lockfile,workspaceCount:workspaces.length,workspaces};fs.mkdirSync(path.dirname(out),{recursive:true});fs.writeFileSync(out,JSON.stringify(meta,null,2)+\"\\n\");" as &byte;
+
+    var buffer: [byte: MAX_STRING_BUILD] = [];
+    var used: usize = 0usize;
+    var first_step: i32 = 1;
+    if shell_append_chain_prefix(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first_step) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, "set -eu" as &byte) != 0 {
+        return null;
+    }
+
+    if shell_append_chain_prefix(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first_step) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, "if command -v npm >/dev/null 2>&1; then npm --prefix " as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, root_text) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " ci; else " as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, node_runtime_path()) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " -e " as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, fallback_install_script) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " " as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, root_text) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, "; fi" as &byte) != 0 {
+        return null;
+    }
+
+    if shell_append_chain_prefix(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first_step) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, node_runtime_path()) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " -e " as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, metadata_script) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " " as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, root_text) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " " as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, lockfile_text) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " " as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, action.output_head.text) != 0 {
+        return null;
+    }
+
+    if stdout_path != null {
+        if append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " > " as &byte) != 0 ||
+            shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, stdout_path) != 0 {
+            return null;
+        }
+    }
+    if stderr_path != null {
+        if append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " 2> " as &byte) != 0 ||
+            shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, stderr_path) != 0 {
+            return null;
+        }
+    }
+    return arena_copy_cstr(&ctx.arena, &buffer[0] as &byte);
+}
+
+fn build_node_app_shell_command(ctx: &Phase1Context,
+                                action: &PlannedAction,
+                                stdout_path: &byte,
+                                stderr_path: &byte) &byte {
+    if ctx == null || action == null || action.owner == null {
+        return null;
+    }
+    const workspace_target: &IRTarget = find_node_workspace_target(ctx, action.owner);
+    const root_text: &byte = node_workspace_root_text(workspace_target);
+    const package_field: &IRField = find_ir_field(action.owner.attrs, "package" as &byte);
+    if root_text == null || package_field == null || package_field.value == null || package_field.value.text == null {
+        return null;
+    }
+    const package_text: &byte = package_field.value.text;
+
+    const fallback_install_script: &byte =
+        "const fs=require(\"fs\"),path=require(\"path\");const root=process.argv[1];const pkg=JSON.parse(fs.readFileSync(path.join(root,\"package.json\"),\"utf8\"));const workspaces=Array.isArray(pkg.workspaces)?pkg.workspaces:[];const nodeModules=path.join(root,\"node_modules\");fs.mkdirSync(nodeModules,{recursive:true});for(const workspaceDir of workspaces){const manifestPath=path.join(root,workspaceDir,\"package.json\");if(!fs.existsSync(manifestPath))continue;const workspacePkg=JSON.parse(fs.readFileSync(manifestPath,\"utf8\"));if(!workspacePkg.name)continue;const parts=workspacePkg.name.split(\"/\");let scopeDir=nodeModules;for(let i=0;i<parts.length-1;i++){scopeDir=path.join(scopeDir,parts[i]);fs.mkdirSync(scopeDir,{recursive:true});}const linkPath=path.join(scopeDir,parts[parts.length-1]);fs.rmSync(linkPath,{recursive:true,force:true});fs.symlinkSync(path.relative(scopeDir,path.join(root,workspaceDir)),linkPath,\"dir\");}" as &byte;
+    const fallback_build_script: &byte =
+        "const fs=require(\"fs\"),path=require(\"path\"),cp=require(\"child_process\");const pkgDir=process.argv[1];const pkg=JSON.parse(fs.readFileSync(path.join(pkgDir,\"package.json\"),\"utf8\"));const script=pkg.scripts&&pkg.scripts.build;if(!script){console.error(\"missing build script\");process.exit(1);}const result=cp.spawnSync(\"/bin/sh\",[\"-c\",script],{cwd:pkgDir,stdio:\"inherit\"});if(result.error){console.error(result.error.message);process.exit(1);}process.exit(result.status===null?1:result.status);" as &byte;
+
+    var buffer: [byte: MAX_STRING_BUILD] = [];
+    var used: usize = 0usize;
+    var first_step: i32 = 1;
+    if shell_append_chain_prefix(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first_step) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, "set -eu" as &byte) != 0 {
+        return null;
+    }
+
+    if shell_append_chain_prefix(&buffer[0] as &byte, &used, MAX_STRING_BUILD, &first_step) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, "if command -v npm >/dev/null 2>&1; then npm --prefix " as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, root_text) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " ci && npm --prefix " as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, package_text) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " run build; else " as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, node_runtime_path()) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " -e " as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, fallback_install_script) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " " as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, root_text) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " && " as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, node_runtime_path()) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " -e " as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, fallback_build_script) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " " as &byte) != 0 ||
+        shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, package_text) != 0 ||
+        append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, "; fi" as &byte) != 0 {
+        return null;
+    }
+
+    if stdout_path != null {
+        if append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " > " as &byte) != 0 ||
+            shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, stdout_path) != 0 {
+            return null;
+        }
+    }
+    if stderr_path != null {
+        if append_buffer_text(&buffer[0] as &byte, &used, MAX_STRING_BUILD, " 2> " as &byte) != 0 ||
+            shell_append_quoted(&buffer[0] as &byte, &used, MAX_STRING_BUILD, stderr_path) != 0 {
+            return null;
+        }
+    }
+    return arena_copy_cstr(&ctx.arena, &buffer[0] as &byte);
+}
+
 fn build_aggregate_shell_command(ctx: &Phase1Context,
                                  action: &PlannedAction,
                                  stdout_path: &byte,
@@ -6709,6 +6974,12 @@ fn build_action_shell_command(ctx: &Phase1Context,
                               stderr_path: &byte) &byte {
     if ctx == null || action == null {
         return null;
+    }
+    if string_equals(action.kind, "node.workspace" as &byte) != 0 {
+        return build_node_workspace_shell_command(ctx, action, stdout_path, stderr_path);
+    }
+    if string_equals(action.kind, "node.app" as &byte) != 0 {
+        return build_node_app_shell_command(ctx, action, stdout_path, stderr_path);
     }
     if string_equals(action.kind, "cxx.library" as &byte) != 0 {
         return build_cxx_library_shell_command(ctx, action, stdout_path, stderr_path);
@@ -7576,6 +7847,8 @@ fn action_supports_local_executor(ctx: &Phase2Context, action: &PlannedAction) i
     const rule_kind: &RuleKindDef = find_rule_kind_def(ctx.phase1, action.kind);
     if rule_kind != null &&
         (rule_kind.planner_kind == RULE_PLANNER_COMMAND ||
+         rule_kind.planner_kind == RULE_PLANNER_NODE_WORKSPACE ||
+         rule_kind.planner_kind == RULE_PLANNER_NODE_APP ||
          rule_kind.planner_kind == RULE_PLANNER_CXX_LIBRARY ||
          rule_kind.planner_kind == RULE_PLANNER_CXX_BINARY ||
          rule_kind.planner_kind == RULE_PLANNER_AGGREGATE) {
@@ -8805,7 +9078,15 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
         const root_field: &IRField = find_ir_field(target.attrs, "root" as &byte);
         const lock_field: &IRField = find_ir_field(target.attrs, "lockfile" as &byte);
         if root_field != null && root_field.value != null && root_field.value.text != null {
-            if action_add_input_spec(ctx, action, target, root_field.value.text) != 0 {
+            var manifest_raw: [byte: PATH_MAX] = [];
+            var manifest_glob: [byte: PATH_MAX] = [];
+            if build_node_root_manifest_raw(root_field.value.text, &manifest_raw[0] as &byte, PATH_MAX) != 0 ||
+                build_node_root_glob(root_field.value.text,
+                                     "**/package.json" as &byte,
+                                     &manifest_glob[0] as &byte,
+                                     PATH_MAX) != 0 ||
+                action_add_input_spec(ctx, action, target, &manifest_raw[0] as &byte) != 0 ||
+                action_add_input_spec(ctx, action, target, &manifest_glob[0] as &byte) != 0 {
                 return -1;
             }
         }
@@ -8826,6 +9107,32 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
             if action_add_input_spec(ctx, action, target, package_field.value.text) != 0 {
                 return -1;
             }
+        }
+        const workspace_target: &IRTarget = find_node_workspace_target(ctx.phase1, target);
+        const workspace_root: &byte = node_workspace_root_text(workspace_target);
+        const workspace_lockfile: &byte = node_workspace_lockfile_text(workspace_target);
+        if workspace_root != null {
+            var manifest_raw: [byte: PATH_MAX] = [];
+            var manifest_glob: [byte: PATH_MAX] = [];
+            var source_glob: [byte: PATH_MAX] = [];
+            if build_node_root_manifest_raw(workspace_root, &manifest_raw[0] as &byte, PATH_MAX) != 0 ||
+                build_node_root_glob(workspace_root,
+                                     "**/package.json" as &byte,
+                                     &manifest_glob[0] as &byte,
+                                     PATH_MAX) != 0 ||
+                build_node_root_glob(workspace_root,
+                                     "**/*.js" as &byte,
+                                     &source_glob[0] as &byte,
+                                     PATH_MAX) != 0 ||
+                action_add_input_spec(ctx, action, workspace_target, &manifest_raw[0] as &byte) != 0 ||
+                action_add_input_spec(ctx, action, workspace_target, &manifest_glob[0] as &byte) != 0 ||
+                action_add_input_spec(ctx, action, workspace_target, &source_glob[0] as &byte) != 0 {
+                return -1;
+            }
+        }
+        if workspace_lockfile != null &&
+            action_add_input_spec(ctx, action, workspace_target, workspace_lockfile) != 0 {
+            return -1;
         }
         const out_field: &IRField = find_ir_field(target.attrs, "out" as &byte);
         if out_field != null && out_field.value != null && out_field.value.text != null {

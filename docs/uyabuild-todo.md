@@ -155,7 +155,7 @@
 - `uyabuild build --jobs <n>` 现已启用并行调度：`cpu` 池使用作业并发上限，`link` / `docker` / `network` 和其他非 `cpu` 池按池名串行化，`plan --json` / 动作元数据也会显式记录 `pool`。
 - Linux 本地执行现已默认关闭宿主网络；只有显式声明 `allow_network = true` 的动作才会跳过 `unshare -Urn` 隔离并使用宿主网络。
 - ActionRecord 现已同时写入 `meta/actions/` 与 `.uya-build/cas/action-records/`：`meta/actions/<action-key>` 保留最新快照，`meta/actions/<run-id>-<action-key>` 保留历史记录，索引会指向历史 doc 以支持后续查询。
-- `cxx.library` / `cxx.binary` 现已接入最小本地执行路径：执行器会预创建声明输出父目录，`/usr/bin/c++` 在 `pure` 模式下复用宿主工具链完成编译/链接，并允许声明输出目录内的瞬时编译中间文件通过严格模式校验；`node` / `oci` 动作和 macOS 依赖追踪后端仍待后续收口。
+- `cxx.library` / `cxx.binary` 现已接入最小本地执行路径：执行器会预创建声明输出父目录，`/usr/bin/c++` 在 `pure` 模式下复用宿主工具链完成编译/链接，并允许声明输出目录内的瞬时编译中间文件通过严格模式校验；`oci` 动作和 macOS 依赖追踪后端仍待后续收口，`node.workspace` / `node.app` 的更细 lockfile / workspace 图扫描继续由 `P4-7` 跟进。
 
 | ID | 优先级 | 任务 | 依赖 | 验收标准 |
 |---|---|---|---|---|
@@ -193,8 +193,9 @@
 - `P4-3` 已完成：`cxx.library` / `cxx.binary` 现已可在 `pure` 本地执行器里完成最小 C++ 构建闭环；`cxx-minimal` 样例仓已可通过 `uyabuild build //app:hello` 产出并运行 `out/bin/hello`，`custom-state-dir`、e2e 和全量回归已覆盖该路径。
 - `P4-4` 已完成：`cxx.library` / `cxx.binary` 现已支持显式 `discover = cpp.headers()` 触发的递归 `#include` 扫描；新补充的 `cxx-header-scan` 样例仓和 `planner/cxx-header-discover`、e2e 回归可验证扫描到的私有头文件会进入 action inputs，并在头文件改动后触发正确重建。
 - `P4-5` 已完成：`cxx.test` 规则现已复用最小 `cxx` 本地执行路径接入 `uyabuild test`；新增 `cxx-test` 样例仓、golden 与 e2e 回归可验证测试二进制会被构建并实际执行。
+- `P4-6` 已完成：`node.workspace` / `node.app` 现已接入最小本地执行路径；`node-workspace` 样例仓可通过 `uyabuild build //web:app` 生成 `dist/app/message.txt`，并同时落盘 `out/web/workspace.workspace.json` 元数据；golden 与 e2e 回归已覆盖该链路，`P4-7` 继续承接更细的 lockfile / workspace 图扫描。
 - `P4-10` 已完成：`artifact` / `service` / `bundle` 现已作为聚合规则接入统一注册表、planner 和本地执行器；新增 `aggregate-bundle` 样例仓与 golden 回归可验证上游产物与 manifests 会被聚合进声明输出。
-- 现有回归已覆盖注册表接线后的六类内建规则：`legacy.shell`、`cxx.*`、`artifact/service/bundle` 已具备稳定闭环；`node` / `oci` 的执行后端继续留在后续条目推进。
+- 现有回归已覆盖 `legacy.shell`、`cxx.*`、`node.workspace/node.app`、`artifact/service/bundle` 四类已闭环规则；`oci` 的执行后端继续留在后续条目推进。
 
 | ID | 优先级 | 任务 | 依赖 | 验收标准 |
 |---|---|---|---|---|
@@ -203,7 +204,7 @@
 | `P4-3` | `P0` | 已完成：实现 `cxx.library` / `cxx.binary` schema 与 planner | `P4-1` | 最小 C++ 项目可构建 |
 | `P4-4` | `P0` | 已完成：接入头文件 include 扫描 | `P4-3`, `P3-7` | 修改头文件会触发正确增量重建 |
 | `P4-5` | `P1` | 已完成：实现 `cxx.test` 规则 | `P4-3` | `uya test` 可执行 C/C++ 测试 |
-| `P4-6` | `P0` | 实现 `node.workspace` / `node.app` 规则 | `P4-1` | Node workspace 项目可安装与构建 |
+| `P4-6` | `P0` | 已完成：实现 `node.workspace` / `node.app` 规则 | `P4-1` | Node workspace 项目可安装与构建 |
 | `P4-7` | `P1` | 实现 lockfile 和 workspace 图扫描 | `P4-6` | 修改相关 package 会触发正确构建 |
 | `P4-8` | `P0` | 实现 `oci.image` 规则，后端对接 Buildx | `P4-1`, `P3-6` | Docker 多阶段镜像可构建并产出 metadata |
 | `P4-9` | `P1` | 支持 `cache-from/cache-to/provenance` | `P4-8` | 镜像规则可配置缓存与 provenance |

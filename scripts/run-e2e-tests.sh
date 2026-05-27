@@ -227,6 +227,39 @@ run_build_case() {
   printf 'PASS %s\n' "$case_name"
 }
 
+run_node_build_case() {
+  case_name=$1
+  fixture_name=$2
+  target_label=$3
+  output_file=$4
+  expected_text=$5
+  metadata_file=$6
+  metadata_text=$7
+  expected_workspace=$8
+  expected_action_count=$9
+
+  workdir=$(mktemp -d "$TMP_ROOT/$case_name.XXXXXX")
+  cp -R "$ROOT_DIR/fixtures/workspaces/$fixture_name/." "$workdir"
+
+  stdout_file="$workdir/stdout.txt"
+  stderr_file="$workdir/stderr.txt"
+
+  (
+    cd "$workdir"
+    "$BIN" build "$target_label"
+  ) >"$stdout_file" 2>"$stderr_file"
+
+  assert_file_contains "$workdir/$output_file" "$expected_text" "$case_name"
+  assert_file_contains "$workdir/$metadata_file" "$metadata_text" "$case_name"
+  assert_output_contains "$stdout_file" "workspace: $expected_workspace" "$case_name"
+  assert_output_contains "$stdout_file" "planned_actions: $expected_action_count" "$case_name"
+  assert_dir_exists "$workdir/.uya-build/cas" "$case_name"
+  assert_dir_exists "$workdir/.uya-build/meta" "$case_name"
+  assert_dir_exists "$workdir/.uya-build/tmp" "$case_name"
+
+  printf 'PASS %s\n' "$case_name"
+}
+
 if [ ! -x "$BIN" ]; then
   echo "bin/uyabuild is missing; run 'make bootstrap' first" >&2
   exit 1
@@ -267,14 +300,16 @@ run_test_case \
   "smoke test passed"
 pass_count=$((pass_count + 1))
 
-run_plan_case \
+run_node_build_case \
   "sample-node-workspace" \
   "node-workspace" \
   "//web:app" \
-  '"name":"node-workspace"' \
-  '"label":"//web:workspace"' \
-  '"label":"//web:app"' \
-  '"command":["npm","ci"]'
+  "dist/app/message.txt" \
+  "hello from workspace" \
+  "out/web/workspace.workspace.json" \
+  "\"workspaceCount\": 2" \
+  "node-workspace" \
+  "2"
 pass_count=$((pass_count + 1))
 
 run_plan_case \

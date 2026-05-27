@@ -38,6 +38,7 @@ Phase 3 now provides an initial local executor for `legacy.shell`, `task`, and t
 - supported actions now honor `execution_mode = "pure" | "host" | "volatile"`: `pure` keeps undeclared workspace files out of the action root, `host` materializes the broader workspace for compatibility, and `volatile` always re-executes instead of reusing local cache decisions
 - supported actions now default to host networking off and require `allow_network = true` to opt back into the host network namespace
 - supported actions inherit only a small environment allowlist plus explicit `env_allowlist` entries from the rule
+- `node.workspace` / `node.app` now cover a minimal local Node workspace path: `build` records package-manifest / `.js` inputs, materializes local workspace links, and commits declared frontend outputs; richer workspace graph scanning remains follow-up work
 - executed actions persist `executed-local` metadata, log digests, and dedicated CAS log objects alongside the existing CAS/meta records
 - executed actions now persist immutable ActionRecord history entries in `meta/actions/` and matching CAS objects under `.uya-build/cas/action-records/`
 - executed actions also persist tracked read/write path lists for declared inputs, upstream outputs, and declared outputs as the Phase 3 dependency-tracking interface
@@ -46,7 +47,7 @@ Phase 3 now provides an initial local executor for `legacy.shell`, `task`, and t
 Still pending for later Phase 3 work:
 
 - a macOS dependency-tracing backend for the same hidden-input / undeclared-output checks
-- broader rule-kind execution backends beyond `cxx`, especially `node` and `oci`
+- broader rule-kind execution backends beyond the current `cxx` / minimal `node` path, especially `oci`
 
 Reference docs:
 

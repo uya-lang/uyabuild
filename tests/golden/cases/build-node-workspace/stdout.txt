@@ -1,0 +1,11 @@
+workspace: node-workspace
+phase: 3
+matched_targets: 1
+planned_actions: 2
+cache_hits: 0
+seeded_outputs: 0
+success_no_change: 0
+pending_execution: 0
+root_digest: bf20f0d756e641acaf8797540db0e0ced6e482aa007906bea8dacb386dd5ac01
+matched:
+  //web:app
