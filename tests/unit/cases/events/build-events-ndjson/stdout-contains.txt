@@ -1,0 +1,5 @@
+"event":"BuildStarted"
+"event":"ActionStarted"
+"event":"ActionFinished"
+"event":"BuildFinished"
+"status":"executed-local"

@@ -44,6 +44,12 @@ Phase 3 now provides an initial local executor for `legacy.shell`, `task`, and t
 - executed actions also persist tracked read/write path lists for declared inputs, upstream outputs, and declared outputs as the Phase 3 dependency-tracking interface
 - Linux builds now wrap supported local actions with `strace` so compat mode records `hidden_inputs` / `undeclared_outputs`, and `workspace.strict = true` turns those findings into hard failures before output commit
 
+Phase 5 now starts exposing structured event output:
+
+- `uyabuild build --events ndjson` streams a UBEP-compatible line-delimited event log for CLI and CI consumers
+- `uyabuild build --events json` emits the same event stream as an aggregated JSON object with a `summary` block
+- `.uya-build/meta/events/<run-id>` now records `BuildStarted`, `WorkspaceLoaded`, `TargetConfigured`, `ActionPlanned`, `ActionCacheChecked`, `ActionScheduled`, `ActionStarted`, `ActionFinished`, `TargetCompleted`, `BuildMetrics`, and `BuildFinished`
+
 Still pending for later Phase 3 work:
 
 - a macOS dependency-tracing backend for the same hidden-input / undeclared-output checks

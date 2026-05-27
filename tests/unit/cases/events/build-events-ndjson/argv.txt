@@ -1,0 +1,4 @@
+build
+--events
+ndjson
+//modes:host

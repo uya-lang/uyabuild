@@ -1,0 +1,6 @@
+"ok":false
+"format":"ubep.json"
+"event":"BuildStarted"
+"event":"ActionFinished"
+"diagnostic_code":"UYABUILD_E_STRICT_UNDECLARED_OUTPUT"
+"undeclared_outputs":["out/extra.txt"]

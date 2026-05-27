@@ -225,11 +225,16 @@
 
 ### 10.2 TODO
 
+当前状态（2026-05-27）：
+
+- `P5-2` / `P5-3` 已完成：`uyabuild build` 现已支持 `--events ndjson|json`；`.uya-build/meta/events/<run-id>` 已切换到 UBEP envelope，并会为执行或复用的动作记录 `BuildStarted`、`WorkspaceLoaded`、`TargetConfigured`、`ActionPlanned`、`ActionCacheChecked`、`ActionScheduled`、`ActionStarted`、`ActionFinished`、`TargetCompleted`、`BuildMetrics`、`BuildFinished` 生命周期事件。
+- 新增 `events/build-events-ndjson`、`events/build-events-json-failure`、`events/build-events-option-conflict` unit 回归，覆盖成功流、失败流与 CLI 选项校验；golden / e2e 回归已同步验证。
+
 | ID | 优先级 | 任务 | 依赖 | 验收标准 |
 |---|---|---|---|---|
 | `P5-1` | `P1` | 已完成：定义 UBEP 事件 schema | `P3-12` | 事件字段和生命周期固定 |
-| `P5-2` | `P1` | 实现 `ndjson/json` 事件输出 | `P5-1` | CLI 和 CI 可消费结构化事件 |
-| `P5-3` | `P1` | 记录 `BuildStarted/ActionStarted/ActionFinished/BuildFinished` | `P5-2` | 一次构建具备完整事件流 |
+| `P5-2` | `P1` | 已完成：实现 `ndjson/json` 事件输出 | `P5-1` | CLI 和 CI 可消费结构化事件 |
+| `P5-3` | `P1` | 已完成：记录 `BuildStarted/ActionStarted/ActionFinished/BuildFinished` | `P5-2` | 一次构建具备完整事件流 |
 | `P5-4` | `P1` | 实现 `query` 的 `deps/rdeps/kind/filter` | `P2-5`, `P2-4` | 可以查询目标图 |
 | `P5-5` | `P1` | 实现 `aquery` 查看动作命令和输入输出 | `P2-6`, `P2-4` | 动作图可被直接检查 |
 | `P5-6` | `P1` | 实现 `why` 的脏因树 | `P2-7`, `P3-12` | 能解释一次重建的最小原因链 |

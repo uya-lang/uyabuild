@@ -32,3 +32,6 @@ Current coverage:
 | `executor` | `legacy-shell-success` | prove local execution commits declared outputs |
 | `executor` | `strict-hidden-input` | prove strict mode blocks hidden inputs before output commit |
 | `planner` | `node-workspace-graph` | prove `node.app` narrows inputs to reachable workspace packages while keeping workspace manifests visible for install/setup |
+| `events` | `build-events-ndjson` | prove `uyabuild build --events ndjson` emits a UBEP lifecycle for an executed local action |
+| `events` | `build-events-json-failure` | prove `uyabuild build --events json` preserves failure diagnostics and undeclared-output findings |
+| `events` | `build-events-option-conflict` | prove the CLI rejects mixing build summary `--json` with UBEP `--events` |

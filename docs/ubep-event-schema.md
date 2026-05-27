@@ -242,10 +242,9 @@ MVP 事件集合固定为以下类型。
 
 ## 7. 当前实现映射
 
-当前仓库（2026-05-27）的落盘实现还处于 Phase 5 之前的过渡态：
+当前仓库（2026-05-27）已完成 `P5-2` / `P5-3` 的最小闭环：
 
-- `meta/events/<run-id>` 已落盘为 line-delimited JSON
-- 已有事件子集：`BuildPlanned`、`ActionPlanned`
-- 事件 payload 已复用 `run_id`、`root_digest`、`action_key`、`label`、`status` 等字段
-
-后续 `P5-2` / `P5-3` 的目标是把现有过渡事件对齐到本文件定义的 UBEP schema，并补齐 `BuildStarted/ActionStarted/ActionFinished/BuildFinished` 生命周期。
+- `uyabuild build --events ndjson` 会直接输出按 `seq` 排序的 UBEP line-delimited 事件流。
+- `uyabuild build --events json` 会输出聚合后的 `events + summary` 视图，便于 CI 和脚本消费。
+- `.uya-build/meta/events/<run-id>` 现已落盘为 UBEP envelope，并覆盖 `BuildStarted`、`WorkspaceLoaded`、`TargetConfigured`、`ActionPlanned`、`ActionCacheChecked`、`ActionScheduled`、`ActionStarted`、`ActionFinished`、`TargetCompleted`、`BuildMetrics`、`BuildFinished`。
+- 对于 `local-hit` / `seeded-output` / `success-no-change` 直接复用的动作，当前实现会记录 `ActionPlanned`、`ActionCacheChecked`、`ActionScheduled`，但不会伪造 `ActionStarted` / `ActionFinished`。

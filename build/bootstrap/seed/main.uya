@@ -52,6 +52,10 @@ const EXIT_NOT_IMPLEMENTED: i32 = 6;
 
 const OUTPUT_TEXT: i32 = 0;
 const OUTPUT_JSON: i32 = 1;
+const EVENT_OUTPUT_NONE: i32 = 0;
+const EVENT_OUTPUT_NDJSON: i32 = 1;
+const EVENT_OUTPUT_JSON: i32 = 2;
+const UBEP_VERSION: i32 = 1;
 
 const S_IFMT: u32 = 61440u32;
 const S_IFDIR: u32 = 16384u32;
@@ -81,6 +85,7 @@ struct Options {
     state_dir_override: &byte,
     config_selector: &byte,
     output_mode: i32,
+    event_output_mode: i32,
     jobs: i32,
 }
 
@@ -403,6 +408,7 @@ struct PlannedAction {
     cache_status: &byte,
     exit_code: i32,
     pending_execution: i32,
+    started_execution: i32,
     child_pid: i32,
     order_index: i32,
     next: &PlannedAction,
@@ -8716,6 +8722,7 @@ fn start_local_action(ctx: &Phase2Context, action: &PlannedAction) i32 {
         _exit(127);
     }
     action.child_pid = child_pid;
+    action.started_execution = 1;
     return 0;
 }
 
@@ -10693,7 +10700,11 @@ fn read_cache_output_digest(ctx: &Phase2Context, action_key: &byte, out: &byte, 
     return extract_json_string_field(content, "output_root_digest" as &byte, out, out_cap);
 }
 
-fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &StringNode) i32 {
+fn persist_phase2_metadata(ctx: &Phase2Context,
+                           subcommand: &byte,
+                           matched: &StringNode,
+                           requested: [&byte: MAX_ARGS],
+                           requested_count: i32) i32 {
     refresh_action_dependency_findings(ctx);
     var build_run_path: [byte: PATH_MAX] = [];
     if join_path(&ctx.state_layout.meta_build_runs[0] as &byte, &ctx.manifest.run_id[0] as &byte, &build_run_path[0] as &byte, PATH_MAX) != 0 {
@@ -10733,22 +10744,6 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
         return -1;
     }
 
-    var events_path: [byte: PATH_MAX] = [];
-    if join_path(&ctx.state_layout.meta_events[0] as &byte, &ctx.manifest.run_id[0] as &byte, &events_path[0] as &byte, PATH_MAX) != 0 {
-        return -1;
-    }
-    const events_file: &FILE = fopen(&events_path[0] as &const byte, "w" as &const byte);
-    if events_file == null {
-        return -1;
-    }
-    fputs("{\"event\":\"BuildPlanned\",\"run_id\":\"" as *byte, events_file);
-    write_json_escape(events_file, &ctx.manifest.run_id[0] as &byte);
-    fputs("\",\"root_digest\":\"" as *byte, events_file);
-    write_json_escape(events_file, ctx.root_digest);
-    fputs("\",\"actions\":" as *byte, events_file);
-    fprintf(events_file, "%d" as *byte, ctx.action_count);
-    fputs("}\n" as *byte, events_file);
-
     var action: &PlannedAction = ctx.action_head;
     while action != null {
         var action_doc_id: [byte: PATH_MAX] = [];
@@ -10758,7 +10753,6 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
                                                     &ctx.manifest.run_id[0] as *byte,
                                                     action.action_key as *byte);
         if action_doc_id_written < 0 || action_doc_id_written >= PATH_MAX {
-            _ = fclose(events_file);
             return -1;
         }
 
@@ -10766,7 +10760,6 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
         var action_latest_path: [byte: PATH_MAX] = [];
         if join_path(&ctx.state_layout.meta_actions[0] as &byte, &action_doc_id[0] as &byte, &action_history_path[0] as &byte, PATH_MAX) != 0 ||
             join_path(&ctx.state_layout.meta_actions[0] as &byte, action.action_key, &action_latest_path[0] as &byte, PATH_MAX) != 0 {
-            _ = fclose(events_file);
             return -1;
         }
         if write_action_record_file(ctx,
@@ -10774,7 +10767,6 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
                                     action,
                                     &action_doc_id[0] as &byte,
                                     null) != 0 {
-            _ = fclose(events_file);
             return -1;
         }
         const action_record_digest: &byte = persist_action_record_digest(ctx, &action_history_path[0] as &byte);
@@ -10789,35 +10781,21 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
                                      action,
                                      &action_doc_id[0] as &byte,
                                      action_record_digest) != 0 {
-            _ = fclose(events_file);
             return -1;
         }
         if append_index_doc_id(ctx, "actions.by_digest" as &byte, action.action_key, &action_doc_id[0] as &byte) != 0 ||
             append_index_doc_id(ctx, "actions.by_owner" as &byte, action.label, &action_doc_id[0] as &byte) != 0 ||
             append_index_doc_id(ctx, "actions.by_status" as &byte, action.cache_status, &action_doc_id[0] as &byte) != 0 {
-            _ = fclose(events_file);
             return -1;
         }
-
-        fputs("{\"event\":\"ActionPlanned\",\"run_id\":\"" as *byte, events_file);
-        write_json_escape(events_file, &ctx.manifest.run_id[0] as &byte);
-        fputs("\",\"action_key\":\"" as *byte, events_file);
-        write_json_escape(events_file, action.action_key);
-        fputs("\",\"label\":\"" as *byte, events_file);
-        write_json_escape(events_file, action.label);
-        fputs("\",\"status\":\"" as *byte, events_file);
-        write_json_escape(events_file, action.cache_status);
-        fputs("\"}\n" as *byte, events_file);
 
         if action_uses_local_cache(action) != 0 {
             var cache_path: [byte: PATH_MAX] = [];
             if join_path(&ctx.state_layout.meta_cache_entries[0] as &byte, action.action_key, &cache_path[0] as &byte, PATH_MAX) != 0 {
-                _ = fclose(events_file);
                 return -1;
             }
             const cache_file: &FILE = fopen(&cache_path[0] as &const byte, "w" as &const byte);
             if cache_file == null {
-                _ = fclose(events_file);
                 return -1;
             }
             fputs("{\"action_key\":\"" as *byte, cache_file);
@@ -10837,14 +10815,12 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
             fputs("\"}\n" as *byte, cache_file);
             _ = fflush(cache_file);
             if fclose(cache_file) != 0 {
-                _ = fclose(events_file);
                 return -1;
             }
             if append_index_doc_id(ctx,
                                    "cache_entries.by_action_digest" as &byte,
                                    action.action_key,
                                    action.action_key) != 0 {
-                _ = fclose(events_file);
                 return -1;
             }
         }
@@ -10855,12 +10831,10 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
             var artifact_path: [byte: PATH_MAX] = [];
             if artifact_id == null ||
                 join_path(&ctx.state_layout.meta_artifacts[0] as &byte, artifact_id, &artifact_path[0] as &byte, PATH_MAX) != 0 {
-                _ = fclose(events_file);
                 return -1;
             }
             const artifact_file: &FILE = fopen(&artifact_path[0] as &const byte, "w" as &const byte);
             if artifact_file == null {
-                _ = fclose(events_file);
                 return -1;
             }
             const snapshot: &SnapshotEntry = snapshot_workspace_path(ctx, output.text, 0);
@@ -10881,11 +10855,9 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
             fputs("}\n" as *byte, artifact_file);
             _ = fflush(artifact_file);
             if fclose(artifact_file) != 0 {
-                _ = fclose(events_file);
                 return -1;
             }
             if append_index_doc_id(ctx, "artifacts.by_path" as &byte, output.text, artifact_id) != 0 {
-                _ = fclose(events_file);
                 return -1;
             }
             output = output.next;
@@ -10894,8 +10866,7 @@ fn persist_phase2_metadata(ctx: &Phase2Context, subcommand: &byte, matched: &Str
         action = action.next;
     }
 
-    _ = fflush(events_file);
-    if fclose(events_file) != 0 {
+    if write_phase2_events_file(ctx, subcommand, requested, requested_count, matched) != 0 {
         return -1;
     }
     if append_index_doc_id(ctx,
@@ -10930,6 +10901,432 @@ fn emit_json_bool(stream: &FILE, value: i32) void {
     } else {
         fputs("false" as *byte, stream);
     }
+}
+
+fn emit_args_array_json(stream: &FILE, values: [&byte: MAX_ARGS], value_count: i32) void {
+    fputs("[" as *byte, stream);
+    var first: i32 = 1;
+    var i: i32 = 0;
+    while i < value_count {
+        const value: &byte = values[i as usize];
+        if value != null {
+            if first == 0 {
+                fputs("," as *byte, stream);
+            }
+            fputc(34, stream);
+            write_json_escape(stream, value);
+            fputc(34, stream);
+            first = 0;
+        }
+        i = i + 1;
+    }
+    fputs("]" as *byte, stream);
+}
+
+fn emit_source_file_array_json(stream: &FILE, files: &SourceFile) void {
+    fputs("[" as *byte, stream);
+    var first: i32 = 1;
+    var file: &SourceFile = files;
+    while file != null {
+        if first == 0 {
+            fputs("," as *byte, stream);
+        }
+        fputc(34, stream);
+        write_json_escape(stream, file.rel_path);
+        fputc(34, stream);
+        first = 0;
+        file = file.next;
+    }
+    fputs("]" as *byte, stream);
+}
+
+fn emit_json_string_or_null(stream: &FILE, value: &byte) void {
+    if value != null {
+        fputc(34, stream);
+        write_json_escape(stream, value);
+        fputc(34, stream);
+    } else {
+        fputs("null" as *byte, stream);
+    }
+}
+
+fn action_cache_checked_status(action: &PlannedAction) &byte {
+    if action == null || action.cache_status == null {
+        return "pending-execution" as &byte;
+    }
+    if string_equals(action.cache_status, "executed-local" as &byte) != 0 ||
+        string_equals(action.cache_status, "execution-failed" as &byte) != 0 {
+        return "pending-execution" as &byte;
+    }
+    return action.cache_status;
+}
+
+fn action_started_locally(action: &PlannedAction) i32 {
+    if action == null {
+        return 0;
+    }
+    return action.started_execution;
+}
+
+fn phase2_final_status(ctx: &Phase2Context) &byte {
+    if ctx == null || ctx.phase1 == null {
+        return "failed" as &byte;
+    }
+    if ctx.phase1.diagnostic.code != null {
+        return "failed" as &byte;
+    }
+    var action: &PlannedAction = ctx.action_head;
+    while action != null {
+        if action.cache_status != null &&
+            string_equals(action.cache_status, "execution-failed" as &byte) != 0 {
+            return "failed" as &byte;
+        }
+        action = action.next;
+    }
+    return "ok" as &byte;
+}
+
+fn emit_ubep_event_prefix(stream: &FILE,
+                          ctx: &Phase2Context,
+                          subcommand: &byte,
+                          event_name: &byte,
+                          seq: i32) void {
+    var now_buf: time_t = 0;
+    const now: time_t = time(&now_buf);
+    fputs("{\"version\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, UBEP_VERSION);
+    fputs(",\"event\":\"" as *byte, stream);
+    write_json_escape(stream, event_name);
+    fputs("\",\"run_id\":\"" as *byte, stream);
+    write_json_escape(stream, &ctx.manifest.run_id[0] as &byte);
+    fputs("\",\"seq\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, seq);
+    fputs(",\"phase\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, phase_number_for_subcommand(subcommand));
+    fputs(",\"workspace\":\"" as *byte, stream);
+    if ctx.phase1 != null && ctx.phase1.workspace_ir.name != null {
+        write_json_escape(stream, ctx.phase1.workspace_ir.name);
+    }
+    fputs("\",\"subcommand\":\"" as *byte, stream);
+    write_json_escape(stream, subcommand);
+    fputs("\",\"timestamp_ms\":" as *byte, stream);
+    fprintf(stream, "%ld000" as *byte, now);
+    fputs(",\"payload\":" as *byte, stream);
+}
+
+fn emit_ubep_event_suffix(stream: &FILE) void {
+    fputs("}\n" as *byte, stream);
+}
+
+fn write_phase2_events_file(ctx: &Phase2Context,
+                            subcommand: &byte,
+                            requested: [&byte: MAX_ARGS],
+                            requested_count: i32,
+                            matched: &StringNode) i32 {
+    if ctx == null || subcommand == null {
+        return -1;
+    }
+    var events_path: [byte: PATH_MAX] = [];
+    if join_path(&ctx.state_layout.meta_events[0] as &byte, &ctx.manifest.run_id[0] as &byte, &events_path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    const events_file: &FILE = fopen(&events_path[0] as &const byte, "w" as &const byte);
+    if events_file == null {
+        return -1;
+    }
+
+    var seq: i32 = 1;
+
+    emit_ubep_event_prefix(events_file, ctx, subcommand, "BuildStarted" as &byte, seq);
+    fputs("{\"requested\":" as *byte, events_file);
+    emit_args_array_json(events_file, requested, requested_count);
+    fputs(",\"matched\":" as *byte, events_file);
+    emit_string_node_array_json(events_file, matched);
+    fputs(",\"state_dir\":\"" as *byte, events_file);
+    write_json_escape(events_file, &ctx.state_layout.root[0] as &byte);
+    fputs("\"}" as *byte, events_file);
+    emit_ubep_event_suffix(events_file);
+    seq = seq + 1;
+
+    emit_ubep_event_prefix(events_file, ctx, subcommand, "WorkspaceLoaded" as &byte, seq);
+    fputs("{\"root\":\"" as *byte, events_file);
+    write_json_escape(events_file, ctx.phase1.workspace_root);
+    fputs("\",\"entrypoint\":\"" as *byte, events_file);
+    if ctx.phase1.workspace_ir.source_file != null && ctx.phase1.workspace_ir.source_file.rel_path != null {
+        write_json_escape(events_file, ctx.phase1.workspace_ir.source_file.rel_path);
+    } else {
+        write_json_escape(events_file, "uya.build" as &byte);
+    }
+    fputs("\",\"files\":" as *byte, events_file);
+    emit_source_file_array_json(events_file, ctx.phase1.files_head);
+    fputs(",\"strict\":" as *byte, events_file);
+    emit_json_bool(events_file, ctx.phase1.workspace_ir.strict);
+    fputs("}" as *byte, events_file);
+    emit_ubep_event_suffix(events_file);
+    seq = seq + 1;
+
+    var action: &PlannedAction = ctx.action_head;
+    while action != null {
+        emit_ubep_event_prefix(events_file, ctx, subcommand, "TargetConfigured" as &byte, seq);
+        fputs("{\"label\":\"" as *byte, events_file);
+        write_json_escape(events_file, action.label);
+        fputs("\",\"kind\":\"" as *byte, events_file);
+        write_json_escape(events_file, action.kind);
+        fputs("\",\"package\":\"" as *byte, events_file);
+        if action.owner != null && action.owner.package_path != null {
+            write_json_escape(events_file, action.owner.package_path);
+        }
+        fputs("\",\"providers\":" as *byte, events_file);
+        if action.owner != null {
+            emit_provider_mask_json(events_file, action.owner.provider_mask);
+        } else {
+            fputs("[]" as *byte, events_file);
+        }
+        fputs("}" as *byte, events_file);
+        emit_ubep_event_suffix(events_file);
+        seq = seq + 1;
+        action = action.next;
+    }
+
+    action = ctx.action_head;
+    while action != null {
+        emit_ubep_event_prefix(events_file, ctx, subcommand, "ActionPlanned" as &byte, seq);
+        fputs("{\"label\":\"" as *byte, events_file);
+        write_json_escape(events_file, action.label);
+        fputs("\",\"kind\":\"" as *byte, events_file);
+        write_json_escape(events_file, action.kind);
+        fputs("\",\"action_key\":\"" as *byte, events_file);
+        write_json_escape(events_file, action.action_key);
+        fputs("\",\"pool\":\"" as *byte, events_file);
+        write_json_escape(events_file, action.pool_name);
+        fputs("\",\"execution_mode\":\"" as *byte, events_file);
+        write_json_escape(events_file, action.execution_mode);
+        fputs("\",\"inputs\":" as *byte, events_file);
+        emit_string_node_array_json(events_file, action.input_head);
+        fputs(",\"outputs\":" as *byte, events_file);
+        emit_string_node_array_json(events_file, action.output_head);
+        fputs(",\"deps\":" as *byte, events_file);
+        emit_string_node_array_json(events_file, action.dep_head);
+        fputs("}" as *byte, events_file);
+        emit_ubep_event_suffix(events_file);
+        seq = seq + 1;
+
+        emit_ubep_event_prefix(events_file, ctx, subcommand, "ActionCacheChecked" as &byte, seq);
+        fputs("{\"action_key\":\"" as *byte, events_file);
+        write_json_escape(events_file, action.action_key);
+        fputs("\",\"status\":\"" as *byte, events_file);
+        write_json_escape(events_file, action_cache_checked_status(action));
+        fputs("\",\"input_root_digest\":\"" as *byte, events_file);
+        write_json_escape(events_file, action.input_root_digest);
+        fputs("\",\"output_root_digest\":" as *byte, events_file);
+        emit_json_string_or_null(events_file, action.output_root_digest);
+        fputs("}" as *byte, events_file);
+        emit_ubep_event_suffix(events_file);
+        seq = seq + 1;
+
+        emit_ubep_event_prefix(events_file, ctx, subcommand, "ActionScheduled" as &byte, seq);
+        fputs("{\"action_key\":\"" as *byte, events_file);
+        write_json_escape(events_file, action.action_key);
+        fputs("\",\"status\":\"" as *byte, events_file);
+        write_json_escape(events_file, action_cache_checked_status(action));
+        fputs("\",\"order\":" as *byte, events_file);
+        fprintf(events_file, "%d" as *byte, action.order_index);
+        fputs("}" as *byte, events_file);
+        emit_ubep_event_suffix(events_file);
+        seq = seq + 1;
+
+        if action_started_locally(action) != 0 {
+            emit_ubep_event_prefix(events_file, ctx, subcommand, "ActionStarted" as &byte, seq);
+            fputs("{\"action_key\":\"" as *byte, events_file);
+            write_json_escape(events_file, action.action_key);
+            fputs("\",\"label\":\"" as *byte, events_file);
+            write_json_escape(events_file, action.label);
+            fputs("\",\"command\":" as *byte, events_file);
+            emit_string_node_array_json(events_file, action.command_head);
+            fputs(",\"action_root\":" as *byte, events_file);
+            emit_json_string_or_null(events_file, action.action_root_path);
+            fputs("}" as *byte, events_file);
+            emit_ubep_event_suffix(events_file);
+            seq = seq + 1;
+
+            emit_ubep_event_prefix(events_file, ctx, subcommand, "ActionFinished" as &byte, seq);
+            fputs("{\"action_key\":\"" as *byte, events_file);
+            write_json_escape(events_file, action.action_key);
+            fputs("\",\"status\":\"" as *byte, events_file);
+            write_json_escape(events_file, action.cache_status);
+            fputs("\",\"exit_code\":" as *byte, events_file);
+            fprintf(events_file, "%d" as *byte, action.exit_code);
+            fputs(",\"stdout_digest\":" as *byte, events_file);
+            emit_json_string_or_null(events_file, action.stdout_digest);
+            fputs(",\"stderr_digest\":" as *byte, events_file);
+            emit_json_string_or_null(events_file, action.stderr_digest);
+            fputs(",\"tracked_reads\":" as *byte, events_file);
+            emit_string_node_array_json(events_file, action.tracked_read_head);
+            fputs(",\"tracked_writes\":" as *byte, events_file);
+            emit_string_node_array_json(events_file, action.tracked_write_head);
+            fputs(",\"hidden_inputs\":" as *byte, events_file);
+            emit_string_node_array_json(events_file, action.hidden_input_head);
+            fputs(",\"undeclared_outputs\":" as *byte, events_file);
+            emit_string_node_array_json(events_file, action.undeclared_output_head);
+            fputs("}" as *byte, events_file);
+            emit_ubep_event_suffix(events_file);
+            seq = seq + 1;
+        }
+
+        action = action.next;
+    }
+
+    var node: &StringNode = matched;
+    while node != null {
+        emit_ubep_event_prefix(events_file, ctx, subcommand, "TargetCompleted" as &byte, seq);
+        fputs("{\"label\":\"" as *byte, events_file);
+        write_json_escape(events_file, node.text);
+        fputs("\",\"status\":\"" as *byte, events_file);
+        const action_for_target: &PlannedAction = find_planned_action_by_label(ctx, node.text);
+        if action_for_target != null && action_for_target.cache_status != null {
+            write_json_escape(events_file, action_for_target.cache_status);
+        } else {
+            write_json_escape(events_file, "not-planned" as &byte);
+        }
+        fputs("\",\"artifacts\":" as *byte, events_file);
+        if action_for_target != null {
+            emit_string_node_array_json(events_file, action_for_target.output_head);
+        } else {
+            fputs("[]" as *byte, events_file);
+        }
+        fputs("}" as *byte, events_file);
+        emit_ubep_event_suffix(events_file);
+        seq = seq + 1;
+        node = node.next;
+    }
+
+    emit_ubep_event_prefix(events_file, ctx, subcommand, "BuildMetrics" as &byte, seq);
+    fputs("{\"actions\":" as *byte, events_file);
+    fprintf(events_file, "%d" as *byte, ctx.action_count);
+    fputs(",\"cache_hits\":" as *byte, events_file);
+    fprintf(events_file, "%d" as *byte, ctx.cache_hit_count);
+    fputs(",\"seeded\":" as *byte, events_file);
+    fprintf(events_file, "%d" as *byte, ctx.seeded_count);
+    fputs(",\"no_change\":" as *byte, events_file);
+    fprintf(events_file, "%d" as *byte, ctx.no_change_count);
+    fputs(",\"pending\":" as *byte, events_file);
+    fprintf(events_file, "%d" as *byte, ctx.pending_count);
+    fputs("}" as *byte, events_file);
+    emit_ubep_event_suffix(events_file);
+    seq = seq + 1;
+
+    emit_ubep_event_prefix(events_file, ctx, subcommand, "BuildFinished" as &byte, seq);
+    fputs("{\"status\":\"" as *byte, events_file);
+    write_json_escape(events_file, phase2_final_status(ctx));
+    fputs("\",\"root_digest\":\"" as *byte, events_file);
+    write_json_escape(events_file, ctx.root_digest);
+    fputs("\",\"diagnostic_code\":" as *byte, events_file);
+    emit_json_string_or_null(events_file, ctx.phase1.diagnostic.code);
+    fputs(",\"diagnostic_message\":" as *byte, events_file);
+    emit_json_string_or_null(events_file, ctx.phase1.diagnostic.message);
+    fputs("}" as *byte, events_file);
+    emit_ubep_event_suffix(events_file);
+
+    _ = fflush(events_file);
+    if fclose(events_file) != 0 {
+        return -1;
+    }
+    return 0;
+}
+
+fn emit_phase2_events_summary_json(stream: &FILE, ctx: &Phase2Context, subcommand: &byte) void {
+    fputs("{\"status\":\"" as *byte, stream);
+    write_json_escape(stream, phase2_final_status(ctx));
+    fputs("\",\"run_id\":\"" as *byte, stream);
+    write_json_escape(stream, &ctx.manifest.run_id[0] as &byte);
+    fputs("\",\"phase\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, phase_number_for_subcommand(subcommand));
+    fputs(",\"subcommand\":\"" as *byte, stream);
+    write_json_escape(stream, subcommand);
+    fputs("\",\"root_digest\":\"" as *byte, stream);
+    write_json_escape(stream, ctx.root_digest);
+    fputs("\",\"diagnostic_code\":" as *byte, stream);
+    emit_json_string_or_null(stream, ctx.phase1.diagnostic.code);
+    fputs(",\"diagnostic_message\":" as *byte, stream);
+    emit_json_string_or_null(stream, ctx.phase1.diagnostic.message);
+    fputs(",\"metrics\":{" as *byte, stream);
+    fputs("\"actions\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, ctx.action_count);
+    fputs(",\"cache_hits\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, ctx.cache_hit_count);
+    fputs(",\"seeded\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, ctx.seeded_count);
+    fputs(",\"no_change\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, ctx.no_change_count);
+    fputs(",\"pending\":" as *byte, stream);
+    fprintf(stream, "%d" as *byte, ctx.pending_count);
+    fputs("}}" as *byte, stream);
+}
+
+fn emit_phase2_events_output(ctx: &Phase2Context, subcommand: &byte, event_output_mode: i32) i32 {
+    if ctx == null || subcommand == null || event_output_mode == EVENT_OUTPUT_NONE {
+        return 0;
+    }
+    var events_path: [byte: PATH_MAX] = [];
+    if join_path(&ctx.state_layout.meta_events[0] as &byte, &ctx.manifest.run_id[0] as &byte, &events_path[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    var size_out: usize = 0usize;
+    const content: &byte = read_file_into_arena(ctx.phase1, &events_path[0] as &byte, &size_out);
+    if content == null {
+        return -1;
+    }
+
+    if event_output_mode == EVENT_OUTPUT_NDJSON {
+        fputs(content as *byte, libc.stdout);
+        _ = fflush(libc.stdout);
+        return 0;
+    }
+
+    fputs("{\"ok\":" as *byte, libc.stdout);
+    if string_equals(phase2_final_status(ctx), "ok" as &byte) != 0 {
+        fputs("true" as *byte, libc.stdout);
+    } else {
+        fputs("false" as *byte, libc.stdout);
+    }
+    fputs(",\"format\":\"ubep.json\",\"events\":[" as *byte, libc.stdout);
+
+    var first_event: i32 = 1;
+    var pos: usize = 0usize;
+    while pos < size_out {
+        while pos < size_out &&
+            (content[pos] == 10 as byte || content[pos] == 13 as byte) {
+            pos = pos + 1usize;
+        }
+        if pos >= size_out || content[pos] == 0 as byte {
+            break;
+        }
+
+        const line_start: usize = pos;
+        while pos < size_out &&
+            content[pos] != 0 as byte &&
+            content[pos] != 10 as byte &&
+            content[pos] != 13 as byte {
+            pos = pos + 1usize;
+        }
+        const line_len: usize = pos - line_start;
+        if line_len > 0usize {
+            if first_event == 0 {
+                fputs("," as *byte, libc.stdout);
+            }
+            const written: usize = fwrite((&content[line_start]) as &const byte, 1usize, line_len, libc.stdout);
+            if written != line_len {
+                return -1;
+            }
+            first_event = 0;
+        }
+    }
+
+    fputs("],\"summary\":" as *byte, libc.stdout);
+    emit_phase2_events_summary_json(libc.stdout, ctx, subcommand);
+    fputs("}\n" as *byte, libc.stdout);
+    _ = fflush(libc.stdout);
+    return 0;
 }
 
 fn write_action_record_file(ctx: &Phase2Context,
@@ -11670,6 +12067,7 @@ fn print_root_help() void {
     fputs("\n" as *byte, libc.stdout);
     fputs("Examples:\n" as *byte, libc.stdout);
     fputs("  uyabuild build //bootstrap:uyabuild\n" as *byte, libc.stdout);
+    fputs("  uyabuild build //legacy:echo --events ndjson\n" as *byte, libc.stdout);
     fputs("  uyabuild test //tests:smoke\n" as *byte, libc.stdout);
     fputs("  uyabuild query //...\n" as *byte, libc.stdout);
     fputs("  uyabuild plan //app:hello --json\n" as *byte, libc.stdout);
@@ -11687,6 +12085,7 @@ fn print_build_help() void {
     fputs("  --state-dir <path>    override state directory\n" as *byte, libc.stdout);
     fputs("  --config <list>       activate config names for select() expansion\n" as *byte, libc.stdout);
     fputs("  --json                emit diagnostics as JSON\n" as *byte, libc.stdout);
+    fputs("  --events <format>     emit UBEP events as ndjson or aggregated json\n" as *byte, libc.stdout);
     fputs("  -h, --help            show build help\n" as *byte, libc.stdout);
     fputs("\n" as *byte, libc.stdout);
     fputs("Notes:\n" as *byte, libc.stdout);
@@ -12110,6 +12509,19 @@ fn apply_shared_option(argument: &byte, next_argument: &byte, options: &Options)
     return 0;
 }
 
+fn parse_event_output_mode(value: &byte) i32 {
+    if value == null {
+        return -1;
+    }
+    if string_equals(value, "ndjson" as &byte) != 0 {
+        return EVENT_OUTPUT_NDJSON;
+    }
+    if string_equals(value, "json" as &byte) != 0 {
+        return EVENT_OUTPUT_JSON;
+    }
+    return -1;
+}
+
 fn default_parallel_jobs() i32 {
     const raw_jobs: &byte = getenv("UYABUILD_JOBS" as &const byte);
     var parsed_jobs: i32 = 0;
@@ -12125,6 +12537,7 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
         state_dir_override: base_options.state_dir_override,
         config_selector: base_options.config_selector,
         output_mode: base_options.output_mode,
+        event_output_mode: base_options.event_output_mode,
         jobs: base_options.jobs,
     };
     var targets: [&byte: MAX_ARGS] = [];
@@ -12170,6 +12583,33 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
             if string_equals(argument, "--json" as &byte) != 0 {
                 options.output_mode = OUTPUT_JSON;
                 index = index + 1;
+                continue;
+            }
+            if string_equals(argument, "--events" as &byte) != 0 {
+                if index + 1 >= argc {
+                    return emit_error(options.output_mode,
+                                      EXIT_USAGE,
+                                      "UYABUILD_E_USAGE" as &byte,
+                                      "option requires a value" as &byte,
+                                      argument);
+                }
+                if options.event_output_mode != EVENT_OUTPUT_NONE {
+                    return emit_error(options.output_mode,
+                                      EXIT_USAGE,
+                                      "UYABUILD_E_USAGE" as &byte,
+                                      "--events may only be passed once" as &byte,
+                                      "use --events ndjson or --events json" as &byte);
+                }
+                const event_mode: i32 = parse_event_output_mode(get_argv(index + 1));
+                if event_mode == -1 {
+                    return emit_error(options.output_mode,
+                                      EXIT_USAGE,
+                                      "UYABUILD_E_USAGE" as &byte,
+                                      "unknown --events format" as &byte,
+                                      "supported formats: ndjson, json" as &byte);
+                }
+                options.event_output_mode = event_mode;
+                index = index + 2;
                 continue;
             }
 
@@ -12221,6 +12661,14 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
         targets[target_count as usize] = argument;
         target_count = target_count + 1;
         index = index + 1;
+    }
+
+    if options.output_mode == OUTPUT_JSON && options.event_output_mode != EVENT_OUTPUT_NONE {
+        return emit_error(OUTPUT_TEXT,
+                          EXIT_USAGE,
+                          "UYABUILD_E_USAGE" as &byte,
+                          "--json cannot be combined with --events" as &byte,
+                          "choose either the build summary JSON view or UBEP event output" as &byte);
     }
 
     var workspace: Workspace = Workspace { root: [], entrypoint: [] };
@@ -12333,7 +12781,14 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
                           "check declared inputs, target cycles, and CAS paths" as &byte);
     }
     if phase2.pending_count > 0 && execute_pending_actions(&phase2) != 0 {
-        _ = persist_phase2_metadata(&phase2, "build" as &byte, matched);
+        _ = persist_phase2_metadata(&phase2, "build" as &byte, matched, targets, target_count);
+        if options.event_output_mode != EVENT_OUTPUT_NONE {
+            _ = emit_phase2_events_output(&phase2, "build" as &byte, options.event_output_mode);
+            if phase1.diagnostic.code != null {
+                return phase1.diagnostic.exit_code;
+            }
+            return EXIT_ACTION;
+        }
         if phase1.diagnostic.code != null {
             return emit_diagnostic(options.output_mode, &phase1.diagnostic);
         }
@@ -12343,14 +12798,22 @@ fn run_build(start_index: i32, base_options: &Options) i32 {
                           "the local executor failed before build metadata could be reported" as &byte,
                           "check action stderr logs under .uya-build/tmp/actions/" as &byte);
     }
-    if persist_phase2_metadata(&phase2, "build" as &byte, matched) != 0 {
+    if persist_phase2_metadata(&phase2, "build" as &byte, matched, targets, target_count) != 0 {
         return emit_error(options.output_mode,
                           EXIT_IO,
                           "UYABUILD_E_META_WRITE" as &byte,
                           "failed to persist Phase 2 metadata" as &byte,
                           "check .uya-build/meta permissions and path lengths" as &byte);
     }
-    if options.output_mode == OUTPUT_JSON {
+    if options.event_output_mode != EVENT_OUTPUT_NONE {
+        if emit_phase2_events_output(&phase2, "build" as &byte, options.event_output_mode) != 0 {
+            return emit_error(OUTPUT_TEXT,
+                              EXIT_IO,
+                              "UYABUILD_E_META_WRITE" as &byte,
+                              "failed to emit UBEP event output" as &byte,
+                              "check the run event file under .uya-build/meta/events/" as &byte);
+        }
+    } else if options.output_mode == OUTPUT_JSON {
         emit_build_json(&phase1, &phase2, matched);
     } else {
         emit_build_text(&phase1, &phase2, matched);
@@ -12364,6 +12827,7 @@ fn run_test(start_index: i32, base_options: &Options) i32 {
         state_dir_override: base_options.state_dir_override,
         config_selector: base_options.config_selector,
         output_mode: base_options.output_mode,
+        event_output_mode: base_options.event_output_mode,
         jobs: base_options.jobs,
     };
     var targets: [&byte: MAX_ARGS] = [];
@@ -12584,7 +13048,7 @@ fn run_test(start_index: i32, base_options: &Options) i32 {
                           "check declared inputs, target cycles, and CAS paths" as &byte);
     }
     if phase2.pending_count > 0 && execute_pending_actions(&phase2) != 0 {
-        _ = persist_phase2_metadata(&phase2, "test" as &byte, matched);
+        _ = persist_phase2_metadata(&phase2, "test" as &byte, matched, targets, target_count);
         if phase1.diagnostic.code != null {
             return emit_diagnostic(OUTPUT_TEXT, &phase1.diagnostic);
         }
@@ -12594,7 +13058,7 @@ fn run_test(start_index: i32, base_options: &Options) i32 {
                           "the local executor failed before tests could run" as &byte,
                           "check action stderr logs under .uya-build/tmp/actions/" as &byte);
     }
-    if persist_phase2_metadata(&phase2, "test" as &byte, matched) != 0 {
+    if persist_phase2_metadata(&phase2, "test" as &byte, matched, targets, target_count) != 0 {
         return emit_error(OUTPUT_TEXT,
                           EXIT_IO,
                           "UYABUILD_E_META_WRITE" as &byte,
@@ -12652,6 +13116,7 @@ fn run_query(start_index: i32, base_options: &Options) i32 {
         state_dir_override: base_options.state_dir_override,
         config_selector: base_options.config_selector,
         output_mode: base_options.output_mode,
+        event_output_mode: base_options.event_output_mode,
         jobs: base_options.jobs,
     };
     var args: [&byte: MAX_ARGS] = [];
@@ -12825,6 +13290,7 @@ fn run_plan(start_index: i32, base_options: &Options) i32 {
         state_dir_override: base_options.state_dir_override,
         config_selector: base_options.config_selector,
         output_mode: base_options.output_mode,
+        event_output_mode: base_options.event_output_mode,
         jobs: base_options.jobs,
     };
     var targets: [&byte: MAX_ARGS] = [];
@@ -12993,7 +13459,7 @@ fn run_plan(start_index: i32, base_options: &Options) i32 {
                           "failed to build the Phase 2 action graph" as &byte,
                           "check declared inputs, target cycles, and CAS paths" as &byte);
     }
-    if persist_phase2_metadata(&phase2, "plan" as &byte, matched) != 0 {
+    if persist_phase2_metadata(&phase2, "plan" as &byte, matched, targets, target_count) != 0 {
         return emit_error(options.output_mode,
                           EXIT_IO,
                           "UYABUILD_E_META_WRITE" as &byte,
@@ -13014,6 +13480,7 @@ fn run_why(start_index: i32, base_options: &Options) i32 {
         state_dir_override: base_options.state_dir_override,
         config_selector: base_options.config_selector,
         output_mode: base_options.output_mode,
+        event_output_mode: base_options.event_output_mode,
         jobs: base_options.jobs,
     };
     var targets: [&byte: MAX_ARGS] = [];
@@ -13183,7 +13650,7 @@ fn run_why(start_index: i32, base_options: &Options) i32 {
                           "failed to build the Phase 2 action graph" as &byte,
                           "check declared inputs, target cycles, and CAS paths" as &byte);
     }
-    if persist_phase2_metadata(&phase2, "why" as &byte, matched) != 0 {
+    if persist_phase2_metadata(&phase2, "why" as &byte, matched, targets, target_count) != 0 {
         return emit_error(options.output_mode,
                           EXIT_IO,
                           "UYABUILD_E_META_WRITE" as &byte,
@@ -13205,6 +13672,7 @@ export fn main() i32 {
         state_dir_override: null,
         config_selector: null,
         output_mode: OUTPUT_TEXT,
+        event_output_mode: EVENT_OUTPUT_NONE,
         jobs: default_parallel_jobs(),
     };
     var command_index: i32 = 1;

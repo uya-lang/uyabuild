@@ -25,6 +25,7 @@ Global options:
 
 Examples:
   uyabuild build //bootstrap:uyabuild
+  uyabuild build //legacy:echo --events ndjson
   uyabuild test //tests:smoke
   uyabuild query //...
   uyabuild plan //app:hello --json
