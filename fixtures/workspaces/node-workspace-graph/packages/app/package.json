@@ -1,0 +1,11 @@
+{
+  "name": "@sample/app",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "@sample/lib": "0.0.0"
+  },
+  "scripts": {
+    "build": "node build.js"
+  }
+}

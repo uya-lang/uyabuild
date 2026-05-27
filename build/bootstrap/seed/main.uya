@@ -335,6 +335,14 @@ struct TomlWorkspaceMeta {
     strict: i32,
 }
 
+struct NodeWorkspacePackage {
+    package_dir: &byte,
+    manifest_path: &byte,
+    name: &byte,
+    dependency_head: &StringNode,
+    next: &NodeWorkspacePackage,
+}
+
 struct Phase1Context {
     arena: Arena,
     workspace_root: &byte,
@@ -1362,6 +1370,14 @@ fn new_planned_action(ctx: &Phase1Context) &PlannedAction {
         return null;
     }
     return mem as &PlannedAction;
+}
+
+fn new_node_workspace_package(ctx: &Phase1Context) &NodeWorkspacePackage {
+    const mem: &byte = arena_alloc_zero(&ctx.arena, @size_of(NodeWorkspacePackage));
+    if mem == null {
+        return null;
+    }
+    return mem as &NodeWorkspacePackage;
 }
 
 fn phase2_ctx_init(ctx: &Phase2Context,
@@ -5151,6 +5167,16 @@ fn action_uses_local_cache(action: &PlannedAction) i32 {
     return 1;
 }
 
+fn action_allows_preexecution_output_reuse(action: &PlannedAction) i32 {
+    if action == null {
+        return 0;
+    }
+    if action_is_node_kind(action) != 0 {
+        return 0;
+    }
+    return 1;
+}
+
 fn rule_kind_required_fields_message(rule_kind: &RuleKindDef) &byte {
     if rule_kind == null || rule_kind.name == null {
         return "rule kind is missing required fields" as &byte;
@@ -6456,6 +6482,661 @@ fn node_runtime_path() &byte {
     return "node" as &byte;
 }
 
+fn json_is_space(ch: byte) i32 {
+    if ch == 32 as byte || ch == 10 as byte || ch == 13 as byte || ch == 9 as byte {
+        return 1;
+    }
+    return 0;
+}
+
+fn json_skip_space(content: &byte, pos: usize) usize {
+    var cursor: usize = pos;
+    while content[cursor] != 0 as byte && json_is_space(content[cursor]) != 0 {
+        cursor = cursor + 1usize;
+    }
+    return cursor;
+}
+
+fn json_skip_string_value(content: &byte, pos: usize, next_out: &usize) i32 {
+    if content == null || next_out == null || content[pos] != 34 as byte {
+        return -1;
+    }
+    var cursor: usize = pos + 1usize;
+    while content[cursor] != 0 as byte {
+        if content[cursor] == 92 as byte {
+            if content[cursor + 1usize] == 0 as byte {
+                return -1;
+            }
+            cursor = cursor + 2usize;
+            continue;
+        }
+        if content[cursor] == 34 as byte {
+            next_out[0] = cursor + 1usize;
+            return 0;
+        }
+        cursor = cursor + 1usize;
+    }
+    return -1;
+}
+
+fn json_parse_string_range(content: &byte,
+                           pos: usize,
+                           start_out: &usize,
+                           end_out: &usize,
+                           next_out: &usize) i32 {
+    if content == null || start_out == null || end_out == null || next_out == null {
+        return -1;
+    }
+    if content[pos] != 34 as byte {
+        return -1;
+    }
+    start_out[0] = pos + 1usize;
+    var cursor: usize = pos + 1usize;
+    while content[cursor] != 0 as byte {
+        if content[cursor] == 92 as byte {
+            if content[cursor + 1usize] == 0 as byte {
+                return -1;
+            }
+            cursor = cursor + 2usize;
+            continue;
+        }
+        if content[cursor] == 34 as byte {
+            end_out[0] = cursor;
+            next_out[0] = cursor + 1usize;
+            return 0;
+        }
+        cursor = cursor + 1usize;
+    }
+    return -1;
+}
+
+fn json_match_string_token(content: &byte, pos: usize, expected: &byte, next_out: &usize) i32 {
+    if content == null || expected == null || next_out == null || content[pos] != 34 as byte {
+        return 0;
+    }
+    var cursor: usize = pos + 1usize;
+    var index: usize = 0usize;
+    while expected[index] != 0 as byte {
+        if content[cursor] == 0 as byte ||
+            content[cursor] == 92 as byte ||
+            content[cursor] != expected[index] {
+            return 0;
+        }
+        cursor = cursor + 1usize;
+        index = index + 1usize;
+    }
+    if content[cursor] != 34 as byte {
+        return 0;
+    }
+    next_out[0] = cursor + 1usize;
+    return 1;
+}
+
+fn json_skip_literal_value(content: &byte, pos: usize, next_out: &usize) i32 {
+    if content == null || next_out == null {
+        return -1;
+    }
+    var cursor: usize = pos;
+    while content[cursor] != 0 as byte &&
+        content[cursor] != 44 as byte &&
+        content[cursor] != 93 as byte &&
+        content[cursor] != 125 as byte &&
+        json_is_space(content[cursor]) == 0 {
+        cursor = cursor + 1usize;
+    }
+    if cursor == pos {
+        return -1;
+    }
+    next_out[0] = cursor;
+    return 0;
+}
+
+fn json_skip_value(content: &byte, pos: usize, next_out: &usize) i32 {
+    if content == null || next_out == null {
+        return -1;
+    }
+    var cursor: usize = json_skip_space(content, pos);
+    const ch: byte = content[cursor];
+    if ch == 34 as byte {
+        return json_skip_string_value(content, cursor, next_out);
+    }
+    if ch == 123 as byte {
+        cursor = json_skip_space(content, cursor + 1usize);
+        if content[cursor] == 125 as byte {
+            next_out[0] = cursor + 1usize;
+            return 0;
+        }
+        while content[cursor] != 0 as byte {
+            if json_skip_string_value(content, cursor, &cursor) != 0 {
+                return -1;
+            }
+            cursor = json_skip_space(content, cursor);
+            if content[cursor] != 58 as byte {
+                return -1;
+            }
+            if json_skip_value(content, cursor + 1usize, &cursor) != 0 {
+                return -1;
+            }
+            cursor = json_skip_space(content, cursor);
+            if content[cursor] == 44 as byte {
+                cursor = json_skip_space(content, cursor + 1usize);
+                continue;
+            }
+            if content[cursor] == 125 as byte {
+                next_out[0] = cursor + 1usize;
+                return 0;
+            }
+            return -1;
+        }
+        return -1;
+    }
+    if ch == 91 as byte {
+        cursor = json_skip_space(content, cursor + 1usize);
+        if content[cursor] == 93 as byte {
+            next_out[0] = cursor + 1usize;
+            return 0;
+        }
+        while content[cursor] != 0 as byte {
+            if json_skip_value(content, cursor, &cursor) != 0 {
+                return -1;
+            }
+            cursor = json_skip_space(content, cursor);
+            if content[cursor] == 44 as byte {
+                cursor = json_skip_space(content, cursor + 1usize);
+                continue;
+            }
+            if content[cursor] == 93 as byte {
+                next_out[0] = cursor + 1usize;
+                return 0;
+            }
+            return -1;
+        }
+        return -1;
+    }
+    return json_skip_literal_value(content, cursor, next_out);
+}
+
+fn json_find_top_level_field_start(content: &byte, field_name: &byte, value_pos_out: &usize) i32 {
+    if content == null || field_name == null || value_pos_out == null {
+        return -1;
+    }
+    var cursor: usize = json_skip_space(content, 0usize);
+    if content[cursor] != 123 as byte {
+        return -1;
+    }
+    cursor = json_skip_space(content, cursor + 1usize);
+    if content[cursor] == 125 as byte {
+        return -1;
+    }
+    while content[cursor] != 0 as byte {
+        var next_after_key: usize = 0usize;
+        if json_match_string_token(content, cursor, field_name, &next_after_key) != 0 {
+            cursor = json_skip_space(content, next_after_key);
+            if content[cursor] != 58 as byte {
+                return -1;
+            }
+            value_pos_out[0] = json_skip_space(content, cursor + 1usize);
+            return 0;
+        }
+        if json_skip_string_value(content, cursor, &next_after_key) != 0 {
+            return -1;
+        }
+        cursor = json_skip_space(content, next_after_key);
+        if content[cursor] != 58 as byte {
+            return -1;
+        }
+        if json_skip_value(content, cursor + 1usize, &cursor) != 0 {
+            return -1;
+        }
+        cursor = json_skip_space(content, cursor);
+        if content[cursor] == 44 as byte {
+            cursor = json_skip_space(content, cursor + 1usize);
+            continue;
+        }
+        if content[cursor] == 125 as byte {
+            return -1;
+        }
+        return -1;
+    }
+    return -1;
+}
+
+fn json_extract_top_level_string(ctx: &Phase1Context, content: &byte, field_name: &byte) &byte {
+    if ctx == null || content == null || field_name == null {
+        return null;
+    }
+    var value_pos: usize = 0usize;
+    if json_find_top_level_field_start(content, field_name, &value_pos) != 0 {
+        return null;
+    }
+    var start: usize = 0usize;
+    var end: usize = 0usize;
+    var next: usize = 0usize;
+    if json_parse_string_range(content, value_pos, &start, &end, &next) != 0 {
+        return null;
+    }
+    return arena_copy_range(&ctx.arena, content, start, end - start);
+}
+
+fn json_collect_top_level_string_array(ctx: &Phase1Context,
+                                       content: &byte,
+                                       field_name: &byte,
+                                       head: &StringNode,
+                                       count_out: &i32) &StringNode {
+    var result: &StringNode = head;
+    if ctx == null || content == null || field_name == null {
+        if count_out != null {
+            count_out[0] = 0;
+        }
+        return result;
+    }
+    var value_pos: usize = 0usize;
+    if json_find_top_level_field_start(content, field_name, &value_pos) != 0 ||
+        content[value_pos] != 91 as byte {
+        if count_out != null {
+            count_out[0] = 0;
+        }
+        return result;
+    }
+    if count_out != null {
+        count_out[0] = 0;
+    }
+    var cursor: usize = json_skip_space(content, value_pos + 1usize);
+    if content[cursor] == 93 as byte {
+        return result;
+    }
+    while content[cursor] != 0 as byte {
+        var start: usize = 0usize;
+        var end: usize = 0usize;
+        var next: usize = 0usize;
+        if json_parse_string_range(content, cursor, &start, &end, &next) != 0 {
+            return head;
+        }
+        const value_text: &byte = arena_copy_range(&ctx.arena, content, start, end - start);
+        if value_text == null {
+            return head;
+        }
+        var inserted: i32 = 0;
+        result = sorted_string_insert(ctx, result, value_text, &inserted);
+        if inserted != 0 && count_out != null {
+            count_out[0] = count_out[0] + 1;
+        }
+        cursor = json_skip_space(content, next);
+        if content[cursor] == 44 as byte {
+            cursor = json_skip_space(content, cursor + 1usize);
+            continue;
+        }
+        if content[cursor] == 93 as byte {
+            return result;
+        }
+        return head;
+    }
+    return head;
+}
+
+fn json_collect_top_level_object_keys(ctx: &Phase1Context,
+                                      content: &byte,
+                                      field_name: &byte,
+                                      head: &StringNode,
+                                      count_out: &i32) &StringNode {
+    var result: &StringNode = head;
+    if ctx == null || content == null || field_name == null {
+        if count_out != null {
+            count_out[0] = 0;
+        }
+        return result;
+    }
+    var value_pos: usize = 0usize;
+    if json_find_top_level_field_start(content, field_name, &value_pos) != 0 ||
+        content[value_pos] != 123 as byte {
+        if count_out != null {
+            count_out[0] = 0;
+        }
+        return result;
+    }
+    if count_out != null {
+        count_out[0] = 0;
+    }
+    var cursor: usize = json_skip_space(content, value_pos + 1usize);
+    if content[cursor] == 125 as byte {
+        return result;
+    }
+    while content[cursor] != 0 as byte {
+        var start: usize = 0usize;
+        var end: usize = 0usize;
+        var next: usize = 0usize;
+        if json_parse_string_range(content, cursor, &start, &end, &next) != 0 {
+            return head;
+        }
+        const key_text: &byte = arena_copy_range(&ctx.arena, content, start, end - start);
+        if key_text == null {
+            return head;
+        }
+        var inserted: i32 = 0;
+        result = sorted_string_insert(ctx, result, key_text, &inserted);
+        if inserted != 0 && count_out != null {
+            count_out[0] = count_out[0] + 1;
+        }
+        cursor = json_skip_space(content, next);
+        if content[cursor] != 58 as byte {
+            return head;
+        }
+        if json_skip_value(content, cursor + 1usize, &cursor) != 0 {
+            return head;
+        }
+        cursor = json_skip_space(content, cursor);
+        if content[cursor] == 44 as byte {
+            cursor = json_skip_space(content, cursor + 1usize);
+            continue;
+        }
+        if content[cursor] == 125 as byte {
+            return result;
+        }
+        return head;
+    }
+    return head;
+}
+
+fn node_workspace_root_abs_path(ctx: &Phase1Context,
+                                target: &IRTarget,
+                                out: &byte,
+                                out_cap: usize) i32 {
+    if ctx == null || target == null || out == null {
+        return -1;
+    }
+    const root_text: &byte = node_workspace_root_text(target);
+    if root_text == null {
+        return -1;
+    }
+    var root_abs: [byte: PATH_MAX] = [];
+    if join_and_normalize_path(target.file.dir_abs, root_text, &root_abs[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    return copy_string(out, out_cap, &root_abs[0] as &byte);
+}
+
+fn node_workspace_root_rel_path(ctx: &Phase1Context,
+                                target: &IRTarget,
+                                out: &byte,
+                                out_cap: usize) i32 {
+    if ctx == null || target == null || out == null {
+        return -1;
+    }
+    var root_abs: [byte: PATH_MAX] = [];
+    if node_workspace_root_abs_path(ctx, target, &root_abs[0] as &byte, PATH_MAX) != 0 {
+        return -1;
+    }
+    if path_relative_to_root(ctx.workspace_root, &root_abs[0] as &byte, out, out_cap) != 0 {
+        return -1;
+    }
+    if out[0] == 0 as byte {
+        return copy_string(out, out_cap, "." as &byte);
+    }
+    return 0;
+}
+
+fn join_root_relative_path(prefix: &byte, child: &byte, out: &byte, out_cap: usize) i32 {
+    if prefix == null || child == null || out == null {
+        return -1;
+    }
+    if string_equals(prefix, "." as &byte) != 0 || prefix[0] == 0 as byte {
+        return copy_string(out, out_cap, child);
+    }
+    if child[0] == 0 as byte || string_equals(child, "." as &byte) != 0 {
+        return copy_string(out, out_cap, prefix);
+    }
+    return join_path(prefix, child, out, out_cap);
+}
+
+fn node_workspace_manifest_pattern(pattern: &byte, out: &byte, out_cap: usize) i32 {
+    if pattern == null || out == null {
+        return -1;
+    }
+    if string_has_suffix(pattern, "package.json" as &byte) != 0 {
+        return copy_string(out, out_cap, pattern);
+    }
+    var trimmed: [byte: PATH_MAX] = [];
+    if copy_string(&trimmed[0] as &byte, PATH_MAX, pattern) != 0 {
+        return -1;
+    }
+    var len: usize = strlen(&trimmed[0] as &byte);
+    if len >= PATH_MAX as usize {
+        return -1;
+    }
+    while len > 0usize {
+        const last_index: usize = len - 1usize;
+        if last_index >= PATH_MAX as usize || trimmed[last_index] != 47 as byte {
+            break;
+        }
+        trimmed[last_index] = 0 as byte;
+        len = last_index;
+    }
+    if len == 0usize {
+        return copy_string(out, out_cap, "package.json" as &byte);
+    }
+    const written: i32 = snprintf(out as *byte,
+                                  out_cap,
+                                  "%s/package.json" as *byte,
+                                  &trimmed[0] as *byte);
+    if written < 0 || written >= out_cap as i32 {
+        return -1;
+    }
+    return 0;
+}
+
+fn find_node_workspace_package_by_name(head: &NodeWorkspacePackage, name: &byte) &NodeWorkspacePackage {
+    var current: &NodeWorkspacePackage = head;
+    while current != null {
+        if current.name != null && string_equals(current.name, name) != 0 {
+            return current;
+        }
+        current = current.next;
+    }
+    return null;
+}
+
+fn find_node_workspace_package_by_dir(head: &NodeWorkspacePackage, package_dir: &byte) &NodeWorkspacePackage {
+    var current: &NodeWorkspacePackage = head;
+    while current != null {
+        if current.package_dir != null && string_equals(current.package_dir, package_dir) != 0 {
+            return current;
+        }
+        current = current.next;
+    }
+    return null;
+}
+
+fn node_workspace_package_list_append(head: &NodeWorkspacePackage, item: &NodeWorkspacePackage) &NodeWorkspacePackage {
+    if item == null {
+        return head;
+    }
+    if head == null {
+        return item;
+    }
+    var current: &NodeWorkspacePackage = head;
+    while current.next != null {
+        current = current.next;
+    }
+    current.next = item;
+    return head;
+}
+
+fn collect_node_workspace_packages(ctx: &Phase1Context, workspace_target: &IRTarget) &NodeWorkspacePackage {
+    if ctx == null || workspace_target == null {
+        return null;
+    }
+    var root_abs: [byte: PATH_MAX] = [];
+    var root_rel: [byte: PATH_MAX] = [];
+    var root_manifest_rel: [byte: PATH_MAX] = [];
+    var root_manifest_abs: [byte: PATH_MAX] = [];
+    if node_workspace_root_abs_path(ctx, workspace_target, &root_abs[0] as &byte, PATH_MAX) != 0 ||
+        node_workspace_root_rel_path(ctx, workspace_target, &root_rel[0] as &byte, PATH_MAX) != 0 ||
+        build_node_root_manifest_raw(node_workspace_root_text(workspace_target),
+                                     &root_manifest_rel[0] as &byte,
+                                     PATH_MAX) != 0 ||
+        join_and_normalize_path(workspace_target.file.dir_abs,
+                                &root_manifest_rel[0] as &byte,
+                                &root_manifest_abs[0] as &byte,
+                                PATH_MAX) != 0 {
+        return null;
+    }
+
+    var root_manifest_size: usize = 0usize;
+    const root_manifest_content: &byte = read_file_into_arena(ctx,
+                                                              &root_manifest_abs[0] as &byte,
+                                                              &root_manifest_size);
+    _ = root_manifest_size;
+    if root_manifest_content == null {
+        return null;
+    }
+
+    var workspace_pattern_count: i32 = 0;
+    const workspace_patterns: &StringNode = json_collect_top_level_string_array(ctx,
+                                                                                root_manifest_content,
+                                                                                "workspaces" as &byte,
+                                                                                null,
+                                                                                &workspace_pattern_count);
+    if workspace_patterns == null || workspace_pattern_count == 0 {
+        return null;
+    }
+
+    var manifest_paths: &StringNode = null;
+    var pattern: &StringNode = workspace_patterns;
+    while pattern != null {
+        var manifest_pattern: [byte: PATH_MAX] = [];
+        if node_workspace_manifest_pattern(pattern.text, &manifest_pattern[0] as &byte, PATH_MAX) == 0 {
+            var matched_count: i32 = 0;
+            var matches: &StringNode = collect_glob_matches(ctx,
+                                                            &root_abs[0] as &byte,
+                                                            &manifest_pattern[0] as &byte,
+                                                            &matched_count);
+            while matches != null {
+                var manifest_rel_root: [byte: PATH_MAX] = [];
+                if join_root_relative_path(&root_rel[0] as &byte,
+                                           matches.text,
+                                           &manifest_rel_root[0] as &byte,
+                                           PATH_MAX) == 0 {
+                    var inserted: i32 = 0;
+                    manifest_paths = sorted_string_insert(ctx,
+                                                          manifest_paths,
+                                                          &manifest_rel_root[0] as &byte,
+                                                          &inserted);
+                    _ = inserted;
+                }
+                matches = matches.next;
+            }
+        }
+        pattern = pattern.next;
+    }
+
+    var packages_head: &NodeWorkspacePackage = null;
+    var manifest_node: &StringNode = manifest_paths;
+    while manifest_node != null {
+        var manifest_abs: [byte: PATH_MAX] = [];
+        if join_and_normalize_path(ctx.workspace_root,
+                                   manifest_node.text,
+                                   &manifest_abs[0] as &byte,
+                                   PATH_MAX) != 0 ||
+            path_is_file(&manifest_abs[0] as &byte) == 0 {
+            manifest_node = manifest_node.next;
+            continue;
+        }
+        var manifest_size: usize = 0usize;
+        const manifest_content: &byte = read_file_into_arena(ctx,
+                                                             &manifest_abs[0] as &byte,
+                                                             &manifest_size);
+        _ = manifest_size;
+        if manifest_content == null {
+            manifest_node = manifest_node.next;
+            continue;
+        }
+        const package_name: &byte = json_extract_top_level_string(ctx,
+                                                                  manifest_content,
+                                                                  "name" as &byte);
+        var package_dir: [byte: PATH_MAX] = [];
+        if path_dirname_text(manifest_node.text, &package_dir[0] as &byte, PATH_MAX) != 0 {
+            manifest_node = manifest_node.next;
+            continue;
+        }
+        const package_item: &NodeWorkspacePackage = new_node_workspace_package(ctx);
+        if package_item == null {
+            return packages_head;
+        }
+        package_item.package_dir = arena_copy_cstr(&ctx.arena, &package_dir[0] as &byte);
+        package_item.manifest_path = arena_copy_cstr(&ctx.arena, manifest_node.text);
+        if package_name != null {
+            package_item.name = arena_copy_cstr(&ctx.arena, package_name);
+        } else {
+            package_item.name = arena_copy_cstr(&ctx.arena, &package_dir[0] as &byte);
+        }
+        package_item.dependency_head = json_collect_top_level_object_keys(ctx,
+                                                                          manifest_content,
+                                                                          "dependencies" as &byte,
+                                                                          package_item.dependency_head,
+                                                                          null);
+        package_item.dependency_head = json_collect_top_level_object_keys(ctx,
+                                                                          manifest_content,
+                                                                          "devDependencies" as &byte,
+                                                                          package_item.dependency_head,
+                                                                          null);
+        package_item.dependency_head = json_collect_top_level_object_keys(ctx,
+                                                                          manifest_content,
+                                                                          "peerDependencies" as &byte,
+                                                                          package_item.dependency_head,
+                                                                          null);
+        package_item.dependency_head = json_collect_top_level_object_keys(ctx,
+                                                                          manifest_content,
+                                                                          "optionalDependencies" as &byte,
+                                                                          package_item.dependency_head,
+                                                                          null);
+        packages_head = node_workspace_package_list_append(packages_head, package_item);
+        manifest_node = manifest_node.next;
+    }
+
+    return packages_head;
+}
+
+fn node_collect_reachable_package_inputs(ctx: &Phase2Context,
+                                         action: &PlannedAction,
+                                         packages_head: &NodeWorkspacePackage,
+                                         current: &NodeWorkspacePackage,
+                                         visited_head: &StringNode) &StringNode {
+    if ctx == null || action == null || current == null {
+        return visited_head;
+    }
+    var visit_key: &byte = current.package_dir;
+    if current.name != null {
+        visit_key = current.name;
+    }
+    var inserted: i32 = 0;
+    var visited: &StringNode = sorted_string_insert(ctx.phase1, visited_head, visit_key, &inserted);
+    if inserted == 0 && visited_head == null {
+        return null;
+    }
+    if inserted == 0 {
+        return visited;
+    }
+    if action_add_workspace_relative_input(ctx, action, current.package_dir) != 0 {
+        return null;
+    }
+    var dep: &StringNode = current.dependency_head;
+    while dep != null {
+        const dep_package: &NodeWorkspacePackage = find_node_workspace_package_by_name(packages_head, dep.text);
+        if dep_package != null {
+            visited = node_collect_reachable_package_inputs(ctx,
+                                                            action,
+                                                            packages_head,
+                                                            dep_package,
+                                                            visited);
+            if visited == null {
+                return null;
+            }
+        }
+        dep = dep.next;
+    }
+    return visited;
+}
+
 fn find_node_workspace_target(ctx: &Phase1Context, target: &IRTarget) &IRTarget {
     if ctx == null || target == null {
         return null;
@@ -6539,7 +7220,7 @@ fn build_node_workspace_shell_command(ctx: &Phase1Context,
     const fallback_install_script: &byte =
         "const fs=require(\"fs\"),path=require(\"path\");const root=process.argv[1];const pkg=JSON.parse(fs.readFileSync(path.join(root,\"package.json\"),\"utf8\"));const workspaces=Array.isArray(pkg.workspaces)?pkg.workspaces:[];const nodeModules=path.join(root,\"node_modules\");fs.mkdirSync(nodeModules,{recursive:true});for(const workspaceDir of workspaces){const manifestPath=path.join(root,workspaceDir,\"package.json\");if(!fs.existsSync(manifestPath))continue;const workspacePkg=JSON.parse(fs.readFileSync(manifestPath,\"utf8\"));if(!workspacePkg.name)continue;const parts=workspacePkg.name.split(\"/\");let scopeDir=nodeModules;for(let i=0;i<parts.length-1;i++){scopeDir=path.join(scopeDir,parts[i]);fs.mkdirSync(scopeDir,{recursive:true});}const linkPath=path.join(scopeDir,parts[parts.length-1]);fs.rmSync(linkPath,{recursive:true,force:true});fs.symlinkSync(path.relative(scopeDir,path.join(root,workspaceDir)),linkPath,\"dir\");}" as &byte;
     const metadata_script: &byte =
-        "const fs=require(\"fs\"),path=require(\"path\");const root=process.argv[1],lockfile=process.argv[2],out=process.argv[3];const pkg=JSON.parse(fs.readFileSync(path.join(root,\"package.json\"),\"utf8\"));const workspaces=Array.isArray(pkg.workspaces)?pkg.workspaces:[];const meta={root,lockfile,workspaceCount:workspaces.length,workspaces};fs.mkdirSync(path.dirname(out),{recursive:true});fs.writeFileSync(out,JSON.stringify(meta,null,2)+\"\\n\");" as &byte;
+        "const fs=require(\"fs\"),path=require(\"path\");const root=process.argv[1],lockfile=process.argv[2],out=process.argv[3];const pkg=JSON.parse(fs.readFileSync(path.join(root,\"package.json\"),\"utf8\"));const workspaces=Array.isArray(pkg.workspaces)?pkg.workspaces:[];const packages=workspaces.map((workspaceDir)=>{const manifestPath=path.join(root,workspaceDir,\"package.json\");if(!fs.existsSync(manifestPath))return null;const manifest=JSON.parse(fs.readFileSync(manifestPath,\"utf8\"));return {path:workspaceDir,name:manifest.name||workspaceDir,manifest};}).filter(Boolean);const workspaceNames=new Set(packages.map((item)=>item.name));for(const item of packages){const deps=Object.assign({},item.manifest&&item.manifest.dependencies,item.manifest&&item.manifest.devDependencies,item.manifest&&item.manifest.peerDependencies,item.manifest&&item.manifest.optionalDependencies);item.localDependencies=Object.keys(deps||{}).filter((dep)=>workspaceNames.has(dep)).sort();delete item.manifest;}const meta={root,lockfile,workspaceCount:packages.length,workspaces:packages.map((item)=>item.path),packages};fs.mkdirSync(path.dirname(out),{recursive:true});fs.writeFileSync(out,JSON.stringify(meta,null,2)+\"\\n\");" as &byte;
 
     var buffer: [byte: MAX_STRING_BUILD] = [];
     var used: usize = 0usize;
@@ -8612,6 +9293,14 @@ fn collect_target_dependencies(ctx: &Phase1Context, target: &IRTarget) &StringNo
     return deps;
 }
 
+fn action_add_workspace_relative_input(ctx: &Phase2Context, action: &PlannedAction, rel_path: &byte) i32 {
+    if ctx == null || action == null || rel_path == null || rel_path[0] == 0 as byte {
+        return -1;
+    }
+    action_insert_input(ctx.phase1, action, rel_path);
+    return 0;
+}
+
 fn action_add_input_spec(ctx: &Phase2Context, action: &PlannedAction, target: &IRTarget, raw: &byte) i32 {
     if string_has_wildcard(raw) != 0 {
         var matched_count: i32 = 0;
@@ -9077,21 +9766,34 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
         _ = action_append_command(ctx.phase1, action, "ci" as &byte);
         const root_field: &IRField = find_ir_field(target.attrs, "root" as &byte);
         const lock_field: &IRField = find_ir_field(target.attrs, "lockfile" as &byte);
+        const scanned_packages: &NodeWorkspacePackage = collect_node_workspace_packages(ctx.phase1, target);
         if root_field != null && root_field.value != null && root_field.value.text != null {
             var manifest_raw: [byte: PATH_MAX] = [];
-            var manifest_glob: [byte: PATH_MAX] = [];
             if build_node_root_manifest_raw(root_field.value.text, &manifest_raw[0] as &byte, PATH_MAX) != 0 ||
-                build_node_root_glob(root_field.value.text,
-                                     "**/package.json" as &byte,
-                                     &manifest_glob[0] as &byte,
-                                     PATH_MAX) != 0 ||
-                action_add_input_spec(ctx, action, target, &manifest_raw[0] as &byte) != 0 ||
-                action_add_input_spec(ctx, action, target, &manifest_glob[0] as &byte) != 0 {
+                action_add_input_spec(ctx, action, target, &manifest_raw[0] as &byte) != 0 {
                 return -1;
             }
         }
         if lock_field != null && lock_field.value != null && lock_field.value.text != null {
             if action_add_input_spec(ctx, action, target, lock_field.value.text) != 0 {
+                return -1;
+            }
+        }
+        if scanned_packages != null {
+            var scanned_package: &NodeWorkspacePackage = scanned_packages;
+            while scanned_package != null {
+                if action_add_workspace_relative_input(ctx, action, scanned_package.manifest_path) != 0 {
+                    return -1;
+                }
+                scanned_package = scanned_package.next;
+            }
+        } else if root_field != null && root_field.value != null && root_field.value.text != null {
+            var manifest_glob: [byte: PATH_MAX] = [];
+            if build_node_root_glob(root_field.value.text,
+                                     "**/package.json" as &byte,
+                                     &manifest_glob[0] as &byte,
+                                     PATH_MAX) != 0 ||
+                action_add_input_spec(ctx, action, target, &manifest_glob[0] as &byte) != 0 {
                 return -1;
             }
         }
@@ -9103,36 +9805,79 @@ fn populate_planned_action(ctx: &Phase2Context, action: &PlannedAction, target: 
         _ = action_append_command(ctx.phase1, action, "run" as &byte);
         _ = action_append_command(ctx.phase1, action, "build" as &byte);
         const package_field: &IRField = find_ir_field(target.attrs, "package" as &byte);
-        if package_field != null && package_field.value != null && package_field.value.text != null {
-            if action_add_input_spec(ctx, action, target, package_field.value.text) != 0 {
-                return -1;
-            }
-        }
         const workspace_target: &IRTarget = find_node_workspace_target(ctx.phase1, target);
         const workspace_root: &byte = node_workspace_root_text(workspace_target);
         const workspace_lockfile: &byte = node_workspace_lockfile_text(workspace_target);
+        const scanned_packages: &NodeWorkspacePackage = collect_node_workspace_packages(ctx.phase1, workspace_target);
         if workspace_root != null {
             var manifest_raw: [byte: PATH_MAX] = [];
-            var manifest_glob: [byte: PATH_MAX] = [];
-            var source_glob: [byte: PATH_MAX] = [];
             if build_node_root_manifest_raw(workspace_root, &manifest_raw[0] as &byte, PATH_MAX) != 0 ||
-                build_node_root_glob(workspace_root,
-                                     "**/package.json" as &byte,
-                                     &manifest_glob[0] as &byte,
-                                     PATH_MAX) != 0 ||
-                build_node_root_glob(workspace_root,
-                                     "**/*.js" as &byte,
-                                     &source_glob[0] as &byte,
-                                     PATH_MAX) != 0 ||
-                action_add_input_spec(ctx, action, workspace_target, &manifest_raw[0] as &byte) != 0 ||
-                action_add_input_spec(ctx, action, workspace_target, &manifest_glob[0] as &byte) != 0 ||
-                action_add_input_spec(ctx, action, workspace_target, &source_glob[0] as &byte) != 0 {
+                action_add_input_spec(ctx, action, workspace_target, &manifest_raw[0] as &byte) != 0 {
                 return -1;
             }
         }
         if workspace_lockfile != null &&
             action_add_input_spec(ctx, action, workspace_target, workspace_lockfile) != 0 {
             return -1;
+        }
+        if scanned_packages != null &&
+            package_field != null &&
+            package_field.value != null &&
+            package_field.value.text != null {
+            var scanned_package: &NodeWorkspacePackage = scanned_packages;
+            while scanned_package != null {
+                if action_add_workspace_relative_input(ctx, action, scanned_package.manifest_path) != 0 {
+                    return -1;
+                }
+                scanned_package = scanned_package.next;
+            }
+            var package_rel_root: [byte: PATH_MAX] = [];
+            var package_abs: [byte: PATH_MAX] = [];
+            if resolve_target_path(ctx.phase1,
+                                   target,
+                                   package_field.value.text,
+                                   &package_rel_root[0] as &byte,
+                                   &package_abs[0] as &byte) == 0 {
+                const root_package: &NodeWorkspacePackage = find_node_workspace_package_by_dir(scanned_packages,
+                                                                                               &package_rel_root[0] as &byte);
+                if root_package != null {
+                    var visited_packages: &StringNode = null;
+                    visited_packages = node_collect_reachable_package_inputs(ctx,
+                                                                             action,
+                                                                             scanned_packages,
+                                                                             root_package,
+                                                                             visited_packages);
+                    if visited_packages == null {
+                        return -1;
+                    }
+                } else if action_add_input_spec(ctx, action, target, package_field.value.text) != 0 {
+                    return -1;
+                }
+            } else if action_add_input_spec(ctx, action, target, package_field.value.text) != 0 {
+                return -1;
+            }
+        } else {
+            if package_field != null && package_field.value != null && package_field.value.text != null {
+                if action_add_input_spec(ctx, action, target, package_field.value.text) != 0 {
+                    return -1;
+                }
+            }
+            if workspace_root != null {
+                var manifest_glob: [byte: PATH_MAX] = [];
+                var source_glob: [byte: PATH_MAX] = [];
+                if build_node_root_glob(workspace_root,
+                                         "**/package.json" as &byte,
+                                         &manifest_glob[0] as &byte,
+                                         PATH_MAX) != 0 ||
+                    build_node_root_glob(workspace_root,
+                                         "**/*.js" as &byte,
+                                         &source_glob[0] as &byte,
+                                         PATH_MAX) != 0 ||
+                    action_add_input_spec(ctx, action, workspace_target, &manifest_glob[0] as &byte) != 0 ||
+                    action_add_input_spec(ctx, action, workspace_target, &source_glob[0] as &byte) != 0 {
+                    return -1;
+                }
+            }
         }
         const out_field: &IRField = find_ir_field(target.attrs, "out" as &byte);
         if out_field != null && out_field.value != null && out_field.value.text != null {
@@ -9263,6 +10008,10 @@ fn compute_action_digests(ctx: &Phase2Context, action: &PlannedAction) i32 {
             action.cache_status = "local-hit" as &byte;
             action.pending_execution = 0;
             ctx.cache_hit_count = ctx.cache_hit_count + 1;
+        } else if action_allows_preexecution_output_reuse(action) == 0 {
+            action.cache_status = "pending-execution" as &byte;
+            action.pending_execution = 1;
+            ctx.pending_count = ctx.pending_count + 1;
         } else if read_latest_owner_output_digest(ctx,
                                                   action.label,
                                                   &previous_output_digest[0] as &byte,

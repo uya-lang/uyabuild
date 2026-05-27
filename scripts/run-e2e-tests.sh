@@ -260,6 +260,69 @@ run_node_build_case() {
   printf 'PASS %s\n' "$case_name"
 }
 
+run_node_graph_rebuild_case() {
+  case_name=$1
+  fixture_name=$2
+  target_label=$3
+  target_output_file=$4
+  initial_text=$5
+  workspace_metadata_file=$6
+  workspace_metadata_text=$7
+  expected_workspace_name=$8
+  expected_action_count=$9
+  unrelated_file=${10}
+  related_file=${11}
+  related_content=${12}
+  updated_text=${13}
+
+  workdir=$(mktemp -d "$TMP_ROOT/$case_name.XXXXXX")
+  cp -R "$ROOT_DIR/fixtures/workspaces/$fixture_name/." "$workdir"
+
+  first_stdout="$workdir/first-stdout.txt"
+  first_stderr="$workdir/first-stderr.txt"
+  second_stdout="$workdir/second-stdout.txt"
+  second_stderr="$workdir/second-stderr.txt"
+  third_stdout="$workdir/third-stdout.txt"
+  third_stderr="$workdir/third-stderr.txt"
+
+  (
+    cd "$workdir"
+    "$BIN" build "$target_label"
+  ) >"$first_stdout" 2>"$first_stderr"
+
+  assert_file_contains "$workdir/$target_output_file" "$initial_text" "$case_name"
+  assert_file_contains "$workdir/$workspace_metadata_file" "$workspace_metadata_text" "$case_name"
+  assert_output_contains "$first_stdout" "workspace: $expected_workspace_name" "$case_name"
+  assert_output_contains "$first_stdout" "planned_actions: $expected_action_count" "$case_name"
+
+  printf '\n// unrelated workspace touch\n' >>"$workdir/$unrelated_file"
+
+  (
+    cd "$workdir"
+    "$BIN" build "$target_label"
+  ) >"$second_stdout" 2>"$second_stderr"
+
+  assert_file_contains "$workdir/$target_output_file" "$initial_text" "$case_name"
+  assert_output_contains "$second_stdout" "workspace: $expected_workspace_name" "$case_name"
+  assert_output_contains "$second_stdout" "planned_actions: $expected_action_count" "$case_name"
+
+  printf '%s\n' "$related_content" >"$workdir/$related_file"
+
+  (
+    cd "$workdir"
+    "$BIN" build "$target_label"
+  ) >"$third_stdout" 2>"$third_stderr"
+
+  assert_file_contains "$workdir/$target_output_file" "$updated_text" "$case_name"
+  assert_output_contains "$third_stdout" "workspace: $expected_workspace_name" "$case_name"
+  assert_output_contains "$third_stdout" "planned_actions: $expected_action_count" "$case_name"
+  assert_dir_exists "$workdir/.uya-build/cas" "$case_name"
+  assert_dir_exists "$workdir/.uya-build/meta" "$case_name"
+  assert_dir_exists "$workdir/.uya-build/tmp" "$case_name"
+
+  printf 'PASS %s\n' "$case_name"
+}
+
 if [ ! -x "$BIN" ]; then
   echo "bin/uyabuild is missing; run 'make bootstrap' first" >&2
   exit 1
@@ -312,6 +375,22 @@ run_node_build_case \
   "2"
 pass_count=$((pass_count + 1))
 
+run_node_graph_rebuild_case \
+  "sample-node-workspace-graph" \
+  "node-workspace-graph" \
+  "//web:app" \
+  "dist/app/message.txt" \
+  "hello from workspace graph" \
+  "out/web/workspace.workspace.json" \
+  "\"localDependencies\": [" \
+  "node-workspace-graph" \
+  "2" \
+  "packages/unused/src/index.js" \
+  "packages/lib/src/index.js" \
+  "module.exports = \"hello from updated workspace graph\";" \
+  "hello from updated workspace graph"
+pass_count=$((pass_count + 1))
+
 run_plan_case \
   "sample-oci-multistage" \
   "oci-multistage" \
@@ -330,4 +409,4 @@ run_build_case \
   "legacy fixture"
 pass_count=$((pass_count + 1))
 
-printf 'e2e tests: %s/%s passed\n' "$pass_count" 6
+printf 'e2e tests: %s/%s passed\n' "$pass_count" 7

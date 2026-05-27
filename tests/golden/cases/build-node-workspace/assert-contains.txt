@@ -1,2 +1,4 @@
 dist/app/message.txt|hello from workspace
 out/web/workspace.workspace.json|"workspaceCount": 2
+out/web/workspace.workspace.json|"packages": [
+out/web/workspace.workspace.json|"localDependencies": [

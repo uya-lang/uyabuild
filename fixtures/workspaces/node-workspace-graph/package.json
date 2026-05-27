@@ -1,0 +1,12 @@
+{
+  "name": "node-workspace-graph",
+  "private": true,
+  "workspaces": [
+    "packages/app",
+    "packages/lib",
+    "packages/unused"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @sample/app"
+  }
+}

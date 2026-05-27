@@ -31,3 +31,4 @@ Current coverage:
 | `planner` | `action-dag-deps` | prove target planning emits a two-action DAG with deps |
 | `executor` | `legacy-shell-success` | prove local execution commits declared outputs |
 | `executor` | `strict-hidden-input` | prove strict mode blocks hidden inputs before output commit |
+| `planner` | `node-workspace-graph` | prove `node.app` narrows inputs to reachable workspace packages while keeping workspace manifests visible for install/setup |

@@ -1,0 +1,4 @@
+"workspace":{"name":"node-workspace-graph"
+"label":"//web:app","kind":"node.app"
+"inputs":["package-lock.json","package.json","packages/app","packages/app/package.json","packages/lib","packages/lib/package.json","packages/unused/package.json"]
+"outputs":["dist/app"]
